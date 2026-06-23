@@ -1,0 +1,52 @@
+[
+  {
+    "scryfall_id": "e3285e6b-3e79-4d7c-bf96-d920f973b122",
+    "name": "Lightning Bolt",
+    "set": "LEB",
+    "condition": "NM",
+    "finish": "nonfoil",
+    "price": 1.25,
+    "quantity": 4,
+    "seller_id": "seller-abc"
+  },
+  {
+    "scryfall_id": "e3285e6b-3e79-4d7c-bf96-d920f973b122",
+    "name": "Lightning Bolt",
+    "set": "M11",
+    "condition": "LP",
+    "finish": "nonfoil",
+    "price": 0.75,
+    "quantity": 8,
+    "seller_id": "seller-xyz"
+  },
+  {
+    "scryfall_id": "2fab0ea3-7664-4ee8-b520-7f3a4e966aae",
+    "name": "Dark Ritual",
+    "set": "LEA",
+    "condition": "HP",
+    "finish": "nonfoil",
+    "price": 0.50,
+    "quantity": 2,
+    "seller_id": "seller-abc"
+  },
+  {
+    "scryfall_id": "b0faa7f2-b547-42c4-a810-839da50dadfe",
+    "name": "Black Lotus",
+    "set": "LEA",
+    "condition": "NM",
+    "finish": "nonfoil",
+    "price": 450.00,
+    "quantity": 1,
+    "seller_id": "seller-high"
+  },
+  {
+    "scryfall_id": "c334c1f4-f7d8-4258-a77c-dc92e1bda152",
+    "name": "Counterspell",
+    "set": "ICE",
+    "condition": "NM",
+    "finish": "foil",
+    "price": 1.80,
+    "quantity": 3,
+    "seller_id": "seller-abc"
+  }
+]

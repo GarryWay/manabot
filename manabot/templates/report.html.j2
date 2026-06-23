@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Manabot Report — {{ run_at.strftime('%Y-%m-%d %H:%M UTC') }}</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #0f0f0f; color: #e0e0e0; padding: 2rem; }
+  h1 { font-size: 1.4rem; margin-bottom: 0.25rem; color: #fff; }
+  .meta { font-size: 0.85rem; color: #888; margin-bottom: 1.5rem; }
+  .stats { display: flex; gap: 1.5rem; margin-bottom: 2rem; flex-wrap: wrap; }
+  .stat { background: #1a1a1a; border: 1px solid #333; border-radius: 6px; padding: 0.75rem 1.25rem; }
+  .stat-num { font-size: 1.8rem; font-weight: bold; line-height: 1; }
+  .stat-label { font-size: 0.75rem; color: #888; margin-top: 0.2rem; }
+  .stat-num.green { color: #4ade80; }
+  .stat-num.yellow { color: #facc15; }
+  .stat-num.red { color: #f87171; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+  th { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 2px solid #333; color: #aaa; font-weight: 600; cursor: pointer; user-select: none; white-space: nowrap; }
+  th:hover { color: #fff; }
+  td { padding: 0.5rem 0.75rem; border-bottom: 1px solid #222; vertical-align: middle; }
+  tr.good { background: rgba(74, 222, 128, 0.06); }
+  tr.close { background: rgba(250, 204, 21, 0.06); }
+  tr.over { background: rgba(248, 113, 113, 0.05); }
+  tr.unresolved { opacity: 0.5; }
+  .price-good { color: #4ade80; }
+  .price-over { color: #f87171; }
+  .price-close { color: #facc15; }
+  .trend-up { color: #f87171; }
+  .trend-down { color: #4ade80; }
+  .trend-flat { color: #888; }
+  .badge { display: inline-block; font-size: 0.7rem; padding: 0.1rem 0.4rem; border-radius: 3px; background: #2a2a2a; color: #aaa; margin-right: 0.25rem; }
+  .badge-warn { background: #3a2500; color: #facc15; }
+  .badge-unresolved { background: #2a1a1a; color: #f87171; }
+</style>
+</head>
+<body>
+
+<h1>Manabot Price Report</h1>
+<p class="meta">Generated {{ run_at.strftime('%Y-%m-%d %H:%M UTC') }}</p>
+
+<div class="stats">
+  <div class="stat">
+    <div class="stat-num green">{{ summary.good_buy_count }}</div>
+    <div class="stat-label">Good Buys</div>
+  </div>
+  <div class="stat">
+    <div class="stat-num">{{ summary.total_checked }}</div>
+    <div class="stat-label">Total Checked</div>
+  </div>
+  {% if summary.unresolved_count > 0 %}
+  <div class="stat">
+    <div class="stat-num red">{{ summary.unresolved_count }}</div>
+    <div class="stat-label">Unresolved</div>
+  </div>
+  {% endif %}
+  {% if summary.warn_scryfall_count > 0 %}
+  <div class="stat">
+    <div class="stat-num yellow">{{ summary.warn_scryfall_count }}</div>
+    <div class="stat-label">Needs Scryfall</div>
+  </div>
+  {% endif %}
+</div>
+
+<table id="results">
+  <thead>
+    <tr>
+      <th onclick="sortTable(0)">Card ▲</th>
+      <th onclick="sortTable(1)">Tags</th>
+      <th onclick="sortTable(2)">Best Price</th>
+      <th onclick="sortTable(3)">Max Price</th>
+      <th onclick="sortTable(4)">Avail</th>
+      <th onclick="sortTable(5)">Cond</th>
+      <th onclick="sortTable(6)">Finish</th>
+      <th onclick="sortTable(7)">Trend</th>
+      <th>Status</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for r in results %}
+  {% set item = r.buy_list_item %}
+  {% if r.is_good_buy %}
+    {% set row_class = "good" %}
+  {% elif r.best_price is not none and r.best_price <= item.max_price_usd * 1.1 %}
+    {% set row_class = "close" %}
+  {% elif r.status.value == "UNRESOLVED" %}
+    {% set row_class = "unresolved" %}
+  {% else %}
+    {% set row_class = "over" %}
+  {% endif %}
+  <tr class="{{ row_class }}">
+    <td>{{ item.card_name }}</td>
+    <td>{% for tag in item.tags %}<span class="badge">{{ tag }}</span>{% endfor %}</td>
+    <td>
+      {% if r.best_price is not none %}
+        {% if r.best_price <= item.max_price_usd %}
+          <span class="price-good">${{ "%.2f"|format(r.best_price) }}</span>
+        {% elif r.best_price <= item.max_price_usd * 1.1 %}
+          <span class="price-close">${{ "%.2f"|format(r.best_price) }}</span>
+        {% else %}
+          <span class="price-over">${{ "%.2f"|format(r.best_price) }}</span>
+        {% endif %}
+      {% else %}—{% endif %}
+    </td>
+    <td>${{ "%.2f"|format(item.max_price_usd) }}</td>
+    <td>{{ r.listings[0].quantity_available if r.listings else "—" }}</td>
+    <td>{{ item.min_condition.value }}+</td>
+    <td>{{ item.foil.value }}</td>
+    <td>
+      {% if r.trend %}
+        {% if r.trend.direction.value == "UP" %}<span class="trend-up">↑</span>
+        {% elif r.trend.direction.value == "DOWN" %}<span class="trend-down">↓</span>
+        {% elif r.trend.direction.value == "FLAT" %}<span class="trend-flat">→</span>
+        {% else %}<span class="trend-flat">·</span>{% endif %}
+        {% if r.trend.change_pct is not none %}
+          <small style="color:#666">{{ "%.1f"|format(r.trend.change_pct) }}%</small>
+        {% endif %}
+      {% else %}—{% endif %}
+    </td>
+    <td>
+      {% if r.status.value == "UNRESOLVED" %}<span class="badge badge-unresolved">UNRESOLVED</span>
+      {% elif r.status.value == "WARN_SCRYFALL_NEEDED" %}<span class="badge badge-warn">needs Scryfall</span>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<script>
+let sortDir = {};
+function sortTable(col) {
+  const table = document.getElementById("results");
+  const tbody = table.tBodies[0];
+  const rows = Array.from(tbody.rows);
+  const asc = !sortDir[col];
+  sortDir = {};
+  sortDir[col] = asc;
+  rows.sort((a, b) => {
+    const av = a.cells[col].textContent.trim();
+    const bv = b.cells[col].textContent.trim();
+    const an = parseFloat(av.replace(/[^0-9.\-]/g, ""));
+    const bn = parseFloat(bv.replace(/[^0-9.\-]/g, ""));
+    if (!isNaN(an) && !isNaN(bn)) return asc ? an - bn : bn - an;
+    return asc ? av.localeCompare(bv) : bv.localeCompare(av);
+  });
+  rows.forEach(r => tbody.appendChild(r));
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+# config.yaml — copy to config.yaml and fill in values.
+# Environment variables (from .env) override these settings.
+
+manapool:
+  email: your@email.com
+  token: your-access-token-here
+
+discord:
+  webhook_url: ""  # leave empty to disable
+
+paths:
+  buylist: data/buylist.csv
+  db: data/manabot.db
+  reports_dir: data/reports
+
+behavior:
+  use_bulk_export: false
+  max_price_age_days: 1
+  trend_window_days: 7
+  trend_threshold_pct: 5.0
+
+# Future (not yet active):
+# schedule:
+#   cron: "0 8 * * *"  # daily at 8am — requires apscheduler
