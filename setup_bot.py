@@ -134,10 +134,10 @@ def _find_pip() -> list[str]:
     if _probe(sys.executable, "-m", "pip", "--version"):
         return [sys.executable, "-m", "pip"]
 
-    # Attempt to bootstrap pip via ensurepip (ships with CPython 3.4+)
-    _run([sys.executable, "-m", "ensurepip", "--upgrade"], check=False)
-    if _probe(sys.executable, "-m", "pip", "--version"):
-        return [sys.executable, "-m", "pip"]
+    # Attempt to bootstrap pip via ensurepip — silently; not available on all distros
+    if _probe(sys.executable, "-m", "ensurepip", "--upgrade"):
+        if _probe(sys.executable, "-m", "pip", "--version"):
+            return [sys.executable, "-m", "pip"]
 
     # Last resort: system pip3 alias
     if shutil.which("pip3") and _probe("pip3", "--version"):
