@@ -65,6 +65,7 @@ class BuyListItem:
     foil: Finish = Finish.ANY
     allowed_sets: list[str] = field(default_factory=list)
     in_universe_only: bool = False
+    exclude_ub: bool = False
     tags: list[str] = field(default_factory=list)
 
 
@@ -79,6 +80,8 @@ class PriceListing:
     quantity_available: int
     seller_id: str
     fetched_at: datetime
+    market_price_usd: Optional[float] = None  # price_market from ManaPool (None if not available)
+    url: str = ""  # ManaPool card page URL
 
 
 @dataclass
@@ -103,3 +106,32 @@ class MatchResult:
     is_good_buy: bool = False
     trend: Optional[TrendData] = None
     status: MatchStatus = MatchStatus.UNRESOLVED
+
+
+@dataclass
+class CartRequestItem:
+    """A single item prepared for the ManaPool optimizer request."""
+    buy_list_item: BuyListItem
+    set_code: str           # constrains optimizer to this printing (from cheapest valid listing)
+    estimated_price: float  # best price from pre-fetched data
+    estimated_margin: float  # max_price - estimated_price (positive = under budget)
+    condition_ids: list[str]  # e.g. ["NM", "LP"] for min_condition=LP
+    finish_ids: list[str]     # e.g. ["NF"] for nonfoil
+    seller_id: str = ""     # seller from the pre-fetch scan (proxy for optimizer's choice)
+
+
+@dataclass
+class CartResult:
+    """Result from a single ManaPool optimizer run, scored against buy list values."""
+    items: list[CartRequestItem]
+    raw_cart: list[dict]     # [{inventory_id, quantity_selected}] from optimizer
+    subtotal_usd: float
+    shipping_usd: float
+    fees_usd: float
+    total_usd: float
+    value_budget_usd: float  # Σ(max_price_i × qty_i) for items in this cart
+    net_value_usd: float     # value_budget - total_usd
+
+    @property
+    def is_profitable(self) -> bool:
+        return self.net_value_usd > 0

@@ -1,5 +1,5 @@
 card_name,scryfall_id,target_quantity,max_price_usd,min_condition,foil,allowed_sets,in_universe_only,tags,notes
 Lightning Bolt,e3285e6b-3e79-4d7c-bf96-d920f973b122,4,1.50,LP,nonfoil,,,burn-deck,Classic common
-Dark Ritual,,2,0.75,MP,any,,"false","legacy,customer:John",No set restriction
+Dark Ritual,2fab0ea3-7664-4ee8-b520-7f3a4e966aae,2,0.75,MP,any,,"false","legacy,customer:John",No set restriction
 Black Lotus,,1,500.00,NM,nonfoil,LEA,true,vintage,Alpha/Beta/Unlimited only
-Counterspell,,4,2.00,LP,foil,,false,control,Foil copies only
+Counterspell,c334c1f4-f7d8-4258-a77c-dc92e1bda152,4,2.00,LP,foil,,false,control,Foil copies only

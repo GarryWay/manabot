@@ -90,6 +90,22 @@ def test_unresolved_when_name_mismatch():
     assert results[0].status == MatchStatus.UNRESOLVED
 
 
+def test_dfc_front_face_matches_full_name():
+    """Buylist entry with front-face only matches DFC listing with full double-slash name."""
+    listing = make_listing(name="The Mightstone and Weakstone // The Weakstone", scryfall_id=None)
+    item = make_item(card_name="The Mightstone and Weakstone", scryfall_id=None)
+    results = match([item], [listing])
+    assert results[0].status == MatchStatus.MATCHED
+
+
+def test_dfc_full_name_also_matches():
+    """Buylist entry with full DFC name still matches."""
+    listing = make_listing(name="Bala Ged Recovery // Bala Ged Sanctuary", scryfall_id=None)
+    item = make_item(card_name="Bala Ged Recovery // Bala Ged Sanctuary", scryfall_id=None)
+    results = match([item], [listing])
+    assert results[0].status == MatchStatus.MATCHED
+
+
 # --- Condition filter ---
 
 def test_condition_nm_passes_nm_requirement():

@@ -24,10 +24,6 @@ from manabot.models import (
 
 log = logging.getLogger(__name__)
 
-# Set types considered non-in-universe by Scryfall metadata
-_NON_UNIVERSE_SET_TYPES = {"funny", "memorabilia"}
-
-
 def match(
     buy_list: list[BuyListItem],
     listings: list[PriceListing],
@@ -42,6 +38,12 @@ def match(
             by_scryfall_id.setdefault(listing.scryfall_id, []).append(listing)
         normalized = _normalize_name(listing.card_name)
         by_name.setdefault(normalized, []).append(listing)
+        # Also index DFC listings under the front-face name so buylist entries
+        # that omit the back-face (e.g. "The Mightstone and Weakstone") still match.
+        if " // " in listing.card_name:
+            front = _normalize_name(listing.card_name.split(" // ")[0])
+            if front != normalized:
+                by_name.setdefault(front, []).append(listing)
 
     results: list[MatchResult] = []
     for item in buy_list:
@@ -117,18 +119,29 @@ def _normalize_name(name: str) -> str:
 def _filter_in_universe(
     candidates: list[PriceListing], scryfall_client
 ) -> list[PriceListing]:
+    """Keep only listings where Scryfall confirms the printing is in-universe.
+
+    A listing is excluded when:
+    - `flavor_name` is set (alternate universe name printed on the card)
+    - `promo_types` contains "universesbeyond" or "sourcematerial"
+
+    If the metadata fetch fails, the listing is included with a warning rather
+    than silently dropped.
+    """
     filtered = []
     for listing in candidates:
-        try:
-            meta = scryfall_client.get_card_metadata(listing.scryfall_id)
-            set_type = meta.get("set_type", "")
-            is_promo = meta.get("promo", False)
-            if set_type not in _NON_UNIVERSE_SET_TYPES and not is_promo:
-                filtered.append(listing)
-        except NotImplementedError:
-            log.warning("Scryfall client not implemented; skipping in-universe filter for %r", listing.card_name)
+        result = scryfall_client.is_in_universe(listing.scryfall_id)
+        if result is None:
+            log.warning(
+                "Including %r (%s) — Scryfall metadata unavailable, cannot verify printing.",
+                listing.card_name, listing.scryfall_id,
+            )
             filtered.append(listing)
-        except Exception as e:
-            log.warning("Scryfall metadata error for %r: %s", listing.scryfall_id, e)
+        elif result:
             filtered.append(listing)
+        else:
+            log.debug(
+                "Excluded non-in-universe printing: %r (%s %s)",
+                listing.card_name, listing.set_code, listing.scryfall_id,
+            )
     return filtered

@@ -11,11 +11,15 @@ venv/
 # Config and secrets
 .env
 config.yaml
+CLAUDE.md
 
 # Runtime data
 data/manabot.db
 data/reports/
 data/buylist.csv
+data/last_cart.json
+data/manabot.log
+data/scryfall_oracle.json
 
 # Pytest
 .pytest_cache/
