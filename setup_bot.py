@@ -128,27 +128,41 @@ def _find_pip() -> list[str]:
 
     Tries in order:
       1. sys.executable -m pip          (pip already installed for this Python)
-      2. sys.executable -m ensurepip    (bootstrap pip, then retry)
-      3. pip3 in PATH                   (system alias fallback)
+      2. sys.executable -m ensurepip    (bootstrap if available — not on Debian/Ubuntu)
+      3. get-pip.py from PyPA           (universal bootstrap, requires internet)
     """
     if _probe(sys.executable, "-m", "pip", "--version"):
         return [sys.executable, "-m", "pip"]
 
-    # Attempt to bootstrap pip via ensurepip — silently; not available on all distros
+    # ensurepip — silently skipped if not available (e.g. Debian splits it out)
     if _probe(sys.executable, "-m", "ensurepip", "--upgrade"):
         if _probe(sys.executable, "-m", "pip", "--version"):
             return [sys.executable, "-m", "pip"]
 
-    # Last resort: system pip3 alias
-    if shutil.which("pip3") and _probe("pip3", "--version"):
-        _warn("pip module not found for this interpreter — falling back to system pip3.")
-        return ["pip3"]
+    # Download the official get-pip.py bootstrap from PyPA
+    import tempfile
+    import urllib.request
 
+    _warn("pip not found for this interpreter — downloading get-pip.py to bootstrap...")
+    tmp_path = Path(tempfile.mktemp(suffix=".py"))
+    try:
+        urllib.request.urlretrieve("https://bootstrap.pypa.io/get-pip.py", tmp_path)
+        _run([sys.executable, str(tmp_path)], check=False)
+    except Exception as exc:
+        _warn(f"get-pip.py download failed: {exc}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    if _probe(sys.executable, "-m", "pip", "--version"):
+        return [sys.executable, "-m", "pip"]
+
+    v = f"{sys.version_info.major}.{sys.version_info.minor}"
     _fail(
-        "Could not find a working pip for this Python interpreter.\n"
-        "  Try bootstrapping it manually:\n"
-        f"    {sys.executable} -m ensurepip --upgrade\n"
-        f"  Then re-run:  {sys.executable} setup_bot.py"
+        "Could not install pip for this Python interpreter.\n"
+        "  Install it manually, then re-run setup_bot.py:\n"
+        f"    curl -sS https://bootstrap.pypa.io/get-pip.py | {sys.executable}\n"
+        "  Or on Debian/Ubuntu:\n"
+        f"    sudo apt install python{v}-pip"
     )
     return []  # unreachable; satisfies type checker
 
