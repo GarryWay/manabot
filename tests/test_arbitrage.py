@@ -126,10 +126,10 @@ def test_at_min_market_price_included():
     assert len(candidates) == 1
 
 
-# --- Cross-printing logic ---
+# --- Per-printing NM reference ---
 
-def test_cheapest_nm_across_printings_is_market_reference():
-    """Market reference is the cheapest NM across all printings, not the LP's printing."""
+def test_lp_evaluated_against_same_printing_nm():
+    """LP is compared to the NM price of the same printing, not a different printing."""
     nm_old = _listing(name="X", scryfall_id="x1", set_code="OLD",
                       condition=Condition.NM, price=12.48, market=12.48)
     nm_new = _listing(name="X", scryfall_id="x2", set_code="NEW",
@@ -139,32 +139,49 @@ def test_cheapest_nm_across_printings_is_market_reference():
     candidates = find_candidates([nm_old, nm_new, lp_old],
                                  min_discount_pct=10.0, min_quantity=1)
     assert len(candidates) == 1
-    assert candidates[0].market_price_usd == pytest.approx(4.65)  # cheapest NM, not $12.48
+    # Reference is OLD printing's own NM ($12.48), not the cheaper NEW printing ($4.65)
+    assert candidates[0].market_price_usd == pytest.approx(12.48)
 
 
-def test_lp_from_any_printing_is_candidate():
-    """LP from a more expensive printing is still a candidate if cheaper than NM floor."""
-    nm_cheap = _listing(name="X", scryfall_id="x2", set_code="NEW",
-                        condition=Condition.NM, price=4.65, market=4.65)
+def test_lp_without_same_printing_nm_excluded():
+    """LP listing with no NM for the same printing is skipped — no reliable reference."""
+    nm_new = _listing(name="X", scryfall_id="x2", set_code="NEW",
+                      condition=Condition.NM, price=4.65, market=4.65)
     lp_old = _listing(name="X", scryfall_id="x1", set_code="OLD",
                       condition=Condition.LP, price=1.45, market=12.48)
-    candidates = find_candidates([nm_cheap, lp_old], min_discount_pct=10.0, min_quantity=1)
-    assert len(candidates) == 1
+    # No NM listing for OLD printing — even though NM exists for NEW, lp_old is skipped
+    candidates = find_candidates([nm_new, lp_old], min_discount_pct=10.0, min_quantity=1)
+    assert candidates == []
 
 
-def test_all_lp_printings_are_candidates():
-    """All LP listings below the NM floor qualify — no deduplication by card name."""
-    nm = _nm(name="X", scryfall_id="x1", set_code="SET1", price=5.00)
-    lp_expensive = _listing(name="X", scryfall_id="x1", set_code="SET1",
-                             condition=Condition.LP, price=1.50, market=5.00)
-    lp_cheap = _listing(name="X", scryfall_id="x2", set_code="SET2",
+def test_multiple_printings_each_need_own_nm():
+    """LP listings from different printings only qualify if each has its own NM reference."""
+    nm_set1 = _nm(name="X", scryfall_id="x1", set_code="SET1", price=5.00)
+    lp_set1 = _listing(name="X", scryfall_id="x1", set_code="SET1",
+                        condition=Condition.LP, price=1.50, market=5.00)
+    # SET2 has no NM listing — its LP should be excluded
+    lp_set2 = _listing(name="X", scryfall_id="x2", set_code="SET2",
                         condition=Condition.LP, price=1.00, market=5.00)
-    candidates = find_candidates([nm, lp_expensive, lp_cheap],
+    candidates = find_candidates([nm_set1, lp_set1, lp_set2],
+                                 min_discount_pct=10.0, min_quantity=1)
+    assert len(candidates) == 1
+    assert candidates[0].listing.set_code == "SET1"
+
+
+def test_both_printings_with_nm_both_qualify():
+    """When each printing has its own NM, both LP listings can qualify independently."""
+    nm_set1 = _nm(name="X", scryfall_id="x1", set_code="SET1", price=5.00)
+    lp_set1 = _listing(name="X", scryfall_id="x1", set_code="SET1",
+                        condition=Condition.LP, price=1.50, market=5.00)
+    nm_set2 = _nm(name="X", scryfall_id="x2", set_code="SET2", price=5.00)
+    lp_set2 = _listing(name="X", scryfall_id="x2", set_code="SET2",
+                        condition=Condition.LP, price=1.00, market=5.00)
+    candidates = find_candidates([nm_set1, lp_set1, nm_set2, lp_set2],
                                  min_discount_pct=10.0, min_quantity=1)
     assert len(candidates) == 2
     # Sorted by discount descending: SET2 (80%) before SET1 (70%)
-    assert candidates[0].listing.price_usd == pytest.approx(1.00)
-    assert candidates[1].listing.price_usd == pytest.approx(1.50)
+    assert candidates[0].listing.set_code == "SET2"
+    assert candidates[1].listing.set_code == "SET1"
 
 
 def test_no_set_code_constraint_on_buy_list_item():

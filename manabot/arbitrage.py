@@ -3,17 +3,19 @@
 Workflow
 --------
 1. Fetch all singles prices from ManaPool.
-2. Pass 1 — build cheapest-NM index: for each card name, find the cheapest NM
-   nonfoil listing across ALL printings. That price is the "true market floor";
-   buyers gravitate to the cheapest version, so it's the reference price.
-3. Pass 2 — find the cheapest LP listing for each card, across ALL printings.
-   Compare it to the cheapest-NM floor. Cards with no live NM listing are skipped.
-4. A card is a candidate when:
-     cheapest_lp_price < nm_floor_price × (1 − min_discount_pct / 100)
+2. Pass 1 — build cheapest-NM index: for each (card_name, set_code), find the
+   cheapest NM nonfoil listing for THAT printing. Keyed per printing so that a
+   cheap reprint's NM price is never used as the reference for an expensive
+   original's LP price (and vice versa).
+3. Pass 2 — scan every LP listing. Look up the NM floor for the SAME printing.
+   If no live NM listing exists for that printing, skip it — we have no reliable
+   reference price.
+4. A listing is a candidate when:
+     lp_price < same_printing_nm_floor × (1 − min_discount_pct / 100)
+   and nm_floor >= min_market_price_usd (excludes bulk commons)
    and available_quantity >= min_quantity (liquidity proxy).
-5. Build a BuyListItem with max_price = nm_floor_price, no set_code constraint.
-   The optimizer is free to find any printing — if it finds a copy cheaper than
-   our LP scan price, that only improves the margin.
+5. Build a BuyListItem with max_price = same_printing_nm_floor, no set_code
+   constraint. The optimizer is free to find any printing at or below that price.
 """
 from __future__ import annotations
 
@@ -69,17 +71,19 @@ def find_candidates(
     Returns:
         List of ArbitrageCandidate sorted by discount_pct descending (best deal first).
     """
-    # Pass 1: cheapest NM nonfoil price per card name, across ALL printings.
-    cheapest_nm: dict[str, float] = {}
+    # Pass 1: cheapest NM nonfoil price per (card_name, set_code).
+    # Keyed by printing so we never compare a cheap reprint's LP price against
+    # an expensive original printing's NM price (or vice versa).
+    nm_by_printing: dict[tuple[str, str], float] = {}
     for listing in listings:
         if listing.condition != Condition.NM or listing.finish != Finish.NONFOIL:
             continue
-        name = listing.card_name
-        current = cheapest_nm.get(name)
+        key = (listing.card_name, listing.set_code)
+        current = nm_by_printing.get(key)
         if current is None or listing.price_usd < current:
-            cheapest_nm[name] = listing.price_usd
+            nm_by_printing[key] = listing.price_usd
 
-    # Pass 2: every LP listing below the NM floor, one candidate per (card, printing).
+    # Pass 2: LP listings evaluated against the NM price of the SAME printing.
     # min_quantity is a pass/fail liquidity gate only — not proportional to purchase size.
     candidates: list[ArbitrageCandidate] = []
     skipped_unsanctioned = 0
@@ -92,9 +96,9 @@ def find_candidates(
         if listing.condition not in _RESALE_CONDITIONS:
             continue
 
-        nm_floor = cheapest_nm.get(listing.card_name)
+        nm_floor = nm_by_printing.get((listing.card_name, listing.set_code))
         if nm_floor is None:
-            continue  # no live NM reference — skip
+            continue  # no live NM reference for this printing — skip
 
         if nm_floor < min_market_price_usd:
             continue
