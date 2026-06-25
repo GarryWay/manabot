@@ -30,6 +30,7 @@ from __future__ import annotations
 import getpass
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -113,6 +114,45 @@ def _run(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=check)
 
 
+def _probe(*cmd: str) -> bool:
+    """Return True if cmd exits 0. Output is suppressed — used for silent capability checks."""
+    try:
+        subprocess.run(list(cmd), check=True, capture_output=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def _find_pip() -> list[str]:
+    """Return a pip command that works with the current Python interpreter.
+
+    Tries in order:
+      1. sys.executable -m pip          (pip already installed for this Python)
+      2. sys.executable -m ensurepip    (bootstrap pip, then retry)
+      3. pip3 in PATH                   (system alias fallback)
+    """
+    if _probe(sys.executable, "-m", "pip", "--version"):
+        return [sys.executable, "-m", "pip"]
+
+    # Attempt to bootstrap pip via ensurepip (ships with CPython 3.4+)
+    _run([sys.executable, "-m", "ensurepip", "--upgrade"], check=False)
+    if _probe(sys.executable, "-m", "pip", "--version"):
+        return [sys.executable, "-m", "pip"]
+
+    # Last resort: system pip3 alias
+    if shutil.which("pip3") and _probe("pip3", "--version"):
+        _warn("pip module not found for this interpreter — falling back to system pip3.")
+        return ["pip3"]
+
+    _fail(
+        "Could not find a working pip for this Python interpreter.\n"
+        "  Try bootstrapping it manually:\n"
+        f"    {sys.executable} -m ensurepip --upgrade\n"
+        f"  Then re-run:  {sys.executable} setup_bot.py"
+    )
+    return []  # unreachable; satisfies type checker
+
+
 def _read_env_file() -> dict[str, str]:
     """Parse key=value pairs from .env (ignores comments and blank lines)."""
     result: dict[str, str] = {}
@@ -140,14 +180,28 @@ def _write_env_file(values: dict[str, str]) -> None:
 def check_python() -> None:
     _step("Step 1 — Verify Python version")
     info = sys.version_info
-    if info < (3, 11):
-        _fail(f"Python 3.11+ required; found {info.major}.{info.minor}. Please upgrade.")
-    _ok(f"Python {info.major}.{info.minor}.{info.micro}")
+    if info >= (3, 11):
+        _ok(f"Python {info.major}.{info.minor}.{info.micro}")
+        return
+
+    # Look for a newer Python in PATH and suggest it
+    suggestion = ""
+    for minor in range(14, 10, -1):
+        candidate = f"python3.{minor}"
+        if shutil.which(candidate):
+            suggestion = f"\n  Found {candidate} — re-run with:  {candidate} setup_bot.py"
+            break
+
+    _fail(
+        f"Python 3.11+ required; found {info.major}.{info.minor}."
+        f"{suggestion}"
+    )
 
 
 def install_deps() -> None:
     _step("Step 2 — Install dependencies")
-    result = _run([sys.executable, "-m", "pip", "install", "-e", ".[bot]", "--quiet"], check=False)
+    pip_cmd = _find_pip()
+    result = _run([*pip_cmd, "install", "-e", ".[bot]", "--quiet"], check=False)
     if result.returncode != 0:
         _fail(
             "pip install failed. Check the error above and retry.\n"
