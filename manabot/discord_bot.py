@@ -512,7 +512,11 @@ def create_bot(config: Config) -> _ManabotClient:
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
-            parts = [p.strip() for p in line.split(",")]
+            try:
+                parts = [p.strip() for p in next(csv.reader([line]))]
+            except Exception:
+                errors.append(f"Line {line_num}: could not parse — got: {line!r}")
+                continue
             if len(parts) < 3:
                 errors.append(f"Line {line_num}: need name,qty,price — got: {line!r}")
                 continue
