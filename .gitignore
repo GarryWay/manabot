@@ -20,6 +20,7 @@ data/buylist.csv
 data/last_cart.json
 data/manabot.log
 data/scryfall_oracle.json
+data/scryfall_oracle.meta.json
 
 # Pytest
 .pytest_cache/

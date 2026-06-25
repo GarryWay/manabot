@@ -3,7 +3,109 @@ import tempfile
 from datetime import date, timedelta
 from pathlib import Path
 
-from manabot.api.scryfall_bulk import ScryfallBulk
+import responses as resp_lib
+
+from manabot.api.scryfall_bulk import ScryfallBulk, download_oracle_cards
+
+_BULK_META_URL = "https://api.scryfall.com/bulk-data"
+_DOWNLOAD_URL = "https://data.scryfall.io/oracle-cards/oracle-cards-20260101.json"
+
+_BULK_RESPONSE = {
+    "data": [
+        {
+            "type": "oracle_cards",
+            "updated_at": "2026-01-01T12:00:00+00:00",
+            "download_uri": _DOWNLOAD_URL,
+            "size": 1024,
+        }
+    ]
+}
+
+_CARDS_PAYLOAD = json.dumps([
+    {
+        "id": "abc",
+        "name": "Lightning Bolt",
+        "prices": {"usd": "1.25", "usd_foil": "3.00"},
+        "legalities": {"vintage": "legal", "legacy": "legal", "modern": "legal",
+                       "commander": "legal", "pioneer": "not_legal", "standard": "not_legal"},
+    }
+]).encode()
+
+
+@resp_lib.activate
+def test_download_oracle_cards_new_file():
+    resp_lib.add(resp_lib.GET, _BULK_META_URL, json=_BULK_RESPONSE)
+    resp_lib.add(resp_lib.GET, _DOWNLOAD_URL, body=_CARDS_PAYLOAD, content_type="application/json")
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "oracle.json"
+        result = download_oracle_cards(path)
+
+    assert result is True
+
+
+@resp_lib.activate
+def test_download_oracle_cards_writes_data():
+    resp_lib.add(resp_lib.GET, _BULK_META_URL, json=_BULK_RESPONSE)
+    resp_lib.add(resp_lib.GET, _DOWNLOAD_URL, body=_CARDS_PAYLOAD, content_type="application/json")
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "oracle.json"
+        download_oracle_cards(path)
+        cards = json.loads(path.read_text(encoding="utf-8"))
+
+    assert cards[0]["name"] == "Lightning Bolt"
+
+
+@resp_lib.activate
+def test_download_oracle_cards_writes_meta_sidecar():
+    resp_lib.add(resp_lib.GET, _BULK_META_URL, json=_BULK_RESPONSE)
+    resp_lib.add(resp_lib.GET, _DOWNLOAD_URL, body=_CARDS_PAYLOAD, content_type="application/json")
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "oracle.json"
+        download_oracle_cards(path)
+        meta = json.loads((path.with_name("oracle.meta.json")).read_text(encoding="utf-8"))
+
+    assert meta["updated_at"] == "2026-01-01T12:00:00+00:00"
+
+
+@resp_lib.activate
+def test_download_oracle_cards_skips_when_current():
+    """Should not re-download when the stored updated_at matches Scryfall's."""
+    resp_lib.add(resp_lib.GET, _BULK_META_URL, json=_BULK_RESPONSE)
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "oracle.json"
+        path.write_bytes(_CARDS_PAYLOAD)
+        meta_path = path.with_name("oracle.meta.json")
+        meta_path.write_text(
+            json.dumps({"updated_at": "2026-01-01T12:00:00+00:00"}),
+            encoding="utf-8",
+        )
+        result = download_oracle_cards(path)
+
+    assert result is False
+    assert len(resp_lib.calls) == 1  # only the metadata request, no download
+
+
+@resp_lib.activate
+def test_download_oracle_cards_force_re_downloads():
+    """force=True should re-download even if updated_at matches."""
+    resp_lib.add(resp_lib.GET, _BULK_META_URL, json=_BULK_RESPONSE)
+    resp_lib.add(resp_lib.GET, _DOWNLOAD_URL, body=_CARDS_PAYLOAD, content_type="application/json")
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "oracle.json"
+        path.write_bytes(_CARDS_PAYLOAD)
+        meta_path = path.with_name("oracle.meta.json")
+        meta_path.write_text(
+            json.dumps({"updated_at": "2026-01-01T12:00:00+00:00"}),
+            encoding="utf-8",
+        )
+        result = download_oracle_cards(path, force=True)
+
+    assert result is True
 
 
 def _write_bulk(cards: list[dict], tmp_dir: str) -> Path:

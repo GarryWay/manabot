@@ -4,8 +4,9 @@ Loads data/scryfall_oracle.json (one record per unique card name) and exposes:
   - is_sanctioned(card_name)  — True if legal in at least one tournament format
   - get_market_price(card_name, foil)  — TCGPlayer market price from Scryfall
 
-The 169MB file is parsed once and cached in the instance. Load time ~2-3s.
-Download via scripts/populate_buylist.py (refreshes weekly).
+The ~170 MB file is parsed once and cached in the instance. Load time ~2-3s.
+Call download_oracle_cards() to fetch or refresh the file; the bot does this
+automatically at startup and weekly thereafter.
 """
 from __future__ import annotations
 
@@ -18,6 +19,68 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 DEFAULT_PATH = Path("data/scryfall_oracle.json")
+
+_BULK_DATA_URL = "https://api.scryfall.com/bulk-data"
+
+
+def download_oracle_cards(path: Path = DEFAULT_PATH, force: bool = False) -> bool:
+    """Download the Scryfall oracle_cards bulk file if a newer version is available.
+
+    Fetches the bulk-data index (tiny JSON) on every call to check the current
+    ``updated_at`` timestamp. The actual ~170 MB file is only downloaded when
+    Scryfall has published a newer version than the one recorded in the sidecar
+    ``<path>.meta.json``, or when the file is absent.
+
+    Returns True if the file was downloaded, False if already current.
+    Raises ``requests.HTTPError`` or ``OSError`` on failure.
+    """
+    import requests
+
+    meta_path = path.with_name(path.stem + ".meta.json")
+
+    resp = requests.get(_BULK_DATA_URL, timeout=30,
+                        headers={"User-Agent": "manabot/1.0"})
+    resp.raise_for_status()
+    oracle_meta = next(
+        (item for item in resp.json().get("data", []) if item["type"] == "oracle_cards"),
+        None,
+    )
+    if oracle_meta is None:
+        raise RuntimeError("oracle_cards entry not found in Scryfall bulk-data listing")
+
+    updated_at: str = oracle_meta["updated_at"]
+    download_uri: str = oracle_meta["download_uri"]
+
+    if not force and path.exists() and meta_path.exists():
+        try:
+            stored = json.loads(meta_path.read_text(encoding="utf-8"))
+            if stored.get("updated_at") == updated_at:
+                log.info("Scryfall oracle data is current (updated_at=%s)", updated_at)
+                return False
+        except Exception:
+            pass
+
+    log.info("Downloading Scryfall oracle_cards updated_at=%s (~170 MB)…", updated_at)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    try:
+        with requests.get(download_uri, stream=True, timeout=120,
+                          headers={"User-Agent": "manabot/1.0"}) as dl:
+            dl.raise_for_status()
+            with tmp.open("wb") as f:
+                for chunk in dl.iter_content(chunk_size=1024 * 1024):
+                    f.write(chunk)
+        tmp.replace(path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+    meta_path.write_text(
+        json.dumps({"updated_at": updated_at, "download_uri": download_uri}, indent=2),
+        encoding="utf-8",
+    )
+    log.info("Scryfall oracle_cards saved to %s", path)
+    return True
 
 # Formats whose legality makes a card resalable as a tournament playable card.
 _SANCTIONED_FORMATS = {"vintage", "legacy", "commander", "modern", "pioneer", "standard"}

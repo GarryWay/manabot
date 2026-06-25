@@ -34,6 +34,20 @@ log = logging.getLogger(__name__)
 _VALID_CONDITIONS = [c.value for c in Condition]
 _VALID_FINISHES = [f.value for f in Finish]
 
+_SCRYFALL_REFRESH_INTERVAL = 7 * 24 * 3600  # weekly
+
+
+async def _scryfall_refresh_loop(oracle_path: Path) -> None:
+    """Download oracle data immediately, then refresh weekly."""
+    from manabot.api.scryfall_bulk import download_oracle_cards
+    while True:
+        try:
+            downloaded = await asyncio.to_thread(download_oracle_cards, oracle_path)
+            log.info("Scryfall oracle: %s", "updated" if downloaded else "already current")
+        except Exception as exc:
+            log.warning("Scryfall oracle refresh failed: %s", exc)
+        await asyncio.sleep(_SCRYFALL_REFRESH_INTERVAL)
+
 
 # ── Last-cart persistence ────────────────────────────────────────────────────
 
@@ -263,6 +277,8 @@ class _ManabotClient(discord.Client):
         super().__init__(intents=intents)
         self.config = config
         self.tree = app_commands.CommandTree(self)
+        self._oracle_path = config.db_path.parent / "scryfall_oracle.json"
+        self._scryfall_task: asyncio.Task | None = None
 
     async def setup_hook(self) -> None:
         guild = discord.Object(id=self.config.discord_guild_id) if self.config.discord_guild_id else None
@@ -276,6 +292,11 @@ class _ManabotClient(discord.Client):
 
     async def on_ready(self) -> None:
         log.info("Discord bot ready: %s (ID %s)", self.user, self.user.id)  # type: ignore[union-attr]
+        # Start (or restart after reconnect) the weekly Scryfall refresh task.
+        if self._scryfall_task is None or self._scryfall_task.done():
+            self._scryfall_task = asyncio.create_task(
+                _scryfall_refresh_loop(self._oracle_path)
+            )
 
 
 def create_bot(config: Config) -> _ManabotClient:

@@ -490,6 +490,30 @@ def restart_service() -> None:
         _warn(f"Unknown OS ({system}) — restart manually:  python -m manabot bot")
 
 
+def download_oracle_data() -> None:
+    _step("Step 8 — Download Scryfall oracle card data (~170 MB)")
+    oracle_path = PROJECT_DIR / "data" / "scryfall_oracle.json"
+    meta_path = oracle_path.with_name("scryfall_oracle.meta.json")
+
+    if oracle_path.exists() and meta_path.exists():
+        _ok("Scryfall oracle data already present — skipping initial download.")
+        print("       (The running bot will check for updates weekly.)")
+        return
+
+    try:
+        from manabot.api.scryfall_bulk import download_oracle_cards
+        download_oracle_cards(oracle_path)
+        _ok(f"Downloaded to {oracle_path}")
+    except Exception as exc:
+        _warn(
+            f"Download failed: {exc}\n"
+            "  The bot will retry automatically on first startup.\n"
+            "  If this keeps failing, check your internet connection and try:\n"
+            f"    python -c \"from manabot.api.scryfall_bulk import download_oracle_cards; "
+            f"download_oracle_cards()\""
+        )
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def _run_setup() -> None:
@@ -506,6 +530,7 @@ def _run_setup() -> None:
     configure_env()
     create_config_yaml()
     setup_autostart()
+    download_oracle_data()
 
     print("\n" + "=" * 60)
     print("  Setup complete!")
