@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-setup_bot.py — Bootstrap and upgrade helper for the manabot Discord bot.
+setup_bot.py — Bootstrap and upgrade helper for manabot.
 
 First deployment (run once on the host machine):
     python setup_bot.py
@@ -10,19 +10,23 @@ Upgrade after pulling new code:
 
 Setup steps:
   1. Verify Python >= 3.11
-  2. Install bot dependencies  (pip install -e ".[bot]")
+  2. Install all dependencies  (pip install -e ".[full]")
   3. Create data/ directories
   4. Create data/buylist.csv with header row (if absent)
   5. Interactively populate .env with credentials (if absent or incomplete)
   6. Create config.yaml template (if absent)
-  7. Install and enable a startup service:
-       Linux  → systemd user service  (~/.config/systemd/user/manabot.service)
-       Windows → Task Scheduler task  (runs at logon)
-       macOS  → launchd plist         (~/Library/LaunchAgents/com.manabot.bot.plist)
+  7. Install and enable startup services:
+       Linux  → two systemd user services
+                  manabot.service        (Discord bot, starts at boot)
+                  manabot-pricer.service (daily price updater, runs 2 AM Central)
+       Windows → two Task Scheduler tasks (same services, run at logon)
+       macOS  → two launchd plists        (same services)
+  8. Download Scryfall oracle card data
 
-Upgrade steps (skips credential prompting, only reinstalls deps + restarts service):
-  1. pip install -e ".[bot]"
-  2. Restart the running service
+Upgrade steps (skips credential prompting):
+  1. pip install -e ".[full]"
+  2. Rewrite service files to pick up any changes
+  3. Restart both running services
 """
 
 from __future__ import annotations
@@ -73,6 +77,10 @@ optimizer:
   destination: US
   min_market_price_usd: 2.00
 
+pricer:
+  schedule_hour: 2                    # local hour for daily inventory reprice
+  schedule_timezone: America/Chicago  # IANA timezone — handles DST automatically
+
 # behavior:
 #   trend_window_days: 7
 #   trend_threshold_pct: 5.0
@@ -87,6 +95,15 @@ _OPTIONAL_ENV = {
     "DISCORD_WEBHOOK_URL": "Discord webhook URL (optional — for run/optimize alerts)",
     "DISCORD_GUILD_ID":    "Discord guild/server ID (optional — for instant slash-command sync during dev)",
 }
+
+# ── Systemd / Task Scheduler names ────────────────────────────────────────────
+
+_LINUX_BOT_UNIT    = "manabot.service"
+_LINUX_PRICER_UNIT = "manabot-pricer.service"
+_WIN_TASK_BOT      = "Manabot Discord Bot"
+_WIN_TASK_PRICER   = "Manabot Price Updater"
+_MAC_LABEL_BOT     = "com.manabot.bot"
+_MAC_LABEL_PRICER  = "com.manabot.pricer"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -124,22 +141,14 @@ def _probe(*cmd: str) -> bool:
 
 
 def _find_pip() -> list[str]:
-    """Return a pip command that works with the current Python interpreter.
-
-    Tries in order:
-      1. sys.executable -m pip          (pip already installed for this Python)
-      2. sys.executable -m ensurepip    (bootstrap if available — not on Debian/Ubuntu)
-      3. get-pip.py from PyPA           (universal bootstrap, requires internet)
-    """
+    """Return a pip command that works with the current Python interpreter."""
     if _probe(sys.executable, "-m", "pip", "--version"):
         return [sys.executable, "-m", "pip"]
 
-    # ensurepip — silently skipped if not available (e.g. Debian splits it out)
     if _probe(sys.executable, "-m", "ensurepip", "--upgrade"):
         if _probe(sys.executable, "-m", "pip", "--version"):
             return [sys.executable, "-m", "pip"]
 
-    # Download the official get-pip.py bootstrap from PyPA
     import tempfile
     import urllib.request
 
@@ -164,7 +173,7 @@ def _find_pip() -> list[str]:
         "  Or on Debian/Ubuntu:\n"
         f"    sudo apt install python{v}-pip"
     )
-    return []  # unreachable; satisfies type checker
+    return []
 
 
 def _read_env_file() -> dict[str, str]:
@@ -198,7 +207,6 @@ def check_python() -> None:
         _ok(f"Python {info.major}.{info.minor}.{info.micro}")
         return
 
-    # Look for a newer Python in PATH and suggest it
     suggestion = ""
     for minor in range(14, 10, -1):
         candidate = f"python3.{minor}"
@@ -215,13 +223,14 @@ def check_python() -> None:
 def install_deps() -> None:
     _step("Step 2 — Install dependencies")
     pip_cmd = _find_pip()
-    result = _run([*pip_cmd, "install", "-e", ".[bot]", "--quiet"], check=False)
+    # [full] includes bot (discord.py) + scheduler (apscheduler) extras
+    result = _run([*pip_cmd, "install", "-e", ".[full]", "--quiet"], check=False)
     if result.returncode != 0:
         _fail(
             "pip install failed. Check the error above and retry.\n"
             "  Common fix: ensure you're running inside the manabot directory."
         )
-    _ok("Dependencies installed.")
+    _ok("Dependencies installed (bot + scheduler).")
 
 
 def create_directories() -> None:
@@ -244,7 +253,6 @@ def configure_env() -> None:
     _step("Step 5 — Configure credentials (.env)")
 
     existing = _read_env_file()
-    # Merge with actual environment variables so we don't re-prompt for already-set vars
     for k in list(_REQUIRED_ENV) + list(_OPTIONAL_ENV):
         if os.getenv(k) and k not in existing:
             existing[k] = os.environ[k]
@@ -252,7 +260,7 @@ def configure_env() -> None:
     missing_required = [k for k in _REQUIRED_ENV if not existing.get(k)]
 
     if not missing_required:
-        _ok(f".env is complete — all required credentials present.")
+        _ok(".env is complete — all required credentials present.")
         return
 
     print(
@@ -288,19 +296,12 @@ def create_config_yaml() -> None:
     _ok(f"Created {CONFIG_YAML.name} — edit it to customise further.")
 
 
-# ── Auto-start helpers ─────────────────────────────────────────────────────────
+# ── Service file builders ──────────────────────────────────────────────────────
 
-def _setup_linux() -> None:
-    """Install a systemd user service that starts at boot via loginctl linger."""
-    service_dir = Path.home() / ".config" / "systemd" / "user"
-    service_file = service_dir / "manabot.service"
-
-    service_dir.mkdir(parents=True, exist_ok=True)
-
+def _linux_bot_service() -> str:
     python_exe = sys.executable
     env_file_line = f"EnvironmentFile={ENV_FILE}" if ENV_FILE.exists() else ""
-
-    service_content = textwrap.dedent(f"""\
+    return textwrap.dedent(f"""\
         [Unit]
         Description=Manabot Discord Bot
         After=network-online.target
@@ -309,7 +310,7 @@ def _setup_linux() -> None:
         [Service]
         Type=simple
         WorkingDirectory={PROJECT_DIR}
-        ExecStart={python_exe} -m manabot bot
+        ExecStart={python_exe} -m manabot discord-bot
         Restart=on-failure
         RestartSec=15
         {env_file_line}
@@ -318,52 +319,36 @@ def _setup_linux() -> None:
         WantedBy=default.target
     """)
 
-    service_file.write_text(service_content, encoding="utf-8")
-    _ok(f"Service file written: {service_file}")
 
-    # Reload and enable
-    for cmd in [
-        ["systemctl", "--user", "daemon-reload"],
-        ["systemctl", "--user", "enable", "manabot.service"],
-        ["systemctl", "--user", "start", "manabot.service"],
-    ]:
-        result = _run(cmd, check=False)
-        if result.returncode != 0:
-            _warn(f"Command failed: {' '.join(cmd)}")
-            _warn("You may need to run it manually after verifying systemd is available.")
+def _linux_pricer_service() -> str:
+    python_exe = sys.executable
+    env_file_line = f"EnvironmentFile={ENV_FILE}" if ENV_FILE.exists() else ""
+    return textwrap.dedent(f"""\
+        [Unit]
+        Description=Manabot Daily Price Updater
+        After=network-online.target
+        Wants=network-online.target
 
-    # Enable linger so the service survives after the user logs out
-    linger_result = _run(["loginctl", "enable-linger", getpass.getuser()], check=False)
-    if linger_result.returncode == 0:
-        _ok("loginctl linger enabled — service will start at boot without login.")
-    else:
-        _warn(
-            "loginctl enable-linger failed (may require sudo).\n"
-            "  Without linger the service only runs while you are logged in.\n"
-            f"  Run manually:  sudo loginctl enable-linger {getpass.getuser()}"
-        )
+        [Service]
+        Type=simple
+        WorkingDirectory={PROJECT_DIR}
+        ExecStart={python_exe} -m manabot pricer-scheduler
+        Restart=on-failure
+        RestartSec=60
+        {env_file_line}
 
-    print(
-        "\n  Useful commands:\n"
-        "    systemctl --user status manabot\n"
-        "    systemctl --user restart manabot\n"
-        "    journalctl --user -u manabot -f"
-    )
+        [Install]
+        WantedBy=default.target
+    """)
 
 
-def _setup_windows() -> None:
-    """Register a Task Scheduler task that runs the bot at logon."""
-    import tempfile
-
+def _windows_task_xml(task_name: str, module_args: str) -> str:
     python_exe = str(Path(sys.executable).resolve())
-    task_name = "Manabot Discord Bot"
-
-    # Build the XML for schtasks /create /xml
-    xml = textwrap.dedent(f"""\
+    return textwrap.dedent(f"""\
         <?xml version="1.0" encoding="UTF-8"?>
         <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
           <RegistrationInfo>
-            <Description>Manabot Discord slash-command bot — auto-starts at logon.</Description>
+            <Description>{task_name}</Description>
           </RegistrationInfo>
           <Triggers>
             <LogonTrigger>
@@ -387,91 +372,38 @@ def _setup_windows() -> None:
           <Actions Context="Author">
             <Exec>
               <Command>{python_exe}</Command>
-              <Arguments>-m manabot bot</Arguments>
+              <Arguments>{module_args}</Arguments>
               <WorkingDirectory>{PROJECT_DIR}</WorkingDirectory>
             </Exec>
           </Actions>
         </Task>
     """)
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".xml", delete=False, encoding="utf-8"
-    ) as tmp:
-        tmp.write(xml)
-        tmp_path = tmp.name
 
-    try:
-        result = _run(
-            ["schtasks", "/create", "/tn", task_name, "/xml", tmp_path, "/f"],
-            check=False,
-        )
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
-
-    if result.returncode != 0:
-        _warn("Task Scheduler registration failed.")
-        _warn(
-            "You can register it manually by running:\n"
-            f"  schtasks /create /tn \"{task_name}\" /tr \"{python_exe} -m manabot bot\" "
-            f"/sc onlogon /f"
-        )
-        return
-
-    _ok(f"Task Scheduler task '{task_name}' registered (runs at logon).")
-
-    # Start it immediately as well
-    start_result = _run(["schtasks", "/run", "/tn", task_name], check=False)
-    if start_result.returncode == 0:
-        _ok("Bot started.")
-    else:
-        _warn("Could not start task immediately — it will start on next logon.")
-
-    print(
-        "\n  Useful commands:\n"
-        f"    schtasks /query /tn \"{task_name}\"\n"
-        f"    schtasks /run /tn \"{task_name}\"\n"
-        f"    schtasks /end /tn \"{task_name}\"\n"
-        f"    schtasks /delete /tn \"{task_name}\" /f"
-    )
-    print(
-        "\n  NOTE: The task runs when you log in. For a truly headless server\n"
-        "  (bot runs even when no one is logged in), enable auto-login and set\n"
-        "  the task trigger to 'At startup' with a service account instead."
-    )
-
-
-def _setup_macos() -> None:
-    """Install a launchd user agent that starts at login."""
-    agents_dir = Path.home() / "Library" / "LaunchAgents"
-    plist_file = agents_dir / "com.manabot.bot.plist"
-
-    agents_dir.mkdir(parents=True, exist_ok=True)
-
+def _mac_plist(label: str, module_cmd: str) -> str:
     python_exe = str(Path(sys.executable).resolve())
     log_file = str(PROJECT_DIR / "data" / "manabot.log")
-
-    # Build env dict from .env for launchd EnvironmentVariables
     env_dict = _read_env_file()
     env_xml = "\n".join(
         f"\t\t<key>{k}</key>\n\t\t<string>{v}</string>"
         for k, v in env_dict.items()
         if v
     )
-
-    plist = textwrap.dedent(f"""\
+    args_xml = "\n".join(
+        f"\t\t<string>{arg}</string>" for arg in module_cmd.split()
+    )
+    return textwrap.dedent(f"""\
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
             "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
         <plist version="1.0">
         <dict>
             <key>Label</key>
-            <string>com.manabot.bot</string>
+            <string>{label}</string>
             <key>ProgramArguments</key>
             <array>
                 <string>{python_exe}</string>
-                <string>-m</string>
-                <string>manabot</string>
-                <string>bot</string>
+        {args_xml}
             </array>
             <key>WorkingDirectory</key>
             <string>{PROJECT_DIR}</string>
@@ -491,24 +423,166 @@ def _setup_macos() -> None:
         </plist>
     """)
 
-    plist_file.write_text(plist, encoding="utf-8")
-    _ok(f"plist written: {plist_file}")
+
+# ── Platform-specific setup ────────────────────────────────────────────────────
+
+def _write_linux_service_files() -> tuple[Path, Path]:
+    """Write both service files to ~/.config/systemd/user/. Returns their paths."""
+    service_dir = Path.home() / ".config" / "systemd" / "user"
+    service_dir.mkdir(parents=True, exist_ok=True)
+
+    bot_file = service_dir / _LINUX_BOT_UNIT
+    pricer_file = service_dir / _LINUX_PRICER_UNIT
+
+    bot_file.write_text(_linux_bot_service(), encoding="utf-8")
+    _ok(f"Service file written: {bot_file}")
+
+    pricer_file.write_text(_linux_pricer_service(), encoding="utf-8")
+    _ok(f"Service file written: {pricer_file}")
+
+    return bot_file, pricer_file
+
+
+def _setup_linux() -> None:
+    """Install both systemd user services and enable linger for boot-time start."""
+    _write_linux_service_files()
 
     for cmd in [
-        ["launchctl", "unload", str(plist_file)],   # unload first (ignore failure)
-        ["launchctl", "load", "-w", str(plist_file)],
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", _LINUX_BOT_UNIT],
+        ["systemctl", "--user", "start",  _LINUX_BOT_UNIT],
+        ["systemctl", "--user", "enable", _LINUX_PRICER_UNIT],
+        ["systemctl", "--user", "start",  _LINUX_PRICER_UNIT],
     ]:
         result = _run(cmd, check=False)
-        if result.returncode != 0 and "load" in cmd:
-            _warn(f"launchctl load failed — try: launchctl load -w {plist_file}")
+        if result.returncode != 0:
+            _warn(f"Command failed: {' '.join(cmd)}")
+
+    linger_result = _run(["loginctl", "enable-linger", getpass.getuser()], check=False)
+    if linger_result.returncode == 0:
+        _ok("loginctl linger enabled — services start at boot without login.")
+    else:
+        _warn(
+            "loginctl enable-linger failed (may require sudo).\n"
+            "  Without linger the services only run while you are logged in.\n"
+            f"  Run manually:  sudo loginctl enable-linger {getpass.getuser()}"
+        )
 
     print(
         "\n  Useful commands:\n"
-        "    launchctl list com.manabot.bot\n"
-        f"    launchctl stop com.manabot.bot\n"
-        f"    launchctl start com.manabot.bot\n"
+        f"    systemctl --user status {_LINUX_BOT_UNIT}\n"
+        f"    systemctl --user status {_LINUX_PRICER_UNIT}\n"
+        f"    systemctl --user restart {_LINUX_BOT_UNIT}\n"
+        f"    systemctl --user restart {_LINUX_PRICER_UNIT}\n"
+        f"    journalctl --user -u manabot -f\n"
+        f"    journalctl --user -u manabot-pricer -f"
+    )
+
+
+def _restart_linux() -> None:
+    _run(["systemctl", "--user", "daemon-reload"], check=False)
+    for unit in [_LINUX_BOT_UNIT, _LINUX_PRICER_UNIT]:
+        result = _run(["systemctl", "--user", "restart", unit], check=False)
+        if result.returncode != 0:
+            _warn(f"Restart failed for {unit}. Run manually:  systemctl --user restart {unit}")
+        else:
+            _ok(f"{unit} restarted.")
+
+
+def _register_windows_task(task_name: str, module_args: str) -> None:
+    import tempfile
+    xml = _windows_task_xml(task_name, module_args)
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".xml", delete=False, encoding="utf-8"
+    ) as tmp:
+        tmp.write(xml)
+        tmp_path = tmp.name
+    try:
+        result = _run(
+            ["schtasks", "/create", "/tn", task_name, "/xml", tmp_path, "/f"],
+            check=False,
+        )
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    if result.returncode != 0:
+        _warn(f"Task Scheduler registration failed for '{task_name}'.")
+    else:
+        _ok(f"Task '{task_name}' registered.")
+
+
+def _setup_windows() -> None:
+    _register_windows_task(_WIN_TASK_BOT, "-m manabot discord-bot")
+    _register_windows_task(_WIN_TASK_PRICER, "-m manabot pricer-scheduler")
+
+    for task_name in [_WIN_TASK_BOT, _WIN_TASK_PRICER]:
+        result = _run(["schtasks", "/run", "/tn", task_name], check=False)
+        if result.returncode != 0:
+            _warn(f"Could not start '{task_name}' immediately — starts at next logon.")
+        else:
+            _ok(f"'{task_name}' started.")
+
+    print(
+        f"\n  Useful commands:\n"
+        f"    schtasks /query /tn \"{_WIN_TASK_BOT}\"\n"
+        f"    schtasks /query /tn \"{_WIN_TASK_PRICER}\"\n"
+        f"    schtasks /run   /tn \"{_WIN_TASK_PRICER}\"\n"
+        f"    schtasks /end   /tn \"{_WIN_TASK_PRICER}\""
+    )
+
+
+def _restart_windows() -> None:
+    import time
+    for task_name in [_WIN_TASK_BOT, _WIN_TASK_PRICER]:
+        _run(["schtasks", "/end", "/tn", task_name], check=False)
+    time.sleep(2)
+    for task_name in [_WIN_TASK_BOT, _WIN_TASK_PRICER]:
+        result = _run(["schtasks", "/run", "/tn", task_name], check=False)
+        if result.returncode != 0:
+            _warn(f"Could not restart '{task_name}'.")
+        else:
+            _ok(f"'{task_name}' restarted.")
+
+
+def _setup_macos() -> None:
+    agents_dir = Path.home() / "Library" / "LaunchAgents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+
+    services = [
+        (_MAC_LABEL_BOT,    "-m manabot discord-bot"),
+        (_MAC_LABEL_PRICER, "-m manabot pricer-scheduler"),
+    ]
+
+    for label, module_cmd in services:
+        plist_file = agents_dir / f"{label}.plist"
+        plist_file.write_text(_mac_plist(label, module_cmd), encoding="utf-8")
+        _ok(f"plist written: {plist_file}")
+        _run(["launchctl", "unload", str(plist_file)], check=False)
+        result = _run(["launchctl", "load", "-w", str(plist_file)], check=False)
+        if result.returncode != 0:
+            _warn(f"launchctl load failed — try: launchctl load -w {plist_file}")
+        else:
+            _ok(f"{label} loaded.")
+
+    log_file = PROJECT_DIR / "data" / "manabot.log"
+    print(
+        "\n  Useful commands:\n"
+        f"    launchctl list {_MAC_LABEL_BOT}\n"
+        f"    launchctl list {_MAC_LABEL_PRICER}\n"
+        f"    launchctl stop {_MAC_LABEL_PRICER}\n"
+        f"    launchctl start {_MAC_LABEL_PRICER}\n"
         f"    tail -f {log_file}"
     )
+
+
+def _restart_macos() -> None:
+    for label in [_MAC_LABEL_BOT, _MAC_LABEL_PRICER]:
+        _run(["launchctl", "stop", label], check=False)
+        result = _run(["launchctl", "start", label], check=False)
+        if result.returncode != 0:
+            _warn(f"Restart failed for {label}.")
+        else:
+            _ok(f"{label} restarted.")
 
 
 def setup_autostart() -> None:
@@ -523,39 +597,46 @@ def setup_autostart() -> None:
     else:
         _warn(
             f"Unsupported OS: {system}.\n"
-            "  Start the bot manually:  python -m manabot bot\n"
-            "  Or add the above command to your system's startup mechanism."
+            "  Start services manually:\n"
+            "    python -m manabot discord-bot\n"
+            "    python -m manabot pricer-scheduler"
         )
 
 
-def restart_service() -> None:
-    """Restart the running bot service (OS-specific)."""
+def update_service_files() -> None:
+    """Rewrite service files on disk without enabling/starting them."""
     system = platform.system()
     if system == "Linux":
-        result = _run(["systemctl", "--user", "restart", "manabot"], check=False)
-        if result.returncode != 0:
-            _warn("Restart failed. Run manually:  systemctl --user restart manabot")
-        else:
-            _ok("Service restarted.")
+        _write_linux_service_files()
     elif system == "Windows":
-        import time
-        task_name = "Manabot Discord Bot"
-        _run(["schtasks", "/end", "/tn", task_name], check=False)
-        time.sleep(2)
-        result = _run(["schtasks", "/run", "/tn", task_name], check=False)
-        if result.returncode != 0:
-            _warn(f"Restart failed. Run manually:  schtasks /run /tn \"{task_name}\"")
-        else:
-            _ok("Task restarted.")
+        _register_windows_task(_WIN_TASK_BOT, "-m manabot discord-bot")
+        _register_windows_task(_WIN_TASK_PRICER, "-m manabot pricer-scheduler")
     elif system == "Darwin":
-        _run(["launchctl", "stop", "com.manabot.bot"], check=False)
-        result = _run(["launchctl", "start", "com.manabot.bot"], check=False)
-        if result.returncode != 0:
-            _warn("Restart failed. Run manually:  launchctl start com.manabot.bot")
-        else:
-            _ok("Service restarted.")
+        agents_dir = Path.home() / "Library" / "LaunchAgents"
+        for label, cmd in [
+            (_MAC_LABEL_BOT, "-m manabot discord-bot"),
+            (_MAC_LABEL_PRICER, "-m manabot pricer-scheduler"),
+        ]:
+            plist_file = agents_dir / f"{label}.plist"
+            plist_file.write_text(_mac_plist(label, cmd), encoding="utf-8")
+            _ok(f"plist updated: {plist_file}")
+
+
+def restart_service() -> None:
+    """Restart both running services (OS-specific)."""
+    system = platform.system()
+    if system == "Linux":
+        _restart_linux()
+    elif system == "Windows":
+        _restart_windows()
+    elif system == "Darwin":
+        _restart_macos()
     else:
-        _warn(f"Unknown OS ({system}) — restart manually:  python -m manabot bot")
+        _warn(
+            f"Unknown OS ({system}) — restart manually:\n"
+            "  python -m manabot discord-bot\n"
+            "  python -m manabot pricer-scheduler"
+        )
 
 
 def download_oracle_data() -> None:
@@ -582,11 +663,11 @@ def download_oracle_data() -> None:
         )
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Main flows ─────────────────────────────────────────────────────────────────
 
 def _run_setup() -> None:
     print("=" * 60)
-    print("  Manabot Discord Bot — Setup")
+    print("  Manabot — Setup")
     print(f"  Project: {PROJECT_DIR}")
     print(f"  Python:  {sys.executable}")
     print("=" * 60)
@@ -605,15 +686,19 @@ def _run_setup() -> None:
     print(
         "\n  Next steps:\n"
         "  1. Review config.yaml and fill in any values you skipped.\n"
-        "  2. Invite the bot to your Discord server if you haven't already:\n"
+        "  2. Test the price updater before going live:\n"
+        "       python -m manabot price-update --dry-run\n"
+        "  3. Invite the Discord bot to your server:\n"
         "       https://discord.com/developers/applications\n"
         "       → Your app → OAuth2 → URL Generator\n"
         "         Scopes: bot + applications.commands\n"
         "         Permissions: Send Messages, Attach Files, Embed Links,\n"
         "                      Use Application Commands\n"
-        "       Open the generated URL in your browser and add it to your server.\n"
-        "  3. Verify slash commands appear in Discord (may take up to 1 hour\n"
-        "     for global sync; use --guild <ID> on first run for instant sync).\n"
+        "  4. Verify slash commands appear in Discord (up to 1 hour for\n"
+        "     global sync; set discord.guild_id in config.yaml for instant).\n"
+        "\n"
+        "  Daily pricing runs at 2 AM Central by default. To change:\n"
+        "    Edit pricer.schedule_hour / pricer.schedule_timezone in config.yaml\n"
         "\n"
         "  To upgrade after pulling new code:\n"
         "    python setup_bot.py upgrade\n"
@@ -626,7 +711,7 @@ def _run_setup() -> None:
 
 def _run_upgrade() -> None:
     print("=" * 60)
-    print("  Manabot Discord Bot — Upgrade")
+    print("  Manabot — Upgrade")
     print(f"  Project: {PROJECT_DIR}")
     print(f"  Python:  {sys.executable}")
     print("=" * 60)
@@ -634,11 +719,32 @@ def _run_upgrade() -> None:
     check_python()
     install_deps()
 
-    _step("Restarting service")
+    _step("Updating service files")
+    update_service_files()
+
+    _step("Restarting services")
     restart_service()
 
     print("\n" + "=" * 60)
     print("  Upgrade complete!")
+    print(
+        "\n  Both services have been restarted:\n"
+        f"    Discord bot     ({_LINUX_BOT_UNIT if platform.system() == 'Linux' else _WIN_TASK_BOT})\n"
+        f"    Price updater   ({_LINUX_PRICER_UNIT if platform.system() == 'Linux' else _WIN_TASK_PRICER})\n"
+        "\n  Database schema migrations apply automatically on first run.\n"
+        "  ManaPool catalog cache refreshes on the next price-update run.\n"
+        "\n  To check service status:\n"
+    )
+    if platform.system() == "Linux":
+        print(
+            f"    journalctl --user -u manabot -f\n"
+            f"    journalctl --user -u manabot-pricer -f"
+        )
+    elif platform.system() == "Windows":
+        print(
+            f"    schtasks /query /tn \"{_WIN_TASK_BOT}\"\n"
+            f"    schtasks /query /tn \"{_WIN_TASK_PRICER}\""
+        )
     print("=" * 60)
 
 
