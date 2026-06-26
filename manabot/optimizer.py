@@ -117,17 +117,14 @@ def build_request_items(
 
 def _select_within_budget(
     items: list[CartRequestItem],
-    max_cart_usd: float,
+    budget_usd: float,
 ) -> list[CartRequestItem]:
-    """Greedily select the best items that fit within max_cart_usd (estimated prices).
+    """Greedily select the best items that fit within budget_usd (estimated prices).
 
     Items are sorted by total estimated savings (margin × qty) descending so the
     most valuable items are prioritised. Shipping and fees are excluded from this
-    estimate — the iteration step corrects for any overage after the optimizer runs.
+    estimate — the caller is responsible for leaving appropriate headroom.
     """
-    # Reserve 20% of the cap for shipping and fees so the optimizer's actual total
-    # stays within budget. Estimated prices often understate final cart cost.
-    effective_cap = max_cart_usd * 0.80
     sorted_items = sorted(
         items,
         key=lambda x: x.estimated_margin * x.buy_list_item.target_quantity,
@@ -137,7 +134,7 @@ def _select_within_budget(
     running_total = 0.0
     for item in sorted_items:
         item_cost = item.estimated_price * item.buy_list_item.target_quantity
-        if running_total + item_cost <= effective_cap:
+        if running_total + item_cost <= budget_usd:
             selected.append(item)
             running_total += item_cost
     return selected
@@ -183,6 +180,11 @@ def _is_better(
     if not new_ok and best_ok:
         return False  # current is within budget; new isn't
     return new.total_usd < current_best.total_usd  # both over budget: prefer cheaper
+
+
+def _sellers_in_cart(result: CartResult) -> set[str]:
+    """Return seller IDs from the items currently in a CartResult."""
+    return {item.seller_id for item in result.items if item.seller_id}
 
 
 def _build_optimizer_payload(items: list[CartRequestItem]) -> list[dict]:
@@ -263,34 +265,104 @@ def find_best_cart(
     preselected: list[CartRequestItem] | None = None,
     scryfall: "ScryfallBulk | None" = None,
     exclude_preorder: bool = False,
+    target_cart_usd: float | None = None,
+    expansion_pool: list[CartRequestItem] | None = None,
+    forced_card_names: frozenset[str] | None = None,
 ) -> CartResult | None:
     """Find the cart configuration that maximizes net value.
 
     When max_cart_usd is set, the result's total (including shipping and fees)
-    will not exceed that limit if at all possible. Items are pre-selected by
-    estimated savings, then the iteration enforces the hard limit on the real total.
+    will not exceed that limit if at all possible.
+
+    Args:
+        target_cart_usd:   Initial build budget. Cards are pre-selected to fit within
+                           this amount, leaving headroom for shipping and expansion.
+                           Defaults to max_cart_usd × 0.80 when None.
+        expansion_pool:    Additional CartRequestItems to try as free riders (Phase 3)
+                           or new-seller candidates (Phase 4) after the main optimize.
+        forced_card_names: Card names that must always be in the cart. Forced items
+                           bypass the build-budget selection, are never removed in
+                           Phase 2, and are re-added if their seller's package is
+                           dropped in Phase 1 (the optimizer sources them elsewhere).
+                           Their cost still counts toward max_cart_usd.
+
+    Iteration
+    ---------
+        1.  Build eligible items: estimated_price ≤ max_price × (1 + over_budget_pct%).
+        2.  If target_cart_usd is set, greedily pre-select items within that budget,
+            keeping the rest as an expansion pool for later phases. If target_cart_usd
+            is None and max_cart_usd is set, defaults to max_cart_usd × 0.80.
+        3.  Run optimizer → baseline result.
+        4.  Phase 1: If cart total > max_cart_usd, remove worst-margin seller packages.
+        5.  Phase 2: Remove negative-margin items up to max_iterations times.
+        6.  Phase 3 (when expansion pool exists): add free-rider cards from sellers
+            already in the cart — their shipping is already paid.
+        7.  Phase 4 (when expansion pool exists): try the best-margin card from each
+            new seller; check for free riders from that seller before accepting.
 
     Pass preselected to bypass build_request_items and _select_within_budget
     (e.g. when the caller has already done greedy budget packing for arbitrage).
 
-    Returns None if no matched results are eligible. Makes at most
-    1 + max_iterations optimizer API calls.
+    Total API calls: 1 (baseline) + Phase 1 removals + Phase 2 (≤ max_iterations)
+                    + Phase 3 free riders + Phase 4 (≤ max_iterations new-seller probes).
     """
+    _run_expansion = target_cart_usd is not None or expansion_pool is not None
+    forced_names: frozenset[str] = frozenset(forced_card_names or ())
+
     if preselected is not None:
         eligible = list(preselected)
+        _extra_pool: list[CartRequestItem] = list(expansion_pool or [])
     else:
-        eligible = build_request_items(match_results, over_budget_pct, scryfall=scryfall)
-        if not eligible:
+        all_eligible = build_request_items(match_results, over_budget_pct, scryfall=scryfall)
+
+        # Forced items bypass the price filter — include them even when their listing
+        # price exceeds max_price × (1 + over_budget_pct%). Build them separately
+        # with a permissive threshold and merge any that aren't already present.
+        if forced_names:
+            forced_results = [r for r in match_results if r.buy_list_item.card_name in forced_names]
+            if forced_results:
+                already_forced = {x.buy_list_item.card_name for x in all_eligible if x.buy_list_item.card_name in forced_names}
+                extra_forced = build_request_items(forced_results, over_budget_pct=99999.0, scryfall=scryfall)
+                all_eligible = all_eligible + [x for x in extra_forced if x.buy_list_item.card_name not in already_forced]
+
+        if not all_eligible:
             log.warning("No eligible items for cart optimization")
             return None
 
-        if max_cart_usd is not None:
-            eligible = _select_within_budget(eligible, max_cart_usd)
+        forced_eligible = [x for x in all_eligible if x.buy_list_item.card_name in forced_names]
+        optional_eligible = [x for x in all_eligible if x.buy_list_item.card_name not in forced_names]
+
+        # When target_cart_usd is set the caller wants an explicit build budget with
+        # headroom for shipping + expansion; otherwise fall back to the 20% reserve.
+        build_budget = (
+            target_cart_usd if target_cart_usd is not None
+            else (max_cart_usd * 0.80 if max_cart_usd is not None else None)
+        )
+
+        if build_budget is not None:
+            # Deduct forced items' estimated cost so they don't crowd out optional items.
+            forced_cost = sum(
+                x.estimated_price * x.buy_list_item.target_quantity for x in forced_eligible
+            )
+            optional_budget = max(0.0, build_budget - forced_cost)
+            selected_optional = _select_within_budget(optional_eligible, optional_budget)
+            eligible = selected_optional + forced_eligible
             if not eligible:
                 log.warning(
-                    "No items fit within the $%.2f budget at estimated prices", max_cart_usd
+                    "No items fit within the $%.2f build budget at estimated prices", build_budget
                 )
                 return None
+            if target_cart_usd is not None or forced_names:
+                selected_names = {x.buy_list_item.card_name for x in eligible}
+                _overflow = [x for x in optional_eligible if x.buy_list_item.card_name not in selected_names]
+                _run_expansion = True
+            else:
+                _overflow = []
+        else:
+            eligible = all_eligible
+            _overflow = []
+
+        _extra_pool = _overflow + list(expansion_pool or [])
 
     log.info("Starting cart optimization: %d eligible items", len(eligible))
 
@@ -385,6 +457,17 @@ def find_best_cart(
             worst_ids = {id(x) for x in worst_grp}
             trial_set = [x for x in current if id(x) not in worst_ids]
 
+            # Forced items must remain in the cart even when their seller is removed.
+            # Re-add them without a seller constraint; the optimizer sources elsewhere.
+            if forced_names:
+                displaced_forced = [x for x in worst_grp if x.buy_list_item.card_name in forced_names]
+                if displaced_forced:
+                    trial_set = trial_set + displaced_forced
+                    log.info(
+                        "Forced item(s) %s displaced from seller %r — will be re-sourced",
+                        [x.buy_list_item.card_name for x in displaced_forced], worst_key,
+                    )
+
             if not trial_set:
                 if len(worst_grp) == 1:
                     log.warning(
@@ -421,8 +504,9 @@ def find_best_cart(
             log.warning("Budget enforcement loop exhausted without reaching cap.")
 
     # Phase 2: Value optimization — remove negative-margin items up to max_iterations.
+    # Forced items are never removed regardless of their margin.
     for iteration in range(max_iterations):
-        candidates = [x for x in current if id(x) not in locked]
+        candidates = [x for x in current if id(x) not in locked and x.buy_list_item.card_name not in forced_names]
         if not candidates:
             break
 
@@ -457,6 +541,46 @@ def find_best_cart(
                 current_result.net_value_usd - trial.net_value_usd,
             )
             locked.add(id(worst))
+
+    # Phase 3: Free-rider expansion — add cards from sellers already in the cart.
+    # Their shipping is already paid so any positive-margin card from that seller
+    # is pure upside. Try all candidates; each accepted item updates the cart.
+    if _run_expansion and _extra_pool and best is not None and max_cart_usd is not None:
+        existing_sellers = _sellers_in_cart(best)
+        in_cart_names = {item.buy_list_item.card_name for item in best.items}
+        free_riders = sorted(
+            [x for x in _extra_pool
+             if x.buy_list_item.card_name not in in_cart_names
+             and x.seller_id in existing_sellers],
+            key=lambda x: x.estimated_margin,
+            reverse=True,
+        )
+        if free_riders:
+            log.info(
+                "Phase 3: checking %d free-rider candidate(s) from %d existing seller(s)",
+                len(free_riders), len(existing_sellers),
+            )
+            best = try_add_items(
+                best, free_riders, client,
+                max_cart_usd=max_cart_usd,
+                optimizer_model=optimizer_model,
+                destination_country=destination_country,
+                exclude_preorder=exclude_preorder,
+            )
+
+    # Phase 4: New-seller exploration — try adding the best-margin card from each
+    # new seller, then check for free riders from that seller before deciding to
+    # keep or reject the addition.
+    if _run_expansion and _extra_pool and best is not None and max_cart_usd is not None:
+        log.info("Phase 4: new-seller exploration (up to %d trial(s))", max_iterations)
+        best = try_expand_with_new_sellers(
+            best, _extra_pool, client,
+            max_cart_usd=max_cart_usd,
+            max_trials=max_iterations,
+            optimizer_model=optimizer_model,
+            destination_country=destination_country,
+            exclude_preorder=exclude_preorder,
+        )
 
     return best
 
@@ -523,5 +647,109 @@ def try_add_items(
                 "Free-rider %r skipped — net $%.2f → $%.2f (no improvement)",
                 candidate.buy_list_item.card_name, best.net_value_usd, trial.net_value_usd,
             )
+
+    return best
+
+
+def try_expand_with_new_sellers(
+    current: CartResult,
+    expansion_pool: list[CartRequestItem],
+    client: ManaPoolClient,
+    max_cart_usd: float | None = None,
+    max_trials: int = 5,
+    optimizer_model: str = "lowest_price",
+    destination_country: str = "US",
+    exclude_preorder: bool = False,
+) -> CartResult:
+    """Try adding best-margin cards from sellers not yet in the cart.
+
+    For each candidate from a new seller (sorted by estimated_margin descending):
+    1. Add the candidate and run the optimizer.
+    2. Check for free riders from sellers newly introduced by this candidate,
+       adding them via try_add_items.
+    3. Accept the combined expansion if it improves net value within max_cart_usd.
+    4. Reject and try the next candidate otherwise.
+
+    Returns at least current. Makes at most max_trials optimizer calls for
+    new-seller probes (plus inner try_add_items calls per accepted candidate).
+    """
+    _run_kwargs = dict(
+        model=optimizer_model,
+        destination=destination_country,
+        exclude_universes_beyond=False,
+        exclude_preorder=exclude_preorder,
+    )
+
+    best = current
+    pool = list(expansion_pool)
+
+    for _ in range(max_trials):
+        current_sellers = _sellers_in_cart(best)
+        in_cart_names = {item.buy_list_item.card_name for item in best.items}
+
+        new_candidates = sorted(
+            [x for x in pool
+             if x.buy_list_item.card_name not in in_cart_names
+             and (not x.seller_id or x.seller_id not in current_sellers)],
+            key=lambda x: x.estimated_margin,
+            reverse=True,
+        )
+        if not new_candidates:
+            break
+
+        candidate = new_candidates[0]
+        trial_items = list(best.items) + [candidate]
+
+        try:
+            trial = _run_single(trial_items, client, **_run_kwargs)
+        except ManaPool409Error:
+            log.debug(
+                "New-seller candidate %r not in optimizer index — skipping",
+                candidate.buy_list_item.card_name,
+            )
+            pool = [x for x in pool if x.buy_list_item.card_name != candidate.buy_list_item.card_name]
+            continue
+        except Exception as exc:  # noqa: BLE001
+            log.debug("New-seller candidate %r skipped: %s", candidate.buy_list_item.card_name, exc)
+            pool = [x for x in pool if x.buy_list_item.card_name != candidate.buy_list_item.card_name]
+            continue
+
+        trial_sellers = {x.seller_id for x in trial_items if x.seller_id}
+        new_sellers = trial_sellers - current_sellers
+        if new_sellers:
+            trial_in_cart = {x.buy_list_item.card_name for x in trial_items}
+            new_seller_riders = sorted(
+                [x for x in pool
+                 if x.buy_list_item.card_name not in trial_in_cart
+                 and x.seller_id in new_sellers],
+                key=lambda x: x.estimated_margin,
+                reverse=True,
+            )
+            if new_seller_riders:
+                trial = try_add_items(
+                    trial, new_seller_riders, client,
+                    max_cart_usd=max_cart_usd,
+                    optimizer_model=optimizer_model,
+                    destination_country=destination_country,
+                    exclude_preorder=exclude_preorder,
+                )
+
+        if _is_better(trial, best, max_cart_usd):
+            log.info(
+                "New-seller expansion: added %r (seller %r) — net $%.2f → $%.2f",
+                candidate.buy_list_item.card_name,
+                candidate.seller_id or "?",
+                best.net_value_usd,
+                trial.net_value_usd,
+            )
+            best = trial
+        else:
+            log.info(
+                "New-seller expansion: rejected %r — net would be $%.2f vs current $%.2f",
+                candidate.buy_list_item.card_name,
+                trial.net_value_usd,
+                best.net_value_usd,
+            )
+            pool = [x for x in pool if x.buy_list_item.card_name != candidate.buy_list_item.card_name]
 
     return best

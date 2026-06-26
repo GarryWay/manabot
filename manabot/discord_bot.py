@@ -128,6 +128,7 @@ def _optimize_pipeline(
     max_cart_usd: float | None,
     arb_riders: bool,
     exclude_preorder: bool,
+    forced_card_names: frozenset[str] | None = None,
 ) -> dict:
     from manabot.buylist import load_buylist
     from manabot.db import open_db, insert_listings
@@ -154,6 +155,18 @@ def _optimize_pipeline(
     if not eligible:
         return {"error": f"No eligible items (over_budget_pct={over_budget_pct:.0f}%)"}
 
+    arb_expansion = None
+    if arb_riders:
+        import manabot.arbitrage as arb
+        arb_candidates = arb.find_candidates(
+            listings, scryfall=scryfall_bulk if scryfall_bulk.available else None,
+            min_discount_pct=10.0, min_quantity=20,
+            min_market_price_usd=config.arbitrage_min_market_price_usd,
+        )
+        if arb_candidates:
+            arb_results = arb.candidates_to_match_results(arb_candidates)
+            arb_expansion = opt.build_request_items(arb_results, over_budget_pct=0.0)
+
     cart = opt.find_best_cart(
         results, client,
         over_budget_pct=over_budget_pct,
@@ -162,28 +175,11 @@ def _optimize_pipeline(
         destination_country=config.optimizer_destination,
         scryfall=scryfall_bulk if scryfall_bulk.available else None,
         exclude_preorder=exclude_preorder,
+        forced_card_names=forced_card_names,
+        expansion_pool=arb_expansion,
     )
     if cart is None:
         return {"error": "Optimizer returned no result"}
-
-    if arb_riders:
-        import manabot.arbitrage as arb
-        arb_candidates = arb.find_candidates(
-            listings, scryfall=scryfall_bulk if scryfall_bulk.available else None,
-            min_discount_pct=10.0, min_quantity=20,
-            min_market_price_usd=config.arbitrage_min_market_price_usd,
-        )
-        cart_seller_ids = {x.seller_id for x in cart.items if x.seller_id}
-        if arb_candidates and cart_seller_ids:
-            arb_results = arb.candidates_to_match_results(arb_candidates)
-            arb_items = opt.build_request_items(arb_results, over_budget_pct=0.0)
-            free_riders = [x for x in arb_items if x.seller_id in cart_seller_ids]
-            if free_riders:
-                cart = opt.try_add_items(
-                    cart, free_riders[:config.optimizer_max_iterations], client,
-                    max_cart_usd=max_cart_usd, destination_country=config.optimizer_destination,
-                    exclude_preorder=exclude_preorder,
-                )
 
     items_data = [
         {"card_name": x.buy_list_item.card_name, "quantity": x.buy_list_item.target_quantity,
@@ -346,6 +342,7 @@ def create_bot(config: Config) -> _ManabotClient:
         max_cart_usd="Hard spending cap in USD (0 = no cap)",
         arb_riders="Pad cart with arbitrage free-riders from existing sellers",
         exclude_preorder="Exclude pre-order listings (default True)",
+        force_cards="Pipe-separated card names to force into the cart regardless of margin (e.g. Counterspell|Sauron, the Dark Lord)",
     )
     async def cmd_optimize(
         interaction: discord.Interaction,
@@ -353,11 +350,13 @@ def create_bot(config: Config) -> _ManabotClient:
         max_cart_usd: float = 0.0,
         arb_riders: bool = False,
         exclude_preorder: bool = True,
+        force_cards: str = "",
     ) -> None:
         await interaction.response.defer(thinking=True)
         max_cart = max_cart_usd if max_cart_usd > 0 else None
+        forced = frozenset(c.strip() for c in force_cards.split("|") if c.strip()) if force_cards else None
         try:
-            data = await asyncio.to_thread(_optimize_pipeline, bot.config, over_budget_pct, max_cart, arb_riders, exclude_preorder)
+            data = await asyncio.to_thread(_optimize_pipeline, bot.config, over_budget_pct, max_cart, arb_riders, exclude_preorder, forced)
         except Exception as e:
             log.exception("optimize pipeline error")
             await interaction.followup.send(f"Optimizer error: {e}")

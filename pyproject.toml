@@ -25,6 +25,13 @@ test = [
 bot = [
     "discord.py>=2.0",
 ]
+scheduler = [
+    "apscheduler>=3.10.4",
+]
+full = [
+    "discord.py>=2.0",
+    "apscheduler>=3.10.4",
+]
 
 [project.scripts]
 manabot = "manabot.__main__:main"

@@ -135,3 +135,31 @@ class CartResult:
     @property
     def is_profitable(self) -> bool:
         return self.net_value_usd > 0
+
+
+@dataclass
+class SellerListing:
+    """Our own inventory listing on ManaPool (seller side)."""
+    inventory_id: str       # UUID from GET /seller/inventory
+    scryfall_id: str
+    card_name: str
+    set_code: str
+    condition: Condition
+    finish: Finish
+    language: str           # "EN", "JA", etc.
+    quantity: int
+    price_usd: float
+
+
+@dataclass
+class CompletedSale:
+    """A completed seller order item from GET /seller/orders."""
+    order_id: str
+    scryfall_id: str
+    card_name: str
+    set_code: str
+    condition: Condition
+    finish: Finish
+    quantity: int
+    sold_price_usd: float
+    sold_at: datetime

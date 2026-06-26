@@ -21,6 +21,8 @@ data/last_cart.json
 data/manabot.log
 data/scryfall_oracle.json
 data/scryfall_oracle.meta.json
+data/manapool_catalog.json.gz
+data/tcgtracking/
 
 # Pytest
 .pytest_cache/

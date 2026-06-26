@@ -17,13 +17,13 @@ from typing import Any, Optional
 
 import requests
 
-from manabot.models import Condition, Finish, PriceListing
+from manabot.models import Condition, Finish, PriceListing, SellerListing, CompletedSale
 
 log = logging.getLogger(__name__)
 
 # Header names as specified in ManaPool OpenAPI securitySchemes
-_EMAIL_HEADER = "Email"
-_TOKEN_HEADER = "Access-Token"
+_EMAIL_HEADER = "X-ManaPool-Email"
+_TOKEN_HEADER = "X-ManaPool-Access-Token"
 
 # Mapping from ManaPool condition strings to our Condition enum.
 # Update if the API uses different values.
@@ -45,6 +45,18 @@ _FINISH_MAP: dict[str, Finish] = {
     "nonfoil": Finish.NONFOIL,
     "non_foil": Finish.NONFOIL,
     "normal": Finish.NONFOIL,
+}
+
+_FINISH_TO_ID: dict[Finish, str] = {
+    Finish.NONFOIL: "NF",
+    Finish.FOIL: "FO",
+    Finish.ANY: "NF",
+}
+
+_FINISH_FROM_ID: dict[str, Finish] = {
+    "NF": Finish.NONFOIL,
+    "FO": Finish.FOIL,
+    "EF": Finish.FOIL,  # etched foil
 }
 
 
@@ -437,6 +449,119 @@ class ManaPoolClient:
         except (requests.ConnectionError, requests.Timeout) as e:
             raise ManaPoolAPIError("Network error fetching pending order") from e
         return resp.json()
+
+    def get_seller_inventory(self, min_quantity: int = 1) -> list[SellerListing]:
+        """GET /seller/inventory — all our ManaPool listings with qty >= min_quantity (cursor-paginated)."""
+        items: list[SellerListing] = []
+        cursor: str | None = None
+        while True:
+            params: dict = {"limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            data = self._get("/seller/inventory", params=params)
+            for item in data.get("inventory", []):
+                if int(item.get("quantity", 0)) < min_quantity:
+                    continue
+                try:
+                    items.append(self._parse_seller_listing(item))
+                except (KeyError, ValueError) as e:
+                    log.warning("Skipping unparseable seller listing: %s — %r", e, item)
+            cursor = data.get("pagination", {}).get("next_cursor")
+            if not cursor:
+                break
+        log.info("Fetched %d seller listing(s) with qty >= %d", len(items), min_quantity)
+        return items
+
+    @staticmethod
+    def _parse_seller_listing(item: dict) -> SellerListing:
+        single = item.get("product", {}).get("single", {})
+        condition_id = single.get("condition_id", "NM")
+        finish_id = single.get("finish_id", "NF")
+        return SellerListing(
+            inventory_id=item["id"],
+            scryfall_id=single["scryfall_id"],
+            card_name=single["name"],
+            set_code=str(single.get("set", "")).upper(),
+            condition=_CONDITION_MAP.get(condition_id, Condition.NM),
+            finish=_FINISH_FROM_ID.get(finish_id, Finish.NONFOIL),
+            language=single.get("language_id", "EN"),
+            quantity=int(item.get("quantity", 0)),
+            price_usd=float(item.get("price_cents", 0)) / 100.0,
+        )
+
+    def update_seller_listing_price(
+        self,
+        scryfall_id: str,
+        condition: Condition,
+        finish: Finish,
+        new_price_usd: float,
+        quantity: int,
+        language: str = "EN",
+    ) -> None:
+        """PUT /seller/inventory/scryfall_id/{scryfall_id} — update listing price."""
+        finish_id = _FINISH_TO_ID.get(finish, "NF")
+        url = f"{self.BASE_URL}/seller/inventory/scryfall_id/{scryfall_id}"
+        params = {
+            "language_id": language,
+            "finish_id": finish_id,
+            "condition_id": condition.value,
+        }
+        payload = {"price_cents": round(new_price_usd * 100), "quantity": quantity}
+        try:
+            resp = self._session.put(url, params=params, json=payload, timeout=30)
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            raise ManaPoolAPIError(
+                f"HTTP {e.response.status_code} updating seller listing {scryfall_id}: {e.response.text[:200]}"
+            ) from e
+        except (requests.ConnectionError, requests.Timeout) as e:
+            raise ManaPoolAPIError(f"Network error updating seller listing {scryfall_id}") from e
+
+    def get_completed_sales(
+        self,
+        since: Optional[datetime] = None,
+    ) -> list[CompletedSale]:
+        """GET /seller/orders (fulfilled) with per-order detail calls for items."""
+        sales: list[CompletedSale] = []
+        cursor: str | None = None
+        while True:
+            params: dict = {"limit": 50, "is_fulfilled": "true"}
+            if cursor:
+                params["cursor"] = cursor
+            if since:
+                params["since"] = since.isoformat()
+            data = self._get("/seller/orders", params=params)
+            for summary in data.get("orders", []):
+                try:
+                    details = self._get(f"/seller/orders/{summary['id']}")
+                    for item in details.get("items", []):
+                        single = item.get("product", {}).get("single")
+                        if not single:
+                            continue
+                        condition_id = single.get("condition_id", "NM")
+                        finish_id = single.get("finish_id", "NF")
+                        sold_at_str = summary.get("created_at", "")
+                        try:
+                            sold_at = datetime.fromisoformat(sold_at_str.replace("Z", "+00:00"))
+                        except (ValueError, AttributeError):
+                            sold_at = datetime.now(timezone.utc)
+                        sales.append(CompletedSale(
+                            order_id=summary["id"],
+                            scryfall_id=single["scryfall_id"],
+                            card_name=single["name"],
+                            set_code=str(single.get("set", "")).upper(),
+                            condition=_CONDITION_MAP.get(condition_id, Condition.NM),
+                            finish=_FINISH_FROM_ID.get(finish_id, Finish.NONFOIL),
+                            quantity=int(item.get("quantity", 1)),
+                            sold_price_usd=float(item.get("price_cents", 0)) / 100.0,
+                            sold_at=sold_at,
+                        ))
+                except (KeyError, ValueError, ManaPoolAPIError) as e:
+                    log.warning("Skipping order %s: %s", summary.get("id", "?"), e)
+            cursor = data.get("pagination", {}).get("next_cursor")
+            if not cursor:
+                break
+        return sales
 
     def _get_raw(self, path: str, headers: Optional[dict] = None) -> bytes:
         url = f"{self.BASE_URL}{path}"

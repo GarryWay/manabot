@@ -604,12 +604,12 @@ def test_select_within_budget_fits_all():
         _cart_item("Bolt", est_price=1.50, margin=0.50, qty=4),   # cost $6.00
         _cart_item("Ritual", est_price=0.50, margin=0.25, qty=2), # cost $1.00
     ]
-    selected = _select_within_budget(items, max_cart_usd=10.00)
+    selected = _select_within_budget(items, budget_usd=8.00)
     assert len(selected) == 2
 
 
 def test_select_within_budget_skips_one_but_fits_smaller():
-    # effective_cap = $9.00 * 0.80 = $7.20
+    # Budget $7.20 (equivalent to old $9.00 × 0.80 — caller now controls headroom).
     # Can't fit Bolt ($6) + Dual ($4): $10 > $7.20, skip Dual.
     # Can fit Bolt ($6) + Ritual ($1): $7 ≤ $7.20, include Ritual.
     items = [
@@ -620,7 +620,7 @@ def test_select_within_budget_skips_one_but_fits_smaller():
     # Sorted by total margin: Bolt ($2.00), Dual ($1.00), Ritual ($0.50)
     # Bolt ($6.00 ≤ $7.20): included. Dual ($4.00 → $10.00 > $7.20): skipped.
     # Ritual ($1.00 → $7.00 ≤ $7.20): included.
-    selected = _select_within_budget(items, max_cart_usd=9.00)
+    selected = _select_within_budget(items, budget_usd=7.20)
     names = {x.buy_list_item.card_name for x in selected}
     assert "Bolt" in names
     assert "Ritual" in names
@@ -629,18 +629,18 @@ def test_select_within_budget_skips_one_but_fits_smaller():
 
 def test_select_within_budget_empty_when_nothing_fits():
     items = [_cart_item("Dual Land", est_price=100.00, margin=10.00, qty=1)]
-    assert _select_within_budget(items, max_cart_usd=50.00) == []
+    assert _select_within_budget(items, budget_usd=40.00) == []
 
 
 def test_select_within_budget_sorts_by_total_savings():
     # Item A: margin $1 × qty 1 = $1.00 total savings, cost $5
     # Item B: margin $0.50 × qty 4 = $2.00 total savings, cost $4
-    # Budget $5: only one can fit. B has higher total savings → B should be selected.
+    # Budget $4: only one can fit. B has higher total savings → B should be selected.
     items = [
         _cart_item("A", est_price=5.00, margin=1.00, qty=1),
         _cart_item("B", est_price=1.00, margin=0.50, qty=4),
     ]
-    selected = _select_within_budget(items, max_cart_usd=5.00)
+    selected = _select_within_budget(items, budget_usd=4.00)
     assert len(selected) == 1
     assert selected[0].buy_list_item.card_name == "B"
 
@@ -974,3 +974,107 @@ def test_group_by_seller_unknown_seller_singleton():
     b = _cart_item("Card B", est_price=1.00, margin=0.50)  # seller_id=""
     groups = _group_by_seller([a, b])
     assert len(groups) == 2  # each item in its own group
+
+
+# ---------------------------------------------------------------------------
+# find_best_cart: forced_card_names
+# ---------------------------------------------------------------------------
+
+@resp_mock.activate
+def test_forced_card_included_despite_over_budget_pct_filter(mp_client):
+    """A forced card bypasses the over_budget_pct price filter and is always eligible."""
+    # Counterspell: max_price=$1.00, listing=$1.50 — 50% over max → normally filtered out.
+    # With forced, it must appear in the initial eligible set and in the final cart.
+    resp_mock.add(
+        resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer",
+        body=_optimizer_ndjson(subtotal_cents=150, shipping_cents=100, fee_cents=0),
+        content_type="application/x-ndjson",
+    )
+
+    counter = _matched(
+        _item(name="Counterspell", max_price=1.00, qty=1),
+        _listing(name="Counterspell", set_code="7ED", price=1.50, qty=1),
+    )
+    counter.best_price = 1.50
+
+    # over_budget_pct=0 would normally exclude Counterspell (1.50 > 1.00).
+    cart = find_best_cart(
+        [counter], mp_client,
+        max_cart_usd=10.00,
+        over_budget_pct=0.0,
+        forced_card_names=frozenset({"Counterspell"}),
+    )
+    assert cart is not None
+    assert cart.items[0].buy_list_item.card_name == "Counterspell"
+
+
+@resp_mock.activate
+def test_forced_card_not_removed_in_phase2_only_forced_item(mp_client):
+    """When the only item is forced, Phase 2 has no candidates and makes no removal trials."""
+    # Counterspell is forced and is the only item.
+    # Phase 2 filters out forced items → candidates=[] → loop breaks immediately.
+    resp_mock.add(
+        resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer",
+        body=_optimizer_ndjson(subtotal_cents=150, shipping_cents=100, fee_cents=0),
+        content_type="application/x-ndjson",
+    )
+
+    counter = _matched(
+        _item(name="Counterspell", max_price=1.00, qty=1),
+        _listing(name="Counterspell", set_code="7ED", price=1.50, qty=1),
+    )
+    counter.best_price = 1.50
+
+    cart = find_best_cart(
+        [counter], mp_client,
+        max_cart_usd=10.00,
+        max_iterations=3,
+        forced_card_names=frozenset({"Counterspell"}),
+    )
+    assert len(resp_mock.calls) == 1  # baseline only — no Phase 2 trials
+    assert cart is not None
+    assert cart.items[0].buy_list_item.card_name == "Counterspell"
+
+
+@resp_mock.activate
+def test_forced_card_cost_deducted_from_optional_budget(mp_client):
+    """Forced card's estimated cost is deducted from the optional build budget."""
+    # max_cart_usd=$10 → build_budget=$8 (×0.80). Forced Dual=$5 → optional_budget=$3.
+    # Bolt costs $4/ea × 1 = $4 > $3 → Bolt excluded from initial selection.
+    # The optimizer baseline runs with only the forced Dual Land.
+    # Use separate seller IDs so Bolt doesn't get added as a Phase-3 free rider.
+    resp_mock.add(
+        resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer",
+        body=_optimizer_ndjson(subtotal_cents=500, shipping_cents=200, fee_cents=0),
+        content_type="application/x-ndjson",
+    )
+
+    bolt_listing = PriceListing(
+        scryfall_id="bolt-id", card_name="Lightning Bolt", set_code="M10",
+        condition=Condition.NM, finish=Finish.NONFOIL, price_usd=4.00,
+        quantity_available=1, seller_id="seller_bolt",
+        fetched_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+    )
+    dual_listing = PriceListing(
+        scryfall_id="dual-id", card_name="Dual Land", set_code="LEA",
+        condition=Condition.NM, finish=Finish.NONFOIL, price_usd=5.00,
+        quantity_available=1, seller_id="seller_dual",
+        fetched_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+    )
+    bolt = _matched(_item(name="Lightning Bolt", max_price=6.00, qty=1), bolt_listing)
+    dual = _matched(_item(name="Dual Land", max_price=8.00, qty=1), dual_listing)
+    bolt.best_price = 4.00
+    dual.best_price = 5.00
+
+    cart = find_best_cart(
+        [bolt, dual], mp_client,
+        max_cart_usd=10.00,
+        forced_card_names=frozenset({"Dual Land"}),
+    )
+    assert cart is not None
+    # Bolt squeezed out of initial selection; Dual forced into cart.
+    # Bolt would be in _overflow (free rider pool) but has a different seller → Phase 3 skips it.
+    # Bolt also a new-seller candidate for Phase 4, but no mock registered for that call.
+    # The cart contains at minimum the forced Dual Land.
+    names = {x.buy_list_item.card_name for x in cart.items}
+    assert "Dual Land" in names

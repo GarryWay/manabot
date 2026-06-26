@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -24,9 +24,24 @@ class Config:
     trend_threshold_pct: float = 5.0
     optimizer_over_budget_pct: float = 0.0   # allow items up to this % above max_price
     optimizer_max_cart_usd: float | None = None  # hard spending cap per run (None = no limit)
+    optimizer_target_cart_usd: float | None = None  # initial build budget (leaves headroom for expansion)
     optimizer_max_iterations: int = 5        # max removal trials per optimize run
     optimizer_destination: str = "US"        # shipping destination country code
     arbitrage_min_market_price_usd: float = 2.00  # NM floor below this = skip card entirely
+    arbitrage_min_liquidity_sales: float = 0.0    # min sales/30d to include in arb (0 = no filter)
+    arbitrage_liquidity_lookback_days: int = 60   # days to count sales for liquidity
+    pricer_race_to_bottom_threshold: float = 0.20  # low_price < trend × (1 - this) = race to bottom
+    pricer_min_margin_pct: float = 0.10       # cost floor = cost_basis * (1 + this)
+    pricer_cost_floor_days: int = 30          # days below floor before cost floor is lifted
+    pricer_schedule_hour: int = 2             # hour (local time) for daily price update job
+    pricer_schedule_timezone: str = "America/Chicago"  # IANA timezone for the scheduler
+    pricer_iqr_fence_factor: float = 1.5      # Tukey IQR fence multiplier for outlier removal
+    pricer_min_sales_for_regression: int = 3  # minimum sales count to run regression
+    pricer_max_sale_age_days: int = 90        # ignore sales data if most recent sale is older
+    pricer_finish_merge_max_price_usd: float = 2.0   # pool foil+NF sales only when market < this
+    pricer_finish_merge_threshold_usd: float = 1.0   # pool foil+NF sales only when prices within this
+    catalog_cache_path: Path = Path("data/manapool_catalog.json.gz")
+    tcg_cache_dir: Path = Path("data/tcgtracking")
     # Required for pending order creation/purchase: name, line1, city, state (2-char), postal_code, country
     shipping_address: dict | None = None
     billing_address: dict | None = None  # defaults to shipping_address if not set
@@ -71,6 +86,8 @@ def load_config(config_path: Path | None = None) -> Config:
             base["optimizer_over_budget_pct"] = float(optimizer["over_budget_pct"])
         if "max_cart_usd" in optimizer:
             base["optimizer_max_cart_usd"] = float(optimizer["max_cart_usd"])
+        if "target_cart_usd" in optimizer:
+            base["optimizer_target_cart_usd"] = float(optimizer["target_cart_usd"])
         if "max_iterations" in optimizer:
             base["optimizer_max_iterations"] = int(optimizer["max_iterations"])
         if "destination" in optimizer:
@@ -85,6 +102,25 @@ def load_config(config_path: Path | None = None) -> Config:
             addr = {k: str(v) if k == "postal_code" else v
                     for k, v in optimizer["billing_address"].items()}
             base["billing_address"] = addr
+        pricer = raw.get("pricer", {})
+        if "race_to_bottom_threshold" in pricer:
+            base["pricer_race_to_bottom_threshold"] = float(pricer["race_to_bottom_threshold"])
+        if "min_margin_pct" in pricer:
+            base["pricer_min_margin_pct"] = float(pricer["min_margin_pct"])
+        if "cost_floor_days" in pricer:
+            base["pricer_cost_floor_days"] = int(pricer["cost_floor_days"])
+        if "schedule_hour" in pricer:
+            base["pricer_schedule_hour"] = int(pricer["schedule_hour"])
+        if "schedule_timezone" in pricer:
+            base["pricer_schedule_timezone"] = str(pricer["schedule_timezone"])
+        catalog_cfg = raw.get("catalog", {})
+        if "cache_path" in catalog_cfg:
+            base["catalog_cache_path"] = Path(catalog_cfg["cache_path"])
+        arbitrage_cfg = raw.get("arbitrage", {})
+        if "min_liquidity_sales" in arbitrage_cfg:
+            base["arbitrage_min_liquidity_sales"] = float(arbitrage_cfg["min_liquidity_sales"])
+        if "liquidity_lookback_days" in arbitrage_cfg:
+            base["arbitrage_liquidity_lookback_days"] = int(arbitrage_cfg["liquidity_lookback_days"])
 
     # Environment variables override config.yaml
     if os.getenv("MANAPOOL_EMAIL"):
@@ -115,10 +151,26 @@ def load_config(config_path: Path | None = None) -> Config:
         base["optimizer_over_budget_pct"] = float(os.environ["OPTIMIZER_OVER_BUDGET_PCT"])
     if os.getenv("OPTIMIZER_MAX_CART_USD"):
         base["optimizer_max_cart_usd"] = float(os.environ["OPTIMIZER_MAX_CART_USD"])
+    if os.getenv("OPTIMIZER_TARGET_CART_USD"):
+        base["optimizer_target_cart_usd"] = float(os.environ["OPTIMIZER_TARGET_CART_USD"])
     if os.getenv("OPTIMIZER_MAX_ITERATIONS"):
         base["optimizer_max_iterations"] = int(os.environ["OPTIMIZER_MAX_ITERATIONS"])
     if os.getenv("OPTIMIZER_DESTINATION"):
         base["optimizer_destination"] = os.environ["OPTIMIZER_DESTINATION"]
+    if os.getenv("PRICER_RACE_TO_BOTTOM_THRESHOLD"):
+        base["pricer_race_to_bottom_threshold"] = float(os.environ["PRICER_RACE_TO_BOTTOM_THRESHOLD"])
+    if os.getenv("PRICER_MIN_MARGIN_PCT"):
+        base["pricer_min_margin_pct"] = float(os.environ["PRICER_MIN_MARGIN_PCT"])
+    if os.getenv("PRICER_COST_FLOOR_DAYS"):
+        base["pricer_cost_floor_days"] = int(os.environ["PRICER_COST_FLOOR_DAYS"])
+    if os.getenv("PRICER_SCHEDULE_TIMEZONE"):
+        base["pricer_schedule_timezone"] = os.environ["PRICER_SCHEDULE_TIMEZONE"]
+    if os.getenv("CATALOG_CACHE_PATH"):
+        base["catalog_cache_path"] = Path(os.environ["CATALOG_CACHE_PATH"])
+    if os.getenv("ARBITRAGE_MIN_LIQUIDITY_SALES"):
+        base["arbitrage_min_liquidity_sales"] = float(os.environ["ARBITRAGE_MIN_LIQUIDITY_SALES"])
+    if os.getenv("ARBITRAGE_LIQUIDITY_LOOKBACK_DAYS"):
+        base["arbitrage_liquidity_lookback_days"] = int(os.environ["ARBITRAGE_LIQUIDITY_LOOKBACK_DAYS"])
 
     email = base.get("manapool_email", "")
 
@@ -144,9 +196,18 @@ def load_config(config_path: Path | None = None) -> Config:
         trend_threshold_pct=base.get("trend_threshold_pct", 5.0),
         optimizer_over_budget_pct=base.get("optimizer_over_budget_pct", 0.0),
         optimizer_max_cart_usd=base.get("optimizer_max_cart_usd", None),
+        optimizer_target_cart_usd=base.get("optimizer_target_cart_usd", None),
         optimizer_max_iterations=base.get("optimizer_max_iterations", 5),
         optimizer_destination=base.get("optimizer_destination", "US"),
         arbitrage_min_market_price_usd=base.get("arbitrage_min_market_price_usd", 2.00),
+        arbitrage_min_liquidity_sales=base.get("arbitrage_min_liquidity_sales", 0.0),
+        arbitrage_liquidity_lookback_days=base.get("arbitrage_liquidity_lookback_days", 60),
+        pricer_race_to_bottom_threshold=base.get("pricer_race_to_bottom_threshold", 0.20),
+        pricer_min_margin_pct=base.get("pricer_min_margin_pct", 0.10),
+        pricer_cost_floor_days=base.get("pricer_cost_floor_days", 30),
+        pricer_schedule_hour=base.get("pricer_schedule_hour", 2),
+        pricer_schedule_timezone=base.get("pricer_schedule_timezone", "America/Chicago"),
+        catalog_cache_path=base.get("catalog_cache_path", Path("data/manapool_catalog.json.gz")),
         shipping_address=base.get("shipping_address", None),
         billing_address=base.get("billing_address", None),
     )

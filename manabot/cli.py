@@ -216,6 +216,9 @@ def validate_buylist(ctx: click.Context, buylist_path_override: Path | None, con
               help="Allow items up to X% above max_price_usd (default 0).")
 @click.option("--max-cart-usd", type=float, default=None,
               help="Hard spending cap per run — buy only the best items that fit within this total.")
+@click.option("--target-cart-usd", default=None, type=float,
+              help="Target spend before shipping/fees (leaves room for free-rider expansion). "
+                   "Defaults to 80% of --max-cart-usd.")
 @click.option("--max-iterations", type=int, default=None,
               help="Max optimizer removal trials (default 5).")
 @click.option("--destination", default=None, help="Shipping destination: US or CA (default US).")
@@ -225,6 +228,9 @@ def validate_buylist(ctx: click.Context, buylist_path_override: Path | None, con
               help="After optimizing, add the result to your ManaPool cart for review.")
 @click.option("--arb-riders", is_flag=True, default=False,
               help="After optimizing, try adding arbitrage free-riders from sellers already in the cart.")
+@click.option("--force-card", "force_cards", multiple=True, metavar="NAME",
+              help="Force a card from the buy list into the cart regardless of margin (repeatable). "
+                   "The card's cost counts toward budget but it cannot be removed by the optimizer.")
 @click.option("--exclude-preorder/--no-exclude-preorder", default=True, show_default=True,
               help="Exclude pre-order listings from optimizer results.")
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging.")
@@ -235,11 +241,13 @@ def optimize(
     buylist_path_override: Path | None,
     over_budget_pct: float | None,
     max_cart_usd: float | None,
+    target_cart_usd: float | None,
     max_iterations: int | None,
     destination: str | None,
     dry_run: bool,
     submit_cart: bool,
     arb_riders: bool,
+    force_cards: tuple[str, ...],
     exclude_preorder: bool,
     verbose: bool,
 ) -> None:
@@ -277,6 +285,7 @@ def optimize(
 
     effective_over_budget = over_budget_pct if over_budget_pct is not None else config.optimizer_over_budget_pct
     effective_max_cart = max_cart_usd if max_cart_usd is not None else config.optimizer_max_cart_usd
+    effective_target = target_cart_usd if target_cart_usd is not None else config.optimizer_target_cart_usd
     effective_max_iter = max_iterations if max_iterations is not None else config.optimizer_max_iterations
     effective_dest = destination or config.optimizer_destination
 
@@ -332,16 +341,42 @@ def optimize(
 
     click.echo(f"\nRunning optimizer (up to {effective_max_iter} iteration(s))...")
 
+    arb_expansion: list | None = None
+    if arb_riders:
+        import manabot.arbitrage as arb_mod
+        from manabot.api.scryfall_bulk import ScryfallBulk as _SBulk
+        _sb = _SBulk()
+        arb_cands = arb_mod.find_candidates(
+            listings,
+            scryfall=_sb if _sb.available else None,
+            min_discount_pct=10.0,
+            min_quantity=20,
+            min_market_price_usd=config.arbitrage_min_market_price_usd,
+        )
+        if arb_cands:
+            arb_results = arb_mod.candidates_to_match_results(arb_cands)
+            arb_expansion = opt.build_request_items(arb_results, over_budget_pct=0.0)
+            click.echo(
+                f"\nArbitrage expansion pool: {len(arb_expansion)} candidate(s) for free-rider/new-seller fill."
+            )
+
+    effective_forced = frozenset(force_cards) if force_cards else None
+    if effective_forced:
+        click.echo(f"\nForced cards: {', '.join(sorted(effective_forced))}")
+
     try:
         cart = opt.find_best_cart(
             results,
             client,
             over_budget_pct=effective_over_budget,
+            target_cart_usd=effective_target,
             max_cart_usd=effective_max_cart,
             max_iterations=effective_max_iter,
             destination_country=effective_dest,
             scryfall=scryfall_bulk if scryfall_bulk.available else None,
             exclude_preorder=exclude_preorder,
+            expansion_pool=arb_expansion,
+            forced_card_names=effective_forced,
         )
     except Exception as e:
         click.echo(f"Optimizer error: {e}", err=True)
@@ -351,39 +386,8 @@ def optimize(
         click.echo("Optimizer returned no result.")
         sys.exit(0)
 
-    n_buylist_items = len(cart.items)
-    if arb_riders:
-        import manabot.arbitrage as arb
-        from manabot.api.scryfall_bulk import ScryfallBulk
-
-        scryfall = ScryfallBulk()
-        arb_candidates = arb.find_candidates(
-            listings,
-            scryfall=scryfall if scryfall.available else None,
-            min_discount_pct=10.0,
-            min_quantity=20,
-            min_market_price_usd=config.arbitrage_min_market_price_usd,
-        )
-        cart_seller_ids = {x.seller_id for x in cart.items if x.seller_id}
-        if arb_candidates and cart_seller_ids:
-            arb_results = arb.candidates_to_match_results(arb_candidates)
-            arb_items = opt.build_request_items(arb_results, over_budget_pct=0.0)
-            free_riders = [x for x in arb_items if x.seller_id in cart_seller_ids]
-            if free_riders:
-                free_riders = free_riders[:effective_max_iter]
-                click.echo(
-                    f"\nArbitrage free-rider fill: checking {len(free_riders)} candidate(s) "
-                    f"from {len(cart_seller_ids)} existing seller(s)..."
-                )
-                cart = opt.try_add_items(
-                    cart,
-                    free_riders,
-                    client,
-                    max_cart_usd=effective_max_cart,
-                    destination_country=effective_dest,
-                    exclude_preorder=exclude_preorder,
-                )
-
+    buylist_names = {r.buy_list_item.card_name for r in results}
+    n_buylist_items = sum(1 for x in cart.items if x.buy_list_item.card_name in buylist_names)
     n_arb_added = len(cart.items) - n_buylist_items
     buylist_note = f"{n_buylist_items} buylist"
     if n_arb_added:
@@ -482,6 +486,8 @@ def _submit_pending_order(cart, client, config, max_cart_usd):
               help="Create a pending order on ManaPool after optimizing.")
 @click.option("--dry-run", "-n", is_flag=True,
               help="Show candidates and optimizer payload; do not call the optimizer.")
+@click.option("--min-liquidity", type=float, default=None,
+              help="Minimum sales per 30 days to include a card (0 = no filter). Overrides config.")
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging.")
 @click.pass_context
 def arbitrage(
@@ -495,6 +501,7 @@ def arbitrage(
     destination: str | None,
     submit_cart: bool,
     dry_run: bool,
+    min_liquidity: float | None,
     verbose: bool,
 ) -> None:
     """Find ManaPool listings trading below market value and optimize a resale cart.
@@ -523,6 +530,7 @@ def arbitrage(
     effective_dest = destination or config.optimizer_destination
     effective_max_cart = max_cart_usd if max_cart_usd is not None else config.optimizer_max_cart_usd
     effective_min_market = min_market_price if min_market_price is not None else config.arbitrage_min_market_price_usd
+    effective_min_liquidity = min_liquidity if min_liquidity is not None else config.arbitrage_min_liquidity_sales
 
     client = ManaPoolClient(
         email=config.manapool_email,
@@ -550,12 +558,25 @@ def arbitrage(
         )
         scryfall = None  # type: ignore[assignment]
 
+    # Load catalog for liquidity scoring (optional — warn and continue if unavailable)
+    catalog_records: list[dict] | None = None
+    if effective_min_liquidity > 0.0 or True:  # always try; liquidity data enriches output
+        try:
+            from manabot.api.manapool_catalog import load_catalog
+            catalog_records = load_catalog(config.catalog_cache_path)
+            log.info("Catalog loaded: %d records for liquidity scoring", len(catalog_records))
+        except Exception as e:
+            log.warning("Could not load catalog for liquidity scoring: %s", e)
+
     candidates = arb.find_candidates(
         listings,
         scryfall=scryfall,
         min_discount_pct=min_discount_pct,
         min_quantity=min_quantity,
         min_market_price_usd=effective_min_market,
+        catalog_records=catalog_records,
+        min_liquidity_sales=effective_min_liquidity,
+        liquidity_lookback_days=config.arbitrage_liquidity_lookback_days,
     )
 
     if not candidates:
@@ -883,3 +904,219 @@ def order_info(order_id: str, config_path: Path | None, dump_json: bool) -> None
     extra = {k: v for k, v in order.items() if k not in known}
     if extra:
         click.echo(f"\nAdditional fields: {_json.dumps(extra, indent=2)}")
+
+
+@cli.command("price-update")
+@click.option("--config", "config_path", type=click.Path(path_type=Path), default=None)
+@click.option("--dry-run", "-n", is_flag=True,
+              help="Show what would change without applying any updates.")
+@click.option("--verbose", "-v", is_flag=True, help="Enable debug logging.")
+@click.pass_context
+def price_update(
+    ctx: click.Context,
+    config_path: Path | None,
+    dry_run: bool,
+    verbose: bool,
+) -> None:
+    """Update seller inventory prices based on market and competitor analysis.
+
+    Fetches current ManaPool prices, computes optimal sell prices using
+    the configured strategy, and applies updates. Uses cost basis from DB
+    to enforce minimum margin, with automatic floor expiry after configured days.
+    """
+    _configure_logging(verbose)
+    from manabot.config import load_config
+    from manabot.api.manapool import ManaPoolClient
+    from manabot.db import open_db
+    from manabot.pricer import run_pricing_update, PricingConfig
+
+    try:
+        config = load_config(config_path)
+    except (ValueError, FileNotFoundError) as e:
+        click.echo(f"Config error: {e}", err=True)
+        sys.exit(1)
+
+    client = ManaPoolClient(
+        email=config.manapool_email,
+        token=config.manapool_token,
+        use_bulk_export=config.use_bulk_export,
+    )
+    pricing_cfg = PricingConfig(
+        race_to_bottom_threshold=config.pricer_race_to_bottom_threshold,
+        min_margin_pct=config.pricer_min_margin_pct,
+        cost_floor_days=config.pricer_cost_floor_days,
+        iqr_fence_factor=config.pricer_iqr_fence_factor,
+        min_sales_for_regression=config.pricer_min_sales_for_regression,
+        max_sale_age_days=config.pricer_max_sale_age_days,
+        finish_merge_max_price_usd=getattr(config, "pricer_finish_merge_max_price_usd", 2.0),
+        finish_merge_threshold_usd=getattr(config, "pricer_finish_merge_threshold_usd", 1.0),
+    )
+
+    if dry_run:
+        click.echo("[dry-run] Simulating price update — no changes will be applied.")
+
+    with open_db(config.db_path) as conn:
+        recommendations = run_pricing_update(client, conn, config, pricing_cfg, dry_run=dry_run)
+
+    if not recommendations:
+        click.echo("No seller inventory found.")
+        return
+
+    n_update = sum(1 for r in recommendations if r.should_update)
+    n_skip = sum(1 for r in recommendations if r.reason == "no_data")
+    n_no_change = len(recommendations) - n_update - n_skip
+
+    click.echo(f"\nPricing summary: {len(recommendations)} listing(s)")
+    click.echo(f"  {'Would update' if dry_run else 'Updated'}:  {n_update}")
+    click.echo(f"  No change:  {n_no_change}")
+    click.echo(f"  Skipped (no data): {n_skip}")
+
+    if n_update > 0:
+        click.echo(f"\n{'Would update' if dry_run else 'Updated'} listings:")
+        for r in sorted(recommendations, key=lambda x: x.card_name):
+            if not r.should_update:
+                continue
+            trend_str = f"trend ${r.trend_target_usd:.2f}" if r.trend_target_usd is not None else "no trend"
+            low_str = f"low ${r.low_price_usd:.2f}" if r.low_price_usd else "no listings"
+            click.echo(
+                f"  {r.card_name[:40]:<40} [{r.set_code}] {r.condition.value}/{r.finish.value}"
+                f"  ${r.current_price_usd:.2f} -> ${r.new_price_usd:.2f}"
+                f"  ({r.reason}, {trend_str}, {low_str})"
+            )
+
+
+@cli.command("margin-report")
+@click.option("--config", "config_path", type=click.Path(path_type=Path), default=None)
+@click.option("--days", type=int, default=None,
+              help="Restrict to sales in the last N days.")
+@click.option("--card", "card_filter", type=str, default=None,
+              help="Filter by card name (substring match).")
+@click.option("--verbose", "-v", is_flag=True)
+@click.pass_context
+def margin_report(
+    ctx: click.Context,
+    config_path: Path | None,
+    days: int | None,
+    card_filter: str | None,
+    verbose: bool,
+) -> None:
+    """Show P&L report from completed sales tracked in the DB."""
+    _configure_logging(verbose)
+    from manabot.config import load_config
+    from manabot.db import open_db, get_margin_report
+
+    try:
+        config = load_config(config_path)
+    except (ValueError, FileNotFoundError) as e:
+        click.echo(f"Config error: {e}", err=True)
+        sys.exit(1)
+
+    with open_db(config.db_path) as conn:
+        rows = get_margin_report(conn, days=days, card_name_filter=card_filter)
+
+    if not rows:
+        period = f" (last {days} days)" if days else ""
+        click.echo(f"No sales recorded{period}.")
+        return
+
+    total_margin = sum(r["total_margin"] or 0 for r in rows)
+    total_sold = sum(r["total_sold"] or 0 for r in rows)
+
+    header = f"{'Card':<42} {'Sold':>6} {'Avg Sell':>9} {'Avg Cost':>9} {'Total Margin':>13} {'Win%':>6}"
+    click.echo(header)
+    click.echo("-" * len(header))
+    for r in rows:
+        avg_cost = f"${r['avg_cost']:.2f}" if r["avg_cost"] is not None else "    N/A"
+        win_pct = (r["profitable_count"] / r["sale_count"] * 100) if r["sale_count"] else 0.0
+        margin_str = f"${r['total_margin']:+.2f}" if r["total_margin"] is not None else "    N/A"
+        click.echo(
+            f"{r['card_name'][:41]:<42} {r['total_sold']:>6} "
+            f"${r['avg_sell_price']:>8.2f} {avg_cost:>9} {margin_str:>13} {win_pct:>5.0f}%"
+        )
+    click.echo("-" * len(header))
+    click.echo(f"{'TOTAL':<42} {total_sold:>6} {'':>9} {'':>9} ${total_margin:>+12.2f}")
+
+
+@cli.command("import-cost-basis")
+@click.option("--config", "config_path", type=click.Path(path_type=Path), default=None)
+@click.option("--file", "csv_path", required=True, type=click.Path(path_type=Path),
+              help="CSV file with cost basis data.")
+@click.option("--verbose", "-v", is_flag=True)
+@click.pass_context
+def import_cost_basis(
+    ctx: click.Context,
+    config_path: Path | None,
+    csv_path: Path,
+    verbose: bool,
+) -> None:
+    """Import purchase prices into the cost basis DB from a CSV file.
+
+    CSV columns (header required):
+      scryfall_id, card_name, set_code, condition, finish, cost_usd, quantity, acquired_at
+
+    condition: NM, LP, MP, HP, DMG
+    finish:    nonfoil, foil
+    acquired_at: ISO date or datetime (e.g. 2025-01-15)
+    """
+    _configure_logging(verbose)
+    import csv as _csv
+    from manabot.config import load_config
+    from manabot.db import open_db, set_cost_basis
+    from manabot.models import Condition, Finish
+
+    try:
+        config = load_config(config_path)
+    except (ValueError, FileNotFoundError) as e:
+        click.echo(f"Config error: {e}", err=True)
+        sys.exit(1)
+
+    required_cols = {"scryfall_id", "card_name", "set_code", "condition", "finish", "cost_usd", "quantity", "acquired_at"}
+    inserted = 0
+    errors = 0
+
+    with open_db(config.db_path) as conn:
+        with open(csv_path, encoding="utf-8-sig") as f:
+            reader = _csv.DictReader(f)
+            if not reader.fieldnames or not required_cols.issubset(set(reader.fieldnames)):
+                missing = required_cols - set(reader.fieldnames or [])
+                click.echo(f"CSV missing required columns: {missing}", err=True)
+                sys.exit(1)
+            for i, row in enumerate(reader, start=2):
+                try:
+                    cond = Condition(row["condition"].strip().upper())
+                    finish_str = row["finish"].strip().lower()
+                    finish = Finish.FOIL if finish_str == "foil" else Finish.NONFOIL
+                    acq = datetime.fromisoformat(row["acquired_at"].strip())
+                    set_cost_basis(
+                        conn,
+                        scryfall_id=row["scryfall_id"].strip(),
+                        card_name=row["card_name"].strip(),
+                        set_code=row["set_code"].strip().upper(),
+                        condition=cond,
+                        finish=finish,
+                        cost_usd=float(row["cost_usd"]),
+                        quantity=int(row["quantity"]),
+                        acquired_at=acq,
+                        source="import",
+                    )
+                    inserted += 1
+                except (ValueError, KeyError) as e:
+                    click.echo(f"Row {i}: {e}", err=True)
+                    errors += 1
+
+    click.echo(f"Imported {inserted} cost basis record(s). {errors} error(s).")
+
+
+@cli.command("pricer-scheduler")
+@click.option("--config", "config_path", type=click.Path(path_type=Path), default=None)
+@click.pass_context
+def pricer_scheduler(ctx: click.Context, config_path: Path | None) -> None:
+    """Start the daily price update scheduler (blocking). Runs at pricer.schedule_hour UTC."""
+    from manabot.config import load_config
+    from manabot.scheduler import schedule_daily_price_update
+    try:
+        config = load_config(config_path)
+    except (ValueError, FileNotFoundError) as e:
+        click.echo(f"Config error: {e}", err=True)
+        sys.exit(1)
+    schedule_daily_price_update(config)
