@@ -310,7 +310,7 @@ def _linux_bot_service() -> str:
         [Service]
         Type=simple
         WorkingDirectory={PROJECT_DIR}
-        ExecStart={python_exe} -m manabot discord-bot
+        ExecStart={python_exe} -m manabot bot
         Restart=on-failure
         RestartSec=15
         {env_file_line}
@@ -512,7 +512,7 @@ def _register_windows_task(task_name: str, module_args: str) -> None:
 
 
 def _setup_windows() -> None:
-    _register_windows_task(_WIN_TASK_BOT, "-m manabot discord-bot")
+    _register_windows_task(_WIN_TASK_BOT, "-m manabot bot")
     _register_windows_task(_WIN_TASK_PRICER, "-m manabot pricer-scheduler")
 
     for task_name in [_WIN_TASK_BOT, _WIN_TASK_PRICER]:
@@ -549,7 +549,7 @@ def _setup_macos() -> None:
     agents_dir.mkdir(parents=True, exist_ok=True)
 
     services = [
-        (_MAC_LABEL_BOT,    "-m manabot discord-bot"),
+        (_MAC_LABEL_BOT,    "-m manabot bot"),
         (_MAC_LABEL_PRICER, "-m manabot pricer-scheduler"),
     ]
 
@@ -598,7 +598,7 @@ def setup_autostart() -> None:
         _warn(
             f"Unsupported OS: {system}.\n"
             "  Start services manually:\n"
-            "    python -m manabot discord-bot\n"
+            "    python -m manabot bot\n"
             "    python -m manabot pricer-scheduler"
         )
 
@@ -609,12 +609,12 @@ def update_service_files() -> None:
     if system == "Linux":
         _write_linux_service_files()
     elif system == "Windows":
-        _register_windows_task(_WIN_TASK_BOT, "-m manabot discord-bot")
+        _register_windows_task(_WIN_TASK_BOT, "-m manabot bot")
         _register_windows_task(_WIN_TASK_PRICER, "-m manabot pricer-scheduler")
     elif system == "Darwin":
         agents_dir = Path.home() / "Library" / "LaunchAgents"
         for label, cmd in [
-            (_MAC_LABEL_BOT, "-m manabot discord-bot"),
+            (_MAC_LABEL_BOT, "-m manabot bot"),
             (_MAC_LABEL_PRICER, "-m manabot pricer-scheduler"),
         ]:
             plist_file = agents_dir / f"{label}.plist"
@@ -634,7 +634,7 @@ def restart_service() -> None:
     else:
         _warn(
             f"Unknown OS ({system}) — restart manually:\n"
-            "  python -m manabot discord-bot\n"
+            "  python -m manabot bot\n"
             "  python -m manabot pricer-scheduler"
         )
 

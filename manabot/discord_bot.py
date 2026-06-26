@@ -18,7 +18,7 @@ Parameters of note:
   /optimize|/arbitrage max_iterations — override removal trial count for large carts
 
 Install deps:  pip install ".[full]"
-Start the bot: python -m manabot discord-bot
+Start the bot: python -m manabot bot
 """
 from __future__ import annotations
 

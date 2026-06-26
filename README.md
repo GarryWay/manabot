@@ -115,7 +115,7 @@ python -m manabot arbitrage --min-discount 0.30 --min-price 5.00
 ### Start the bot
 
 ```bash
-python -m manabot discord-bot
+python -m manabot bot
 ```
 
 Or via `setup_bot.py` — it registers a startup service automatically (systemd on Linux, Task Scheduler on Windows, launchd on macOS).
