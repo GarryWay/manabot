@@ -12,6 +12,11 @@ Commands
 /remove-card      Remove a buy list entry you added (force=True to remove any entry)
 /edit-card        Edit quantity, price, condition, or set restriction on your entry
 
+Parameters of note:
+  /optimize margin_pct     — require cards to be X% below max price (replaces over_budget_pct)
+  /optimize target_cart_usd — initial budget before free-rider expansion
+  /optimize|/arbitrage max_iterations — override removal trial count for large carts
+
 Install deps:  pip install ".[full]"
 Start the bot: python -m manabot discord-bot
 """
@@ -131,6 +136,8 @@ def _optimize_pipeline(
     arb_riders: bool,
     exclude_preorder: bool,
     forced_card_names: frozenset[str] | None = None,
+    target_cart_usd: float | None = None,
+    max_iterations: int | None = None,
 ) -> dict:
     from manabot.buylist import load_buylist
     from manabot.db import open_db, insert_listings
@@ -169,11 +176,13 @@ def _optimize_pipeline(
             arb_results = arb.candidates_to_match_results(arb_candidates)
             arb_expansion = opt.build_request_items(arb_results, over_budget_pct=0.0)
 
+    effective_max_iter = max_iterations if max_iterations is not None else config.optimizer_max_iterations
     cart = opt.find_best_cart(
         results, client,
         over_budget_pct=over_budget_pct,
+        target_cart_usd=target_cart_usd if target_cart_usd is not None else config.optimizer_target_cart_usd,
         max_cart_usd=max_cart_usd,
-        max_iterations=config.optimizer_max_iterations,
+        max_iterations=effective_max_iter,
         destination_country=config.optimizer_destination,
         scryfall=scryfall_bulk if scryfall_bulk.available else None,
         exclude_preorder=exclude_preorder,
@@ -203,6 +212,8 @@ def _arbitrage_pipeline(
     min_discount_pct: float,
     min_quantity: int,
     max_cart_usd: float | None,
+    target_cart_usd: float | None = None,
+    max_iterations: int | None = None,
 ) -> dict:
     from manabot.db import open_db, insert_listings
     from manabot.api.manapool import ManaPoolClient
@@ -243,10 +254,13 @@ def _arbitrage_pipeline(
     if not prebuilt:
         return {"error": "No eligible items after optimizer filtering"}
 
+    effective_max_iter = max_iterations if max_iterations is not None else config.optimizer_max_iterations
     cart = opt.find_best_cart(
         match_results, client,
-        over_budget_pct=0.0, max_cart_usd=max_cart_usd,
-        max_iterations=config.optimizer_max_iterations,
+        over_budget_pct=0.0,
+        target_cart_usd=target_cart_usd if target_cart_usd is not None else config.optimizer_target_cart_usd,
+        max_cart_usd=max_cart_usd,
+        max_iterations=effective_max_iter,
         destination_country=config.optimizer_destination,
         preselected=prebuilt,
     )
@@ -340,25 +354,36 @@ def create_bot(config: Config) -> _ManabotClient:
 
     @tree.command(name="optimize", description="Find the best-value cart using the ManaPool optimizer")
     @app_commands.describe(
-        over_budget_pct="Allow items up to X% above max price (default 0)",
+        margin_pct="Require cards to be at least X% below your max price (default 0; negative allows going over budget)",
+        target_cart_usd="Build to this subtotal first, then look for free-rider opportunities (0 = no target)",
         max_cart_usd="Hard spending cap in USD (0 = no cap)",
+        max_iterations="Optimizer removal trials — increase for large carts (0 = use config default)",
         arb_riders="Pad cart with arbitrage free-riders from existing sellers",
         exclude_preorder="Exclude pre-order listings (default True)",
         force_cards="Pipe-separated card names to force into the cart regardless of margin (e.g. Counterspell|Sauron, the Dark Lord)",
     )
     async def cmd_optimize(
         interaction: discord.Interaction,
-        over_budget_pct: float = 0.0,
+        margin_pct: float = 0.0,
+        target_cart_usd: float = 0.0,
         max_cart_usd: float = 0.0,
+        max_iterations: int = 0,
         arb_riders: bool = False,
         exclude_preorder: bool = True,
         force_cards: str = "",
     ) -> None:
         await interaction.response.defer(thinking=True)
+        # margin_pct is user-facing (positive = require discount); optimizer uses over_budget_pct (inverted sign)
+        over_budget_pct = -margin_pct
         max_cart = max_cart_usd if max_cart_usd > 0 else None
+        target_cart = target_cart_usd if target_cart_usd > 0 else None
+        max_iter = max_iterations if max_iterations > 0 else None
         forced = frozenset(c.strip() for c in force_cards.split("|") if c.strip()) if force_cards else None
         try:
-            data = await asyncio.to_thread(_optimize_pipeline, bot.config, over_budget_pct, max_cart, arb_riders, exclude_preorder, forced)
+            data = await asyncio.to_thread(
+                _optimize_pipeline, bot.config, over_budget_pct, max_cart, arb_riders, exclude_preorder,
+                forced, target_cart, max_iter,
+            )
         except Exception as e:
             log.exception("optimize pipeline error")
             await interaction.followup.send(f"Optimizer error: {e}")
@@ -398,18 +423,26 @@ def create_bot(config: Config) -> _ManabotClient:
     @app_commands.describe(
         min_discount_pct="Minimum % below market price (default 10)",
         min_quantity="Minimum available quantity (default 20)",
+        target_cart_usd="Build to this subtotal first, then look for free-rider opportunities (0 = no target)",
         max_cart_usd="Hard spending cap in USD (0 = no cap)",
+        max_iterations="Optimizer removal trials — increase for large carts (0 = use config default)",
     )
     async def cmd_arbitrage(
         interaction: discord.Interaction,
         min_discount_pct: float = 10.0,
         min_quantity: int = 20,
+        target_cart_usd: float = 0.0,
         max_cart_usd: float = 0.0,
+        max_iterations: int = 0,
     ) -> None:
         await interaction.response.defer(thinking=True)
         max_cart = max_cart_usd if max_cart_usd > 0 else None
+        target_cart = target_cart_usd if target_cart_usd > 0 else None
+        max_iter = max_iterations if max_iterations > 0 else None
         try:
-            data = await asyncio.to_thread(_arbitrage_pipeline, bot.config, min_discount_pct, min_quantity, max_cart)
+            data = await asyncio.to_thread(
+                _arbitrage_pipeline, bot.config, min_discount_pct, min_quantity, max_cart, target_cart, max_iter,
+            )
         except Exception as e:
             log.exception("arbitrage pipeline error")
             await interaction.followup.send(f"Arbitrage error: {e}")

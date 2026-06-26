@@ -129,8 +129,8 @@ Or via `setup_bot.py` — it registers a startup service automatically (systemd 
 | Command | Parameters | Description |
 |---------|-----------|-------------|
 | `/run` | — | Match your buylist against live ManaPool prices and show results |
-| `/optimize` | `over_budget_pct`, `max_cart`, `force_cards`, `arb_riders`, `exclude_preorder` | Run the cart optimizer; returns the best-value seller combination |
-| `/arbitrage` | `min_discount_pct`, `min_quantity`, `min_price` | Find ManaPool listings trading below TCGPlayer market value |
+| `/optimize` | `margin_pct`, `target_cart_usd`, `max_cart_usd`, `max_iterations`, `arb_riders`, `exclude_preorder`, `force_cards` | Run the cart optimizer; returns the best-value seller combination |
+| `/arbitrage` | `min_discount_pct`, `min_quantity`, `target_cart_usd`, `max_cart_usd`, `max_iterations` | Find ManaPool listings trading below TCGPlayer market value |
 
 #### Buylist management
 

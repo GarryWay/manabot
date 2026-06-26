@@ -212,8 +212,9 @@ def validate_buylist(ctx: click.Context, buylist_path_override: Path | None, con
 @cli.command()
 @click.option("--config", "config_path", type=click.Path(path_type=Path), default=None)
 @click.option("--buylist", "buylist_path_override", type=click.Path(path_type=Path), default=None)
-@click.option("--over-budget-pct", type=float, default=None,
-              help="Allow items up to X% above max_price_usd (default 0).")
+@click.option("--margin-pct", type=float, default=None,
+              help="Require cards to be at least X% below max_price_usd (default 0; "
+                   "negative values allow going over budget).")
 @click.option("--max-cart-usd", type=float, default=None,
               help="Hard spending cap per run — buy only the best items that fit within this total.")
 @click.option("--target-cart-usd", default=None, type=float,
@@ -239,7 +240,7 @@ def optimize(
     ctx: click.Context,
     config_path: Path | None,
     buylist_path_override: Path | None,
-    over_budget_pct: float | None,
+    margin_pct: float | None,
     max_cart_usd: float | None,
     target_cart_usd: float | None,
     max_iterations: int | None,
@@ -254,7 +255,7 @@ def optimize(
     """Find the highest-value cart using the ManaPool optimizer.
 
     Fetches current prices, matches your buy list, then iterates through cart
-    configurations to maximize: Σ(max_price_usd × qty) − total_cart_cost.
+    configurations to maximize: sum(max_price_usd * qty) - total_cart_cost.
     Use --max-cart-usd to cap total spend (e.g. for weekly budget purchases).
     """
     _configure_logging(verbose)
@@ -283,7 +284,9 @@ def optimize(
         click.echo(f"Buy list error: {e}", err=True)
         sys.exit(1)
 
-    effective_over_budget = over_budget_pct if over_budget_pct is not None else config.optimizer_over_budget_pct
+    # margin_pct is the user-facing parameter; internally the optimizer uses over_budget_pct
+    # (negative = must be below max price). Invert sign: margin=10 → over_budget=-10.
+    effective_over_budget = (-margin_pct) if margin_pct is not None else config.optimizer_over_budget_pct
     effective_max_cart = max_cart_usd if max_cart_usd is not None else config.optimizer_max_cart_usd
     effective_target = target_cart_usd if target_cart_usd is not None else config.optimizer_target_cart_usd
     effective_max_iter = max_iterations if max_iterations is not None else config.optimizer_max_iterations
@@ -318,16 +321,18 @@ def optimize(
         scryfall=scryfall_bulk if scryfall_bulk.available else None,
     )
     if not eligible:
+        margin_display = -effective_over_budget
         click.echo(
             "\nNo eligible items to optimize. "
-            f"Try --over-budget-pct to widen the threshold (currently {effective_over_budget:.0f}%)."
+            f"Try lowering --margin-pct (currently {margin_display:.0f}%)."
         )
         sys.exit(0)
 
+    margin_display = -effective_over_budget
     budget_note = f", cap ${effective_max_cart:.2f}" if effective_max_cart is not None else ""
     click.echo(
         f"\n{len(eligible)} item(s) eligible"
-        f" (threshold: {effective_over_budget:.0f}% over max price{budget_note})."
+        f" (margin ≥{margin_display:.0f}% below max price{budget_note})."
     )
 
     if dry_run:
@@ -479,6 +484,8 @@ def _submit_pending_order(cart, client, config, max_cart_usd):
               help="Minimum NM floor price (USD) to exclude bulk commons. Overrides config.")
 @click.option("--max-cart-usd", type=float, default=None,
               help="Hard spending cap on the resulting cart.")
+@click.option("--target-cart-usd", type=float, default=None,
+              help="Initial build target before free-rider expansion. Defaults to 80%% of --max-cart-usd.")
 @click.option("--max-iterations", type=int, default=None,
               help="Max optimizer removal trials (default 5).")
 @click.option("--destination", default=None, help="Shipping destination: US or CA.")
@@ -497,6 +504,7 @@ def arbitrage(
     min_quantity: int,
     min_market_price: float,
     max_cart_usd: float | None,
+    target_cart_usd: float | None,
     max_iterations: int | None,
     destination: str | None,
     submit_cart: bool,
@@ -529,6 +537,7 @@ def arbitrage(
     effective_max_iter = max_iterations if max_iterations is not None else config.optimizer_max_iterations
     effective_dest = destination or config.optimizer_destination
     effective_max_cart = max_cart_usd if max_cart_usd is not None else config.optimizer_max_cart_usd
+    effective_target = target_cart_usd if target_cart_usd is not None else config.optimizer_target_cart_usd
     effective_min_market = min_market_price if min_market_price is not None else config.arbitrage_min_market_price_usd
     effective_min_liquidity = min_liquidity if min_liquidity is not None else config.arbitrage_min_liquidity_sales
 
@@ -671,6 +680,7 @@ def arbitrage(
             match_results,
             client,
             over_budget_pct=0.0,
+            target_cart_usd=effective_target,
             max_cart_usd=effective_max_cart,
             max_iterations=effective_max_iter,
             destination_country=effective_dest,
