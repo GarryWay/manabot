@@ -5,13 +5,15 @@ Commands
 /run              Fetch prices and show good buys from the buy list
 /optimize         Run the ManaPool optimizer and show the best cart
 /arbitrage        Find listings trading below market value
-/add-card         Add a single card to the buy list (tagged with your username)
+/add-card         Add a single card to the buy list (tagged with your username + Discord ID)
 /add-cards        Add multiple cards at once (one per line, CSV format)
-/buylist          Display the current buy list, with optional tag filter
-/mark-purchased   Remove purchased cards from the buy list after a ManaPool order
+/buylist          Display the current buy list, with optional tag filter (e.g. user:Garrett)
+/mark-purchased   Remove purchased cards; pings the Discord user who added each card
+/remove-card      Remove a buy list entry you added (force=True to remove any entry)
+/edit-card        Edit quantity, price, condition, or set restriction on your entry
 
-Install deps:  pip install ".[bot]"
-Start the bot: manabot bot
+Install deps:  pip install ".[full]"
+Start the bot: python -m manabot discord-bot
 """
 from __future__ import annotations
 
