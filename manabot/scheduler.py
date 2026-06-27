@@ -60,6 +60,7 @@ def schedule_daily_price_update(config: Config) -> None:
         hour=config.pricer_schedule_hour,
         minute=0,
         id="daily_price_update",
+        misfire_grace_time=3600,  # fire even if service starts up to 1 hour late
     )
     log.info(
         "Price update scheduler started — runs daily at %02d:00 %s",
