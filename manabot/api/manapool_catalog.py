@@ -43,32 +43,68 @@ def load_catalog(
     cache_path: Path,
     max_age_hours: float = 23.0,
     url: str = CATALOG_URL,
+    scryfall_ids: Optional[set] = None,
 ) -> list[dict]:
     """Return parsed catalog records, using cache when fresh enough.
 
-    Downloads a fresh copy if the cache doesn't exist or is older than max_age_hours.
-    Returns the list from data['data'].
+    Pass scryfall_ids to stream-filter and only return matching records — dramatically
+    lower memory usage when you only need a subset of the 100k+ catalog.
     """
     cache_path = Path(cache_path)
-    if cache_path.exists():
+    if not cache_path.exists():
+        _download_catalog(cache_path, url)
+    else:
         age_hours = (datetime.now(timezone.utc).timestamp() - cache_path.stat().st_mtime) / 3600
-        if age_hours < max_age_hours:
+        if age_hours >= max_age_hours:
+            log.info("Catalog cache is %.1fh old, downloading fresh copy...", age_hours)
+            _download_catalog(cache_path, url)
+        else:
             log.info("Loading catalog from cache (%s, %.1fh old)", cache_path, age_hours)
-            with gzip.open(cache_path) as f:
-                return json.load(f)["data"]
 
+    return _parse_catalog(cache_path, scryfall_ids)
+
+
+def _download_catalog(cache_path: Path, url: str) -> None:
     log.info("Downloading catalog from %s ...", url)
     with urllib.request.urlopen(url, timeout=120) as resp:
         raw = resp.read()
     log.info("Downloaded %.1f MB compressed", len(raw) / 1_048_576)
-
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     with open(cache_path, "wb") as f:
         f.write(raw)
     log.info("Cached to %s", cache_path)
 
-    with gzip.open(cache_path) as f:
-        return json.load(f)["data"]
+
+def _parse_catalog(cache_path: Path, scryfall_ids: Optional[set]) -> list[dict]:
+    """Stream-parse the gzipped catalog JSON, optionally filtering by scryfall_id."""
+    try:
+        import ijson  # type: ignore[import-untyped]
+        with gzip.open(cache_path, "rb") as f:
+            if scryfall_ids is None:
+                records = list(ijson.items(f, "data.item"))
+            else:
+                records = [
+                    r for r in ijson.items(f, "data.item")
+                    if r.get("scryfall_id") in scryfall_ids
+                ]
+        log.info(
+            "Catalog loaded: %d record(s)%s",
+            len(records),
+            f" (filtered to {len(scryfall_ids)} inventory IDs)" if scryfall_ids else "",
+        )
+        return records
+    except ImportError:
+        log.warning(
+            "ijson not installed — loading full catalog into memory (high RAM usage); "
+            "run: pip install ijson"
+        )
+        with gzip.open(cache_path) as f:
+            all_records: list[dict] = json.load(f)["data"]
+        if scryfall_ids is not None:
+            records = [r for r in all_records if r.get("scryfall_id") in scryfall_ids]
+            del all_records
+            return records
+        return all_records
 
 
 def build_variant_index(records: list[dict]) -> dict[VariantKey, CatalogVariant]:

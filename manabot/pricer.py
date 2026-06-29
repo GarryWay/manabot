@@ -357,12 +357,6 @@ def run_pricing_update(
             cost_floor_days=getattr(config, "pricer_cost_floor_days", 30),
         )
 
-    catalog_cache = Path(getattr(config, "catalog_cache_path", "data/manapool_catalog.json.gz"))
-    log.info("Loading catalog...")
-    records = load_catalog(catalog_cache)
-    variant_index = build_variant_index(records)
-    log.info("Catalog indexed: %d variants", len(variant_index))
-
     tcg_cache_dir = Path(getattr(config, "tcg_cache_dir", "data/tcgtracking"))
     tcg = TCGTrackingClient(cache_dir=tcg_cache_dir)
 
@@ -372,6 +366,13 @@ def run_pricing_update(
         log.info("No seller inventory found")
         return []
     log.info("Found %d seller listing(s)", len(our_inventory))
+
+    inventory_ids = {listing.scryfall_id for listing in our_inventory}
+    catalog_cache = Path(getattr(config, "catalog_cache_path", "data/manapool_catalog.json.gz"))
+    log.info("Loading catalog (filtering to %d inventory IDs)...", len(inventory_ids))
+    records = load_catalog(catalog_cache, scryfall_ids=inventory_ids)
+    variant_index = build_variant_index(records)
+    log.info("Catalog indexed: %d variants", len(variant_index))
 
     since = get_last_sales_sync(conn)
     try:
