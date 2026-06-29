@@ -1121,7 +1121,14 @@ def import_cost_basis(
 @click.option("--config", "config_path", type=click.Path(path_type=Path), default=None)
 @click.pass_context
 def pricer_scheduler(ctx: click.Context, config_path: Path | None) -> None:
-    """Start the daily price update scheduler (blocking). Runs at pricer.schedule_hour UTC."""
+    """Start the daily price update scheduler (blocking)."""
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
     from manabot.config import load_config
     from manabot.scheduler import schedule_daily_price_update
     try:
