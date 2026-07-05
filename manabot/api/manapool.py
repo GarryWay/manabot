@@ -517,6 +517,47 @@ class ManaPoolClient:
         except (requests.ConnectionError, requests.Timeout) as e:
             raise ManaPoolAPIError(f"Network error updating seller listing {scryfall_id}") from e
 
+    def delete_seller_listing(self, inventory_id: str) -> None:
+        """DELETE /seller/inventory/{inventory_id} — remove a listing by its UUID."""
+        url = f"{self.BASE_URL}/seller/inventory/{inventory_id}"
+        try:
+            resp = self._session.delete(url, timeout=30)
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            raise ManaPoolAPIError(
+                f"HTTP {e.response.status_code} deleting seller listing {inventory_id}: {e.response.text[:200]}"
+            ) from e
+        except (requests.ConnectionError, requests.Timeout) as e:
+            raise ManaPoolAPIError(f"Network error deleting seller listing {inventory_id}") from e
+
+    def create_seller_listing(
+        self,
+        scryfall_id: str,
+        condition: Condition,
+        finish: Finish,
+        price_usd: float,
+        quantity: int,
+        language: str = "EN",
+    ) -> None:
+        """POST /seller/inventory/scryfall_id/{scryfall_id} — create a new listing."""
+        finish_id = _FINISH_TO_ID.get(finish, "NF")
+        url = f"{self.BASE_URL}/seller/inventory/scryfall_id/{scryfall_id}"
+        params = {
+            "language_id": language,
+            "finish_id": finish_id,
+            "condition_id": condition.value,
+        }
+        payload = {"price_cents": round(price_usd * 100), "quantity": quantity}
+        try:
+            resp = self._session.post(url, params=params, json=payload, timeout=30)
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            raise ManaPoolAPIError(
+                f"HTTP {e.response.status_code} creating seller listing {scryfall_id}: {e.response.text[:200]}"
+            ) from e
+        except (requests.ConnectionError, requests.Timeout) as e:
+            raise ManaPoolAPIError(f"Network error creating seller listing {scryfall_id}") from e
+
     def get_completed_sales(
         self,
         since: Optional[datetime] = None,

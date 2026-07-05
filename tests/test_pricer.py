@@ -324,3 +324,192 @@ def test_no_data_without_tcg_or_catalog():
     rec = _compute_tcg(None, tcg_market=None, current_price=5.00)
     assert rec.reason == "no_data"
     assert rec.should_update is False
+
+
+# ---------------------------------------------------------------------------
+# Double-sided token upgrade detection
+# ---------------------------------------------------------------------------
+
+from unittest.mock import MagicMock, patch
+from manabot.models import SellerListing
+from manabot.pricer import apply_double_sided_upgrades, DoubleSidedUpgrade
+
+
+def _seller_listing(
+    card_name: str,
+    set_code: str,
+    scryfall_id: str = "dft-123",
+    inventory_id: str = "inv-001",
+    condition: Condition = Condition.NM,
+    finish: Finish = Finish.NONFOIL,
+    price_usd: float = 0.25,
+    quantity: int = 4,
+) -> SellerListing:
+    return SellerListing(
+        inventory_id=inventory_id,
+        scryfall_id=scryfall_id,
+        card_name=card_name,
+        set_code=set_code,
+        condition=condition,
+        finish=finish,
+        language="EN",
+        quantity=quantity,
+        price_usd=price_usd,
+    )
+
+
+_TOKEN_VARIANT = [{"product_type": "mtg_token", "condition_id": "NM", "finish_id": "NF", "language_id": "EN"}]
+_SINGLE_VARIANT = [{"product_type": "mtg_single", "condition_id": "NM", "finish_id": "NF", "language_id": "EN"}]
+
+
+def test_double_sided_upgrade_detected_when_face_worth_more():
+    """Single-sided face with higher market price triggers an upgrade."""
+    inventory = [_seller_listing("Faerie Rogue // Thopter", "TBFZ", scryfall_id="dft-123")]
+    name_index = {
+        ("TBFZ", "Faerie Rogue // Thopter"): {
+            "scryfall_id": "dft-123", "price_market": 20, "price_market_foil": None,
+            "variants": _TOKEN_VARIANT,
+        },
+        ("TBFZ", "Faerie Rogue"): {
+            "scryfall_id": "single-456", "price_market": 120, "price_market_foil": None,
+            "variants": _TOKEN_VARIANT,
+        },
+        ("TBFZ", "Thopter"): {
+            "scryfall_id": "single-789", "price_market": 15, "price_market_foil": None,
+            "variants": _TOKEN_VARIANT,
+        },
+    }
+    client = MagicMock()
+    upgrades = apply_double_sided_upgrades(inventory, name_index, client, dry_run=True)
+
+    assert len(upgrades) == 1
+    assert upgrades[0].upgrade_name == "Faerie Rogue"
+    assert upgrades[0].upgrade_scryfall_id == "single-456"
+    assert upgrades[0].single_market_usd == pytest.approx(1.20)
+    assert upgrades[0].dft_market_usd == pytest.approx(0.20)
+    client.delete_seller_listing.assert_not_called()
+    client.create_seller_listing.assert_not_called()
+
+
+def test_double_sided_upgrade_picks_best_face():
+    """When both faces are worth more than the DFT, the higher-priced face wins."""
+    inventory = [_seller_listing("Spirit // Soldier", "TMOC", scryfall_id="dft-abc")]
+    name_index = {
+        ("TMOC", "Spirit // Soldier"): {
+            "scryfall_id": "dft-abc", "price_market": 10, "price_market_foil": None,
+            "variants": _TOKEN_VARIANT,
+        },
+        ("TMOC", "Spirit"): {
+            "scryfall_id": "spirit-id", "price_market": 50, "price_market_foil": None,
+            "variants": _TOKEN_VARIANT,
+        },
+        ("TMOC", "Soldier"): {
+            "scryfall_id": "soldier-id", "price_market": 80, "price_market_foil": None,
+            "variants": _TOKEN_VARIANT,
+        },
+    }
+    client = MagicMock()
+    upgrades = apply_double_sided_upgrades(inventory, name_index, client, dry_run=True)
+
+    assert len(upgrades) == 1
+    assert upgrades[0].upgrade_name == "Soldier"
+    assert upgrades[0].upgrade_scryfall_id == "soldier-id"
+
+
+def test_double_sided_no_upgrade_when_face_cheaper():
+    """If neither face has a higher price than the DFT, no upgrade is generated."""
+    inventory = [_seller_listing("Faerie Rogue // Thopter", "TBFZ", scryfall_id="dft-123")]
+    name_index = {
+        ("TBFZ", "Faerie Rogue // Thopter"): {
+            "scryfall_id": "dft-123", "price_market": 200, "price_market_foil": None,
+            "variants": _TOKEN_VARIANT,
+        },
+        ("TBFZ", "Faerie Rogue"): {
+            "scryfall_id": "single-456", "price_market": 120, "price_market_foil": None,
+            "variants": _TOKEN_VARIANT,
+        },
+    }
+    client = MagicMock()
+    upgrades = apply_double_sided_upgrades(inventory, name_index, client, dry_run=True)
+    assert len(upgrades) == 0
+
+
+def test_double_sided_upgrade_live_calls_delete_then_create():
+    """In live mode, delete the DFT listing then create the single-sided listing."""
+    listing = _seller_listing(
+        "Faerie Rogue // Thopter", "TBFZ",
+        scryfall_id="dft-123", inventory_id="inv-abc",
+        quantity=3, price_usd=0.20,
+    )
+    name_index = {
+        ("TBFZ", "Faerie Rogue // Thopter"): {
+            "scryfall_id": "dft-123", "price_market": 20, "price_market_foil": None,
+            "variants": _TOKEN_VARIANT,
+        },
+        ("TBFZ", "Faerie Rogue"): {
+            "scryfall_id": "single-456", "price_market": 120, "price_market_foil": None,
+            "variants": _TOKEN_VARIANT,
+        },
+    }
+    client = MagicMock()
+    upgrades = apply_double_sided_upgrades([listing], name_index, client, dry_run=False)
+
+    assert len(upgrades) == 1
+    client.delete_seller_listing.assert_called_once_with("inv-abc")
+    client.create_seller_listing.assert_called_once_with(
+        scryfall_id="single-456",
+        condition=Condition.NM,
+        finish=Finish.NONFOIL,
+        price_usd=pytest.approx(1.20),
+        quantity=3,
+        language="EN",
+    )
+
+
+def test_double_sided_no_face_in_same_set():
+    """If neither face has a catalog entry in the same set, no upgrade."""
+    inventory = [_seller_listing("Faerie Rogue // Thopter", "TBFZ", scryfall_id="dft-123")]
+    name_index = {
+        ("TBFZ", "Faerie Rogue // Thopter"): {
+            "scryfall_id": "dft-123", "price_market": 20, "price_market_foil": None,
+            "variants": _TOKEN_VARIANT,
+        },
+        # Faerie Rogue exists only in a different set
+        ("TZNC", "Faerie Rogue"): {
+            "scryfall_id": "single-456", "price_market": 120, "price_market_foil": None,
+            "variants": _TOKEN_VARIANT,
+        },
+    }
+    client = MagicMock()
+    upgrades = apply_double_sided_upgrades(inventory, name_index, client, dry_run=True)
+    assert len(upgrades) == 0
+
+
+def test_single_sided_cards_skipped():
+    """Non-DFT listings are ignored by the upgrade check."""
+    inventory = [_seller_listing("Lightning Bolt", "TST", scryfall_id="bolt-123")]
+    name_index = {
+        ("TST", "Lightning Bolt"): {"scryfall_id": "bolt-123", "price_market": 500, "variants": _SINGLE_VARIANT},
+    }
+    client = MagicMock()
+    upgrades = apply_double_sided_upgrades(inventory, name_index, client, dry_run=True)
+    assert len(upgrades) == 0
+
+
+def test_mdfc_spell_skipped_not_a_token():
+    """MDFC spells (Sea Gate Restoration // Sea Gate, Reborn) must not be relisted."""
+    inventory = [_seller_listing("Sea Gate Restoration // Sea Gate, Reborn", "ZNR", scryfall_id="mdfc-999")]
+    name_index = {
+        ("ZNR", "Sea Gate Restoration // Sea Gate, Reborn"): {
+            "scryfall_id": "mdfc-999", "price_market": 4200, "price_market_foil": None,
+            "variants": _SINGLE_VARIANT,  # <-- mtg_single, not mtg_token
+        },
+        ("ZNR", "Sea Gate Restoration"): {
+            "scryfall_id": "face-111", "price_market": 5000, "price_market_foil": None,
+            "variants": _SINGLE_VARIANT,
+        },
+    }
+    client = MagicMock()
+    upgrades = apply_double_sided_upgrades(inventory, name_index, client, dry_run=True)
+    assert len(upgrades) == 0
+    client.delete_seller_listing.assert_not_called()

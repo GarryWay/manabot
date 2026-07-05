@@ -44,11 +44,15 @@ def load_catalog(
     max_age_hours: float = 23.0,
     url: str = CATALOG_URL,
     scryfall_ids: Optional[set] = None,
+    name_set_filter: Optional[set] = None,
 ) -> list[dict]:
     """Return parsed catalog records, using cache when fresh enough.
 
-    Pass scryfall_ids to stream-filter and only return matching records — dramatically
-    lower memory usage when you only need a subset of the 100k+ catalog.
+    Pass scryfall_ids to include records by scryfall_id (inventory items).
+    Pass name_set_filter as a set of (set_code, name) tuples to also include
+    records that match by name within a set — used to pull in same-set single-sided
+    counterparts of double-sided token listings without knowing their scryfall_ids.
+    Both filters are OR'd together.
     """
     cache_path = Path(cache_path)
     if not cache_path.exists():
@@ -61,7 +65,7 @@ def load_catalog(
         else:
             log.info("Loading catalog from cache (%s, %.1fh old)", cache_path, age_hours)
 
-    return _parse_catalog(cache_path, scryfall_ids)
+    return _parse_catalog(cache_path, scryfall_ids, name_set_filter)
 
 
 def _download_catalog(cache_path: Path, url: str) -> None:
@@ -75,22 +79,33 @@ def _download_catalog(cache_path: Path, url: str) -> None:
     log.info("Cached to %s", cache_path)
 
 
-def _parse_catalog(cache_path: Path, scryfall_ids: Optional[set]) -> list[dict]:
-    """Stream-parse the gzipped catalog JSON, optionally filtering by scryfall_id."""
+def _parse_catalog(
+    cache_path: Path,
+    scryfall_ids: Optional[set],
+    name_set_filter: Optional[set] = None,
+) -> list[dict]:
+    """Stream-parse the gzipped catalog JSON, keeping records that match either filter."""
+    def _keep(r: dict) -> bool:
+        if scryfall_ids is None and name_set_filter is None:
+            return True
+        if scryfall_ids and r.get("scryfall_id") in scryfall_ids:
+            return True
+        if name_set_filter:
+            key = (str(r.get("set_code", "")).upper(), r.get("name", ""))
+            if key in name_set_filter:
+                return True
+        return False
+
     try:
         import ijson  # type: ignore[import-untyped]
         with gzip.open(cache_path, "rb") as f:
-            if scryfall_ids is None:
-                records = list(ijson.items(f, "data.item"))
-            else:
-                records = [
-                    r for r in ijson.items(f, "data.item")
-                    if r.get("scryfall_id") in scryfall_ids
-                ]
+            records = [r for r in ijson.items(f, "data.item") if _keep(r)]
         log.info(
             "Catalog loaded: %d record(s)%s",
             len(records),
-            f" (filtered to {len(scryfall_ids)} inventory IDs)" if scryfall_ids else "",
+            f" (filtered to {len(scryfall_ids or [])} inventory IDs"
+            + (f" + {len(name_set_filter)} name lookups)" if name_set_filter else ")")
+            if (scryfall_ids or name_set_filter) else "",
         )
         return records
     except ImportError:
@@ -100,8 +115,8 @@ def _parse_catalog(cache_path: Path, scryfall_ids: Optional[set]) -> list[dict]:
         )
         with gzip.open(cache_path) as f:
             all_records: list[dict] = json.load(f)["data"]
-        if scryfall_ids is not None:
-            records = [r for r in all_records if r.get("scryfall_id") in scryfall_ids]
+        if scryfall_ids is not None or name_set_filter is not None:
+            records = [r for r in all_records if _keep(r)]
             del all_records
             return records
         return all_records
@@ -135,6 +150,27 @@ def build_variant_index(records: list[dict]) -> dict[VariantKey, CatalogVariant]
                 recent_sales=v.get("recent_sales") or [],
                 market_price_usd=market,
             )
+    return index
+
+
+def build_name_index(records: list[dict]) -> dict[tuple[str, str], dict]:
+    """Index records by (set_code, name) for same-set name lookups.
+
+    When multiple records share the same set+name (shouldn't happen but defensive),
+    the one with the highest market price is kept.
+    """
+    index: dict[tuple[str, str], dict] = {}
+    for record in records:
+        key = (str(record.get("set_code", "")).upper(), record.get("name", ""))
+        existing = index.get(key)
+        if existing is None:
+            index[key] = record
+        else:
+            # Keep the record with the higher market price
+            new_mkt = record.get("price_market") or 0
+            old_mkt = existing.get("price_market") or 0
+            if new_mkt > old_mkt:
+                index[key] = record
     return index
 
 

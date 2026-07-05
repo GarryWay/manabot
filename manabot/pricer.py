@@ -78,6 +78,15 @@ class PriceRecommendation:
     should_update: bool
 
 
+@dataclass
+class DoubleSidedUpgrade:
+    listing: "SellerListing"    # the double-sided inventory listing being replaced
+    upgrade_scryfall_id: str    # scryfall_id of the single-sided face
+    upgrade_name: str           # which face name to relist as
+    dft_market_usd: float       # double-sided market price
+    single_market_usd: float    # single-sided market price (the reason for the upgrade)
+
+
 # ---------------------------------------------------------------------------
 # Linear regression (stdlib only)
 # ---------------------------------------------------------------------------
@@ -335,6 +344,122 @@ def compute_price(
     )
 
 
+def apply_double_sided_upgrades(
+    inventory: "list[SellerListing]",
+    name_index: "dict[tuple[str, str], dict]",
+    client: "ManaPoolClient",
+    dry_run: bool = False,
+) -> list[DoubleSidedUpgrade]:
+    """For each double-sided token listing, check if a same-set single-sided face has a
+    higher market price. If so, delete the double-sided listing and create the single-sided
+    one at the same quantity so the normal pricing loop can price it correctly next run.
+    """
+    from manabot.models import SellerListing  # local import to avoid circular
+
+    upgrades: list[DoubleSidedUpgrade] = []
+
+    for listing in inventory:
+        if "//" not in listing.card_name:
+            continue
+
+        faces = [f.strip() for f in listing.card_name.split("//")]
+        is_foil = listing.finish == Finish.FOIL
+
+        # Market price of the double-sided token itself
+        dft_record = name_index.get((listing.set_code, listing.card_name))
+        if dft_record is None:
+            continue
+
+        # Skip non-tokens — MDFC spells and transforming legends also use //
+        # but their catalog variants have product_type "mtg_single", not "mtg_token"
+        if not any(
+            v.get("product_type") == "mtg_token"
+            for v in dft_record.get("variants", [])
+        ):
+            continue
+        if is_foil:
+            dft_market = (dft_record.get("price_market_foil") or 0) / 100.0
+        else:
+            dft_market = (dft_record.get("price_market") or 0) / 100.0
+
+        # Find the single-sided face with the highest same-set market price
+        best_scryfall_id: Optional[str] = None
+        best_face_name: Optional[str] = None
+        best_face_price = 0.0
+
+        for face in faces:
+            single_record = name_index.get((listing.set_code, face))
+            if single_record is None:
+                continue
+            # Skip if it resolves back to the same catalog entry
+            if single_record.get("scryfall_id") == listing.scryfall_id:
+                continue
+            if is_foil:
+                face_price = (single_record.get("price_market_foil") or 0) / 100.0
+            else:
+                face_price = (single_record.get("price_market") or 0) / 100.0
+            if face_price > best_face_price:
+                best_face_price = face_price
+                best_face_name = face
+                best_scryfall_id = single_record.get("scryfall_id")
+
+        if best_scryfall_id is None or best_face_price <= dft_market:
+            continue
+
+        upgrade = DoubleSidedUpgrade(
+            listing=listing,
+            upgrade_scryfall_id=best_scryfall_id,
+            upgrade_name=best_face_name or "",
+            dft_market_usd=dft_market,
+            single_market_usd=best_face_price,
+        )
+        upgrades.append(upgrade)
+
+        log.info(
+            "%s [%s] '%s' → '%s': dft_market=$%.2f single_market=$%.2f",
+            "DRY RUN would relist" if dry_run else "Relisting",
+            listing.set_code,
+            listing.card_name,
+            best_face_name,
+            dft_market,
+            best_face_price,
+        )
+
+        if not dry_run:
+            try:
+                client.delete_seller_listing(listing.inventory_id)
+                # Set initial price at single-sided market; pricer will fine-tune next run
+                client.create_seller_listing(
+                    scryfall_id=best_scryfall_id,
+                    condition=listing.condition,
+                    finish=listing.finish,
+                    price_usd=max(best_face_price, 0.15),
+                    quantity=listing.quantity,
+                    language=listing.language,
+                )
+                log.info(
+                    "Relisted %d× '%s' [%s] as '%s' at $%.2f",
+                    listing.quantity, listing.card_name, listing.set_code,
+                    best_face_name, best_face_price,
+                )
+            except Exception:
+                log.exception(
+                    "Failed to relist '%s' [%s] — original listing preserved",
+                    listing.card_name, listing.set_code,
+                )
+
+    if upgrades:
+        log.info(
+            "Double-sided token check: %d upgrade(s) found%s",
+            len(upgrades),
+            " (dry run, no changes)" if dry_run else " — relisted",
+        )
+    else:
+        log.info("Double-sided token check: no upgrades found")
+
+    return upgrades
+
+
 def run_pricing_update(
     client: "ManaPoolClient",
     conn: sqlite3.Connection,
@@ -343,7 +468,7 @@ def run_pricing_update(
     dry_run: bool = False,
 ) -> list[PriceRecommendation]:
     """Load catalog, fetch seller inventory, compute + apply price updates."""
-    from manabot.api.manapool_catalog import build_variant_index, load_catalog
+    from manabot.api.manapool_catalog import build_name_index, build_variant_index, load_catalog
     from manabot.api.tcgtracking import TCGTrackingClient
     from manabot.db import (
         get_cost_basis, get_days_below_floor, get_last_sales_sync,
@@ -368,11 +493,31 @@ def run_pricing_update(
     log.info("Found %d seller listing(s)", len(our_inventory))
 
     inventory_ids = {listing.scryfall_id for listing in our_inventory}
+
+    # For double-sided tokens, also pull same-set single-sided face records so we can
+    # compare prices and relist if a face is worth more on its own.
+    dft_face_lookups: set[tuple[str, str]] = set()
+    for listing in our_inventory:
+        if "//" in listing.card_name:
+            for face in listing.card_name.split("//"):
+                dft_face_lookups.add((listing.set_code, face.strip()))
+
     catalog_cache = Path(getattr(config, "catalog_cache_path", "data/manapool_catalog.json.gz"))
     log.info("Loading catalog (filtering to %d inventory IDs)...", len(inventory_ids))
-    records = load_catalog(catalog_cache, scryfall_ids=inventory_ids)
+    records = load_catalog(
+        catalog_cache,
+        scryfall_ids=inventory_ids,
+        name_set_filter=dft_face_lookups or None,
+    )
     variant_index = build_variant_index(records)
     log.info("Catalog indexed: %d variants", len(variant_index))
+
+    name_index = build_name_index(records)
+    upgrades = apply_double_sided_upgrades(our_inventory, name_index, client, dry_run=dry_run)
+    # Remove relisted listings from the pricing loop — they no longer exist on ManaPool
+    if not dry_run and upgrades:
+        relisted_ids = {u.listing.inventory_id for u in upgrades}
+        our_inventory = [l for l in our_inventory if l.inventory_id not in relisted_ids]
 
     since = get_last_sales_sync(conn)
     try:
