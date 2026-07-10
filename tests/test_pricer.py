@@ -332,7 +332,7 @@ def test_no_data_without_tcg_or_catalog():
 
 from unittest.mock import MagicMock, patch
 from manabot.models import SellerListing
-from manabot.pricer import apply_double_sided_upgrades, DoubleSidedUpgrade
+from manabot.pricer import apply_double_sided_upgrades, DoubleSidedUpgrade, PricingConfig
 
 
 def _seller_listing(
@@ -380,13 +380,13 @@ def test_double_sided_upgrade_detected_when_face_worth_more():
         },
     }
     client = MagicMock()
-    upgrades = apply_double_sided_upgrades(inventory, name_index, client, dry_run=True)
+    upgrades = apply_double_sided_upgrades(inventory, name_index, {}, PricingConfig(), client, dry_run=True)
 
     assert len(upgrades) == 1
     assert upgrades[0].upgrade_name == "Faerie Rogue"
     assert upgrades[0].upgrade_scryfall_id == "single-456"
-    assert upgrades[0].single_market_usd == pytest.approx(1.20)
-    assert upgrades[0].dft_market_usd == pytest.approx(0.20)
+    assert upgrades[0].single_suggested_usd == pytest.approx(1.20)
+    assert upgrades[0].dft_suggested_usd == pytest.approx(0.20)
     client.delete_seller_listing.assert_not_called()
     client.create_seller_listing.assert_not_called()
 
@@ -409,7 +409,7 @@ def test_double_sided_upgrade_picks_best_face():
         },
     }
     client = MagicMock()
-    upgrades = apply_double_sided_upgrades(inventory, name_index, client, dry_run=True)
+    upgrades = apply_double_sided_upgrades(inventory, name_index, {}, PricingConfig(), client, dry_run=True)
 
     assert len(upgrades) == 1
     assert upgrades[0].upgrade_name == "Soldier"
@@ -430,7 +430,7 @@ def test_double_sided_no_upgrade_when_face_cheaper():
         },
     }
     client = MagicMock()
-    upgrades = apply_double_sided_upgrades(inventory, name_index, client, dry_run=True)
+    upgrades = apply_double_sided_upgrades(inventory, name_index, {}, PricingConfig(), client, dry_run=True)
     assert len(upgrades) == 0
 
 
@@ -452,7 +452,7 @@ def test_double_sided_upgrade_live_calls_delete_then_create():
         },
     }
     client = MagicMock()
-    upgrades = apply_double_sided_upgrades([listing], name_index, client, dry_run=False)
+    upgrades = apply_double_sided_upgrades([listing], name_index, {}, PricingConfig(), client, dry_run=False)
 
     assert len(upgrades) == 1
     client.delete_seller_listing.assert_called_once_with("inv-abc")
@@ -481,7 +481,7 @@ def test_double_sided_no_face_in_same_set():
         },
     }
     client = MagicMock()
-    upgrades = apply_double_sided_upgrades(inventory, name_index, client, dry_run=True)
+    upgrades = apply_double_sided_upgrades(inventory, name_index, {}, PricingConfig(), client, dry_run=True)
     assert len(upgrades) == 0
 
 
@@ -492,7 +492,7 @@ def test_single_sided_cards_skipped():
         ("TST", "Lightning Bolt"): {"scryfall_id": "bolt-123", "price_market": 500, "variants": _SINGLE_VARIANT},
     }
     client = MagicMock()
-    upgrades = apply_double_sided_upgrades(inventory, name_index, client, dry_run=True)
+    upgrades = apply_double_sided_upgrades(inventory, name_index, {}, PricingConfig(), client, dry_run=True)
     assert len(upgrades) == 0
 
 
@@ -510,6 +510,6 @@ def test_mdfc_spell_skipped_not_a_token():
         },
     }
     client = MagicMock()
-    upgrades = apply_double_sided_upgrades(inventory, name_index, client, dry_run=True)
+    upgrades = apply_double_sided_upgrades(inventory, name_index, {}, PricingConfig(), client, dry_run=True)
     assert len(upgrades) == 0
     client.delete_seller_listing.assert_not_called()

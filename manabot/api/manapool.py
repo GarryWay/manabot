@@ -520,9 +520,12 @@ class ManaPoolClient:
     def delete_seller_listing(self, inventory_id: str) -> None:
         """DELETE /seller/inventory/{inventory_id} — remove a listing by its UUID."""
         url = f"{self.BASE_URL}/seller/inventory/{inventory_id}"
+        log.info("DELETE %s (inventory_id=%s)", url, inventory_id)
         try:
             resp = self._session.delete(url, timeout=30)
             resp.raise_for_status()
+            log.info("DELETE %s → %d%s", url, resp.status_code,
+                     f" {resp.text[:120]}" if resp.text else "")
         except requests.HTTPError as e:
             raise ManaPoolAPIError(
                 f"HTTP {e.response.status_code} deleting seller listing {inventory_id}: {e.response.text[:200]}"

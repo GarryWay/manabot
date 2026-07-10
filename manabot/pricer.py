@@ -83,8 +83,8 @@ class DoubleSidedUpgrade:
     listing: "SellerListing"    # the double-sided inventory listing being replaced
     upgrade_scryfall_id: str    # scryfall_id of the single-sided face
     upgrade_name: str           # which face name to relist as
-    dft_market_usd: float       # double-sided market price
-    single_market_usd: float    # single-sided market price (the reason for the upgrade)
+    dft_suggested_usd: float    # suggested price for the double-sided token
+    single_suggested_usd: float # suggested price for the winning single-sided face
 
 
 # ---------------------------------------------------------------------------
@@ -347,17 +347,50 @@ def compute_price(
 def apply_double_sided_upgrades(
     inventory: "list[SellerListing]",
     name_index: "dict[tuple[str, str], dict]",
+    variant_index: "dict",
+    pricing_config: PricingConfig,
     client: "ManaPoolClient",
     dry_run: bool = False,
 ) -> list[DoubleSidedUpgrade]:
-    """For each double-sided token listing, check if a same-set single-sided face has a
-    higher market price. If so, delete the double-sided listing and create the single-sided
-    one at the same quantity so the normal pricing loop can price it correctly next run.
+    """For each double-sided token listing, treat DFT + each face as three alternatives
+    and pick the one with the highest suggested list price (computed by the same pricing
+    algorithm used for regular inventory). If a face wins, relist as that face.
+
+    Multiple DFT listings that target the same single-sided face are batched together:
+    all are deleted and their quantities summed into one create or quantity update so
+    inventory counts remain accurate.
     """
-    from manabot.models import SellerListing  # local import to avoid circular
+    from collections import defaultdict
 
+    def _suggested_price(scryfall_id: str, card_name: str, record: dict, is_foil: bool) -> float:
+        """Run the standard pricing algorithm for a catalog record.
+
+        Uses price_market as the proxy current price so that when there is no
+        trend/sales data, the comparison falls back to market price consistently
+        for all three candidates (DFT, face 1, face 2).
+        """
+        finish_catalog_id = "FO" if is_foil else "NF"
+        key = (scryfall_id, listing.condition.value, finish_catalog_id, listing.language)
+        variant = variant_index.get(key)
+        market_key = "price_market_foil" if is_foil else "price_market"
+        proxy_price = (record.get(market_key) or 0) / 100.0
+        rec = compute_price(
+            listing_scryfall_id=scryfall_id,
+            listing_card_name=card_name,
+            listing_set_code=listing.set_code,
+            listing_condition=listing.condition,
+            listing_finish=listing.finish,
+            listing_language=listing.language,
+            listing_current_price_usd=proxy_price,
+            catalog_variant=variant,
+            cost_basis_usd=None,
+            days_below_floor=0,
+            config=pricing_config,
+        )
+        return rec.new_price_usd
+
+    # Phase 1: identify all upgrades — no API calls yet
     upgrades: list[DoubleSidedUpgrade] = []
-
     for listing in inventory:
         if "//" not in listing.card_name:
             continue
@@ -365,7 +398,6 @@ def apply_double_sided_upgrades(
         faces = [f.strip() for f in listing.card_name.split("//")]
         is_foil = listing.finish == Finish.FOIL
 
-        # Market price of the double-sided token itself
         dft_record = name_index.get((listing.set_code, listing.card_name))
         if dft_record is None:
             continue
@@ -377,86 +409,123 @@ def apply_double_sided_upgrades(
             for v in dft_record.get("variants", [])
         ):
             continue
-        if is_foil:
-            dft_market = (dft_record.get("price_market_foil") or 0) / 100.0
-        else:
-            dft_market = (dft_record.get("price_market") or 0) / 100.0
 
-        # Find the single-sided face with the highest same-set market price
+        dft_suggested = _suggested_price(listing.scryfall_id, listing.card_name, dft_record, is_foil)
+
         best_scryfall_id: Optional[str] = None
         best_face_name: Optional[str] = None
-        best_face_price = 0.0
+        best_face_suggested = 0.0
 
         for face in faces:
             single_record = name_index.get((listing.set_code, face))
             if single_record is None:
                 continue
-            # Skip if it resolves back to the same catalog entry
-            if single_record.get("scryfall_id") == listing.scryfall_id:
+            face_scryfall_id = single_record.get("scryfall_id")
+            if face_scryfall_id == listing.scryfall_id:
                 continue
-            if is_foil:
-                face_price = (single_record.get("price_market_foil") or 0) / 100.0
-            else:
-                face_price = (single_record.get("price_market") or 0) / 100.0
-            if face_price > best_face_price:
-                best_face_price = face_price
+            face_suggested = _suggested_price(face_scryfall_id or "", face, single_record, is_foil)
+            if face_suggested > best_face_suggested:
+                best_face_suggested = face_suggested
                 best_face_name = face
-                best_scryfall_id = single_record.get("scryfall_id")
+                best_scryfall_id = face_scryfall_id
 
-        if best_scryfall_id is None or best_face_price <= dft_market:
+        if best_scryfall_id is None or best_face_suggested <= dft_suggested:
             continue
 
-        upgrade = DoubleSidedUpgrade(
+        upgrades.append(DoubleSidedUpgrade(
             listing=listing,
             upgrade_scryfall_id=best_scryfall_id,
             upgrade_name=best_face_name or "",
-            dft_market_usd=dft_market,
-            single_market_usd=best_face_price,
-        )
-        upgrades.append(upgrade)
-
+            dft_suggested_usd=dft_suggested,
+            single_suggested_usd=best_face_suggested,
+        ))
         log.info(
-            "%s [%s] '%s' → '%s': dft_market=$%.2f single_market=$%.2f",
-            "DRY RUN would relist" if dry_run else "Relisting",
-            listing.set_code,
-            listing.card_name,
-            best_face_name,
-            dft_market,
-            best_face_price,
+            "%s [%s] '%s' → '%s': dft=$%.2f single=$%.2f",
+            "DRY RUN would relist" if dry_run else "Will relist",
+            listing.set_code, listing.card_name, best_face_name,
+            dft_suggested, best_face_suggested,
         )
 
-        if not dry_run:
+    if not upgrades:
+        log.info("Double-sided token check: no upgrades found")
+        return []
+
+    # Phase 2: group by target (scryfall_id, condition, finish, language) so that
+    # multiple DFTs targeting the same single-sided face consolidate into one operation
+    target_groups: dict[tuple, list[DoubleSidedUpgrade]] = defaultdict(list)
+    for u in upgrades:
+        key = (u.upgrade_scryfall_id, u.listing.condition, u.listing.finish, u.listing.language)
+        target_groups[key].append(u)
+
+    # Phase 3: apply — delete DFT sources, then create or add-to-existing target listing
+    if not dry_run:
+        existing_by_key = {
+            (l.scryfall_id, l.condition, l.finish, l.language): l
+            for l in inventory
+        }
+
+        for (scryfall_id, condition, finish, language), group in target_groups.items():
+            face_name = group[0].upgrade_name
+            face_price = max(group[0].single_suggested_usd, HARD_FLOOR_USD)
+            existing = existing_by_key.get((scryfall_id, condition, finish, language))
+
+            deleted_qty = 0
+            for u in group:
+                try:
+                    client.delete_seller_listing(u.listing.inventory_id)
+                    deleted_qty += u.listing.quantity
+                except Exception:
+                    log.exception(
+                        "Failed to delete DFT '%s' [%s] id=%s — skipping its quantity",
+                        u.listing.card_name, u.listing.set_code, u.listing.inventory_id,
+                    )
+
+            if deleted_qty == 0:
+                continue
+
             try:
-                client.delete_seller_listing(listing.inventory_id)
-                # Set initial price at single-sided market; pricer will fine-tune next run
-                client.create_seller_listing(
-                    scryfall_id=best_scryfall_id,
-                    condition=listing.condition,
-                    finish=listing.finish,
-                    price_usd=max(best_face_price, 0.15),
-                    quantity=listing.quantity,
-                    language=listing.language,
-                )
-                log.info(
-                    "Relisted %d× '%s' [%s] as '%s' at $%.2f",
-                    listing.quantity, listing.card_name, listing.set_code,
-                    best_face_name, best_face_price,
-                )
+                if existing:
+                    new_qty = existing.quantity + deleted_qty
+                    client.update_seller_listing_price(
+                        scryfall_id=scryfall_id,
+                        condition=condition,
+                        finish=finish,
+                        new_price_usd=face_price,
+                        quantity=new_qty,
+                        language=language,
+                    )
+                    log.info(
+                        "Updated '%s' [%s] qty %d+%d=%d at $%.2f (%d DFT listing(s) merged)",
+                        face_name, group[0].listing.set_code,
+                        existing.quantity, deleted_qty, new_qty, face_price, len(group),
+                    )
+                else:
+                    client.create_seller_listing(
+                        scryfall_id=scryfall_id,
+                        condition=condition,
+                        finish=finish,
+                        price_usd=face_price,
+                        quantity=deleted_qty,
+                        language=language,
+                    )
+                    log.info(
+                        "Created '%s' [%s] %dx at $%.2f (%d DFT listing(s))",
+                        face_name, group[0].listing.set_code,
+                        deleted_qty, face_price, len(group),
+                    )
             except Exception:
                 log.exception(
-                    "Failed to relist '%s' [%s] — original listing preserved",
-                    listing.card_name, listing.set_code,
+                    "LISTING LOST: deleted DFT(s) for '%s' [%s] but failed to create/update"
+                    " '%s' — manual recovery needed (%d qty)",
+                    group[0].listing.card_name, group[0].listing.set_code,
+                    face_name, deleted_qty,
                 )
 
-    if upgrades:
-        log.info(
-            "Double-sided token check: %d upgrade(s) found%s",
-            len(upgrades),
-            " (dry run, no changes)" if dry_run else " — relisted",
-        )
-    else:
-        log.info("Double-sided token check: no upgrades found")
-
+    log.info(
+        "Double-sided token check: %d upgrade(s) → %d unique target(s)%s",
+        len(upgrades), len(target_groups),
+        " (dry run, no changes)" if dry_run else " — applied",
+    )
     return upgrades
 
 
@@ -513,7 +582,9 @@ def run_pricing_update(
     log.info("Catalog indexed: %d variants", len(variant_index))
 
     name_index = build_name_index(records)
-    upgrades = apply_double_sided_upgrades(our_inventory, name_index, client, dry_run=dry_run)
+    upgrades = apply_double_sided_upgrades(
+        our_inventory, name_index, variant_index, pricing_config, client, dry_run=dry_run,
+    )
     # Remove relisted listings from the pricing loop — they no longer exist on ManaPool
     if not dry_run and upgrades:
         relisted_ids = {u.listing.inventory_id for u in upgrades}
