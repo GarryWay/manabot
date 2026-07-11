@@ -402,23 +402,18 @@ def apply_double_sided_upgrades(
         if "//" not in listing.card_name:
             continue
 
+        # Token set codes start with "T" (TC15, TSOS, T40K, etc.).
+        # Skip MDFCs and transforming legends that also use // but live in normal sets.
+        if not listing.set_code.startswith("T"):
+            continue
+
         faces = [f.strip() for f in listing.card_name.split("//")]
         is_foil = listing.finish == Finish.FOIL
 
-        dft_record = name_index.get((listing.set_code, listing.card_name))
-        if dft_record is None:
-            continue
-
-        # Skip non-tokens — MDFC spells and transforming legends also use //
-        # but their catalog variants have product_type "mtg_single", not "mtg_token"
-        if not any(
-            v.get("product_type") == "mtg_token"
-            for v in dft_record.get("variants", [])
-        ):
-            continue
-
+        # DFTs don't have catalog entries under the combined name; use the listing
+        # price directly as the DFT baseline (always supplied as current_price).
         dft_suggested = _suggested_price(
-            listing.scryfall_id, listing.card_name, dft_record, is_foil,
+            listing.scryfall_id, listing.card_name, {}, is_foil,
             current_price=listing.price_usd,
         )
 
