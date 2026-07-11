@@ -362,18 +362,25 @@ def apply_double_sided_upgrades(
     """
     from collections import defaultdict
 
-    def _suggested_price(scryfall_id: str, card_name: str, record: dict, is_foil: bool) -> float:
+    def _suggested_price(
+        scryfall_id: str,
+        card_name: str,
+        record: dict,
+        is_foil: bool,
+        current_price: float | None = None,
+    ) -> float:
         """Run the standard pricing algorithm for a catalog record.
 
-        Uses price_market as the proxy current price so that when there is no
-        trend/sales data, the comparison falls back to market price consistently
-        for all three candidates (DFT, face 1, face 2).
+        current_price: use the actual listing price for cards already in inventory
+        (DFT), so a missing price_market doesn't collapse the baseline to $0.
+        Omit for unlisted candidates (faces) — falls back to price_market proxy.
         """
         finish_catalog_id = "FO" if is_foil else "NF"
         key = (scryfall_id, listing.condition.value, finish_catalog_id, listing.language)
         variant = variant_index.get(key)
-        market_key = "price_market_foil" if is_foil else "price_market"
-        proxy_price = (record.get(market_key) or 0) / 100.0
+        if current_price is None:
+            market_key = "price_market_foil" if is_foil else "price_market"
+            current_price = (record.get(market_key) or 0) / 100.0
         rec = compute_price(
             listing_scryfall_id=scryfall_id,
             listing_card_name=card_name,
@@ -381,7 +388,7 @@ def apply_double_sided_upgrades(
             listing_condition=listing.condition,
             listing_finish=listing.finish,
             listing_language=listing.language,
-            listing_current_price_usd=proxy_price,
+            listing_current_price_usd=current_price,
             catalog_variant=variant,
             cost_basis_usd=None,
             days_below_floor=0,
@@ -410,7 +417,10 @@ def apply_double_sided_upgrades(
         ):
             continue
 
-        dft_suggested = _suggested_price(listing.scryfall_id, listing.card_name, dft_record, is_foil)
+        dft_suggested = _suggested_price(
+            listing.scryfall_id, listing.card_name, dft_record, is_foil,
+            current_price=listing.price_usd,
+        )
 
         best_scryfall_id: Optional[str] = None
         best_face_name: Optional[str] = None
@@ -472,7 +482,7 @@ def apply_double_sided_upgrades(
             deleted_qty = 0
             for u in group:
                 try:
-                    client.delete_seller_listing(u.listing.inventory_id)
+                    client.delete_seller_listing(u.listing)
                     deleted_qty += u.listing.quantity
                 except Exception:
                     log.exception(
@@ -486,14 +496,7 @@ def apply_double_sided_upgrades(
             try:
                 if existing:
                     new_qty = existing.quantity + deleted_qty
-                    client.update_seller_listing_price(
-                        scryfall_id=scryfall_id,
-                        condition=condition,
-                        finish=finish,
-                        new_price_usd=face_price,
-                        quantity=new_qty,
-                        language=language,
-                    )
+                    client.update_seller_listing_price(existing, face_price, new_qty)
                     log.info(
                         "Updated '%s' [%s] qty %d+%d=%d at $%.2f (%d DFT listing(s) merged)",
                         face_name, group[0].listing.set_code,
@@ -695,10 +698,7 @@ def run_pricing_update(
             )
             if not dry_run:
                 try:
-                    client.update_seller_listing_price(
-                        listing.scryfall_id, listing.condition, listing.finish,
-                        rec.new_price_usd, listing.quantity, listing.language,
-                    )
+                    client.update_seller_listing_price(listing, rec.new_price_usd, listing.quantity)
                     log.info(
                         "Updated %-40s [%s] %s/%-7s  $%.2f → $%.2f (trend=$%.2f, %s)",
                         rec.card_name[:40], rec.set_code,

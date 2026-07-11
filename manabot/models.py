@@ -141,6 +141,7 @@ class CartResult:
 class SellerListing:
     """Our own inventory listing on ManaPool (seller side)."""
     inventory_id: str       # UUID from GET /seller/inventory
+    product_id: str         # ManaPool product UUID — required for DFT updates
     scryfall_id: str
     card_name: str
     set_code: str

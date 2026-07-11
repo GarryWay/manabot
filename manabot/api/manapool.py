@@ -479,6 +479,7 @@ class ManaPoolClient:
         finish_id = single.get("finish_id", "NF")
         return SellerListing(
             inventory_id=item["id"],
+            product_id=item["product"]["id"],
             scryfall_id=single["scryfall_id"],
             card_name=single["name"],
             set_code=str(single.get("set", "")).upper(),
@@ -491,47 +492,46 @@ class ManaPoolClient:
 
     def update_seller_listing_price(
         self,
-        scryfall_id: str,
-        condition: Condition,
-        finish: Finish,
+        listing: "SellerListing",
         new_price_usd: float,
         quantity: int,
-        language: str = "EN",
     ) -> None:
-        """PUT /seller/inventory/scryfall_id/{scryfall_id} — update listing price."""
-        finish_id = _FINISH_TO_ID.get(finish, "NF")
-        url = f"{self.BASE_URL}/seller/inventory/scryfall_id/{scryfall_id}"
+        """Update price/quantity for an existing seller listing.
+
+        Prefers PUT /seller/inventory/product/mtg_single/{product_id} (exact product
+        match, works for DFTs). Falls back to PUT /seller/inventory/scryfall_id/{id}
+        if product_id is absent.
+        """
+        finish_id = _FINISH_TO_ID.get(listing.finish, "NF")
         params = {
-            "language_id": language,
+            "language_id": listing.language,
             "finish_id": finish_id,
-            "condition_id": condition.value,
+            "condition_id": listing.condition.value,
         }
         payload = {"price_cents": round(new_price_usd * 100), "quantity": quantity}
+        if listing.product_id:
+            url = f"{self.BASE_URL}/seller/inventory/product/mtg_single/{listing.product_id}"
+            label = listing.product_id
+        else:
+            url = f"{self.BASE_URL}/seller/inventory/scryfall_id/{listing.scryfall_id}"
+            label = listing.scryfall_id
         try:
             resp = self._session.put(url, params=params, json=payload, timeout=30)
             resp.raise_for_status()
         except requests.HTTPError as e:
             raise ManaPoolAPIError(
-                f"HTTP {e.response.status_code} updating seller listing {scryfall_id}: {e.response.text[:200]}"
+                f"HTTP {e.response.status_code} updating seller listing {label}: {e.response.text[:200]}"
             ) from e
         except (requests.ConnectionError, requests.Timeout) as e:
-            raise ManaPoolAPIError(f"Network error updating seller listing {scryfall_id}") from e
+            raise ManaPoolAPIError(f"Network error updating seller listing {label}") from e
 
-    def delete_seller_listing(self, inventory_id: str) -> None:
-        """DELETE /seller/inventory/{inventory_id} — remove a listing by its UUID."""
-        url = f"{self.BASE_URL}/seller/inventory/{inventory_id}"
-        log.info("DELETE %s (inventory_id=%s)", url, inventory_id)
-        try:
-            resp = self._session.delete(url, timeout=30)
-            resp.raise_for_status()
-            log.info("DELETE %s → %d%s", url, resp.status_code,
-                     f" {resp.text[:120]}" if resp.text else "")
-        except requests.HTTPError as e:
-            raise ManaPoolAPIError(
-                f"HTTP {e.response.status_code} deleting seller listing {inventory_id}: {e.response.text[:200]}"
-            ) from e
-        except (requests.ConnectionError, requests.Timeout) as e:
-            raise ManaPoolAPIError(f"Network error deleting seller listing {inventory_id}") from e
+    def delete_seller_listing(self, listing: "SellerListing") -> None:
+        """Remove a listing by setting quantity to 0 via PUT.
+
+        ManaPool has no dedicated DELETE endpoint; setting quantity=0 removes the listing.
+        Uses product_id endpoint so DFTs are targeted correctly.
+        """
+        self.update_seller_listing_price(listing, new_price_usd=0.15, quantity=0)
 
     def create_seller_listing(
         self,

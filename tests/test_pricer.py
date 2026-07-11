@@ -340,6 +340,7 @@ def _seller_listing(
     set_code: str,
     scryfall_id: str = "dft-123",
     inventory_id: str = "inv-001",
+    product_id: str = "prod-001",
     condition: Condition = Condition.NM,
     finish: Finish = Finish.NONFOIL,
     price_usd: float = 0.25,
@@ -347,6 +348,7 @@ def _seller_listing(
 ) -> SellerListing:
     return SellerListing(
         inventory_id=inventory_id,
+        product_id=product_id,
         scryfall_id=scryfall_id,
         card_name=card_name,
         set_code=set_code,
@@ -386,7 +388,7 @@ def test_double_sided_upgrade_detected_when_face_worth_more():
     assert upgrades[0].upgrade_name == "Faerie Rogue"
     assert upgrades[0].upgrade_scryfall_id == "single-456"
     assert upgrades[0].single_suggested_usd == pytest.approx(1.20)
-    assert upgrades[0].dft_suggested_usd == pytest.approx(0.20)
+    assert upgrades[0].dft_suggested_usd == pytest.approx(0.25)  # listing.price_usd default
     client.delete_seller_listing.assert_not_called()
     client.create_seller_listing.assert_not_called()
 
@@ -417,8 +419,9 @@ def test_double_sided_upgrade_picks_best_face():
 
 
 def test_double_sided_no_upgrade_when_face_cheaper():
-    """If neither face has a higher price than the DFT, no upgrade is generated."""
-    inventory = [_seller_listing("Faerie Rogue // Thopter", "TBFZ", scryfall_id="dft-123")]
+    """If neither face's suggested price exceeds the DFT's listing price, no upgrade."""
+    # DFT listed at $2.00 (the price we'd lose by delisting it); face market=$1.20
+    inventory = [_seller_listing("Faerie Rogue // Thopter", "TBFZ", scryfall_id="dft-123", price_usd=2.00)]
     name_index = {
         ("TBFZ", "Faerie Rogue // Thopter"): {
             "scryfall_id": "dft-123", "price_market": 200, "price_market_foil": None,
@@ -455,7 +458,7 @@ def test_double_sided_upgrade_live_calls_delete_then_create():
     upgrades = apply_double_sided_upgrades([listing], name_index, {}, PricingConfig(), client, dry_run=False)
 
     assert len(upgrades) == 1
-    client.delete_seller_listing.assert_called_once_with("inv-abc")
+    client.delete_seller_listing.assert_called_once_with(listing)
     client.create_seller_listing.assert_called_once_with(
         scryfall_id="single-456",
         condition=Condition.NM,
