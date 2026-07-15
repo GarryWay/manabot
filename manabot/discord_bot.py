@@ -717,11 +717,12 @@ def create_bot(config: Config) -> _ManabotClient:
         # Summarise what was consumed
         total_qty = sum(int(r.get("qty_purchased", "1")) for r in affected)
         unique_cards = len({r.get("card_name", "") for r in affected})
-        lines = [
-            f"{r['qty_purchased']}x {r['card_name']}"
-            + (" (partial)" if r.get("target_quantity") else "")
-            for r in affected
-        ]
+        lines = []
+        for r in affected:
+            qty_purchased = int(r.get("qty_purchased", "1") or "1")
+            qty_original = int(r.get("target_quantity", "1") or "1")
+            partial = qty_purchased < qty_original
+            lines.append(f"{r['qty_purchased']}x {r['card_name']}" + (" (partial)" if partial else ""))
         summary = (
             f"Marked **{total_qty}** cop{'y' if total_qty == 1 else 'ies'} "
             f"across **{unique_cards}** card(s) as purchased:\n"
@@ -729,19 +730,31 @@ def create_bot(config: Config) -> _ManabotClient:
             + (f"\n  ... and {len(lines) - 30} more" if len(lines) > 30 else "")
         )
 
-        # Ping each Discord user whose entries were affected
-        uids: set[str] = set()
+        # Ping each Discord user whose entries were affected (once per unique uid).
+        # Tags are stored as "user:Name,uid:SNOWFLAKE" — extract both for the message
+        # so it's readable even when the Discord client hasn't loaded the mention yet.
+        uid_to_name: dict[str, str] = {}
         for row in affected:
+            name_tag = ""
+            uid_tag = ""
             for tag in (row.get("tags") or "").split(","):
                 tag = tag.strip()
-                if tag.startswith("uid:"):
-                    uid = tag[4:].strip()
-                    if uid:
-                        uids.add(uid)
+                if tag.startswith("user:"):
+                    name_tag = tag[5:].strip()
+                elif tag.startswith("uid:"):
+                    uid_tag = tag[4:].strip()
+            if uid_tag and uid_tag.isdigit():
+                uid_to_name.setdefault(uid_tag, name_tag or uid_tag)
 
-        if uids:
-            mentions = " ".join(f"<@{uid}>" for uid in sorted(uids))
-            summary += f"\n\nFYI {mentions} — your cards have been purchased."
+        if uid_to_name:
+            mention_parts = []
+            for uid, name in sorted(uid_to_name.items()):
+                member = interaction.guild.get_member(int(uid)) if interaction.guild else None
+                if member:
+                    mention_parts.append(member.mention)
+                else:
+                    mention_parts.append(f"<@{uid}> ({name})")
+            summary += f"\n\nFYI {' '.join(mention_parts)} — your cards have been purchased."
 
         await interaction.response.send_message(summary[:2000])
 
