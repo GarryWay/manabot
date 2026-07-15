@@ -90,6 +90,20 @@ def _send_as_file_or_text(text: str, filename: str) -> tuple[str | None, discord
     return None, discord.File(io.BytesIO(text.encode()), filename=filename)
 
 
+def _send_kwargs(
+    embed: discord.Embed,
+    content: str | None = None,
+    file: discord.File | None = None,
+) -> dict:
+    """Build followup.send kwargs, omitting None values (discord.py uses MISSING, not None)."""
+    kw: dict = {"embed": embed}
+    if content is not None:
+        kw["content"] = content
+    if file is not None:
+        kw["file"] = file
+    return kw
+
+
 # ── Synchronous pipeline helpers (run in thread via asyncio.to_thread) ───────
 
 def _run_pipeline(config: Config) -> dict:
@@ -348,7 +362,7 @@ def create_bot(config: Config) -> _ManabotClient:
 
         list_lines = [f"{i['quantity']}x {i['card_name']}  ${i['price']:.2f}/ea" for i in good_buys]
         content, file = _send_as_file_or_text("\n".join(list_lines), "good_buys.txt") if list_lines else (None, None)
-        await interaction.followup.send(embed=embed, content=content, file=file)  # type: ignore[arg-type]
+        await interaction.followup.send(**_send_kwargs(embed, content, file))
 
     # ── /optimize ─────────────────────────────────────────────────────────────
 
@@ -415,7 +429,7 @@ def create_bot(config: Config) -> _ManabotClient:
             sign = "+" if x["margin"] >= 0 else "-"
             lines.append(f"{x['quantity']}x {x['card_name']} [{x['set_code']}]  ${x['price']:.2f}/ea  ({sign}${abs(x['margin']):.2f})")
         content, file = _send_as_file_or_text("\n".join(lines), "cart.txt")
-        await interaction.followup.send(embed=embed, content=content, file=file)  # type: ignore[arg-type]
+        await interaction.followup.send(**_send_kwargs(embed, content, file))
 
     # ── /arbitrage ────────────────────────────────────────────────────────────
 
@@ -475,7 +489,7 @@ def create_bot(config: Config) -> _ManabotClient:
                 f"  ${x['price']:.2f}/ea  (market ${x['market_price']:.2f}, -{x['discount_pct']:.1f}%)"
             )
         content, file = _send_as_file_or_text("\n".join(lines), "arbitrage_cart.txt")
-        await interaction.followup.send(embed=embed, content=content, file=file)  # type: ignore[arg-type]
+        await interaction.followup.send(**_send_kwargs(embed, content, file))
 
     # ── /add-card ─────────────────────────────────────────────────────────────
 
@@ -683,10 +697,20 @@ def create_bot(config: Config) -> _ManabotClient:
 
         if not affected:
             all_names = [p[0] for p in purchases]
+            # Arb riders from /optimize arb_riders=True or /arbitrage are not in the
+            # buy list — that's expected. Give a clearer message when the cart command
+            # was arbitrage-sourced.
+            last_meta_path = _last_cart_path(bot.config)
+            try:
+                last_meta = json.loads(last_meta_path.read_text(encoding="utf-8")) if last_meta_path.exists() else {}
+            except Exception:
+                last_meta = {}
+            arb_hint = " (arb carts don't touch the buy list)" if last_meta.get("command") == "arbitrage" else ""
             await interaction.response.send_message(
                 "No matching cards found in buy list for: "
                 + ", ".join(all_names[:10])
                 + (f" ... and {len(all_names) - 10} more" if len(all_names) > 10 else "")
+                + arb_hint
             )
             return
 
