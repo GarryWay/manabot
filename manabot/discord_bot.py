@@ -300,6 +300,7 @@ def _arbitrage_pipeline(
 class _ManabotClient(discord.Client):
     def __init__(self, config: Config):
         intents = discord.Intents.default()
+        intents.members = True  # needed for guild.get_member() to resolve all guild members
         super().__init__(intents=intents)
         self.config = config
         self.tree = app_commands.CommandTree(self)
