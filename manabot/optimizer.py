@@ -14,7 +14,7 @@ Iteration
 ---------
     1.  Build eligible items: estimated_price ≤ max_price × (1 + over_budget_pct%).
     2.  If max_cart_usd is set, greedily pre-select the highest-value items that fit
-        within that estimated dollar cap (sorted by total savings = margin × qty).
+        within that estimated dollar cap (sorted by relative margin rate × qty).
     3.  Run optimizer → baseline result.
     4.  Iterate up to max_iterations times:
         a.  If cart total > max_cart_usd: force-remove the worst-margin item to get
@@ -121,13 +121,13 @@ def _select_within_budget(
 ) -> list[CartRequestItem]:
     """Greedily select the best items that fit within budget_usd (estimated prices).
 
-    Items are sorted by total estimated savings (margin × qty) descending so the
-    most valuable items are prioritised. Shipping and fees are excluded from this
-    estimate — the caller is responsible for leaving appropriate headroom.
+    Items are sorted by relative margin rate (margin / price × qty) descending so
+    the best-deal-per-dollar items are prioritised over high-price low-percentage
+    discounts. Shipping and fees are excluded — the caller is responsible for headroom.
     """
     sorted_items = sorted(
         items,
-        key=lambda x: x.estimated_margin * x.buy_list_item.target_quantity,
+        key=lambda x: (x.estimated_margin / x.estimated_price) * x.buy_list_item.target_quantity,
         reverse=True,
     )
     selected: list[CartRequestItem] = []
@@ -510,7 +510,7 @@ def find_best_cart(
         if not candidates:
             break
 
-        worst = min(candidates, key=lambda x: x.estimated_margin)
+        worst = min(candidates, key=lambda x: x.estimated_margin / x.estimated_price)
         trial_set = [x for x in current if x is not worst]
         if not trial_set:
             locked.add(id(worst))
@@ -552,7 +552,7 @@ def find_best_cart(
             [x for x in _extra_pool
              if x.buy_list_item.card_name not in in_cart_names
              and x.seller_id in existing_sellers],
-            key=lambda x: x.estimated_margin,
+            key=lambda x: x.estimated_margin / x.estimated_price,
             reverse=True,
         )
         if free_riders:
@@ -691,7 +691,7 @@ def try_expand_with_new_sellers(
             [x for x in pool
              if x.buy_list_item.card_name not in in_cart_names
              and (not x.seller_id or x.seller_id not in current_sellers)],
-            key=lambda x: x.estimated_margin,
+            key=lambda x: x.estimated_margin / x.estimated_price,
             reverse=True,
         )
         if not new_candidates:
