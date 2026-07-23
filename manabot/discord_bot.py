@@ -776,6 +776,8 @@ def create_bot(config: Config) -> _ManabotClient:
         caller_uid = str(interaction.user.id)
         uid_filter = None if force else caller_uid
 
+        await interaction.response.defer()
+
         try:
             affected = await asyncio.to_thread(
                 remove_purchases_fifo,
@@ -784,12 +786,12 @@ def create_bot(config: Config) -> _ManabotClient:
                 uid_filter,
             )
         except Exception as e:
-            await interaction.response.send_message(f"Error updating buy list: {e}", ephemeral=True)
+            await interaction.followup.send(f"Error updating buy list: {e}", ephemeral=True)
             return
 
         if not affected:
             qualifier = "any entry" if force else "your entries"
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"No {qualifier} found in buy list for **{card_name}**.",
                 ephemeral=True,
             )
@@ -813,7 +815,7 @@ def create_bot(config: Config) -> _ManabotClient:
                 mentions = " ".join(f"<@{u}>" for u in sorted(other_uids))
                 msg += f"\n\nFYI {mentions} — your entry was removed by {interaction.user.display_name}."
 
-        await interaction.response.send_message(msg)
+        await interaction.followup.send(msg)
 
     # ── /edit-card ────────────────────────────────────────────────────────────
 
@@ -863,6 +865,8 @@ def create_bot(config: Config) -> _ManabotClient:
             "foil": foil if foil else None,
         }
 
+        await interaction.response.defer()
+
         try:
             original = await asyncio.to_thread(
                 edit_buylist_entry,
@@ -872,12 +876,12 @@ def create_bot(config: Config) -> _ManabotClient:
                 uid_filter,
             )
         except Exception as e:
-            await interaction.response.send_message(f"Error updating buy list: {e}", ephemeral=True)
+            await interaction.followup.send(f"Error updating buy list: {e}", ephemeral=True)
             return
 
         if original is None:
             qualifier = "any entry" if force else "your entry"
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"No {qualifier} found in buy list for **{card_name}**.",
                 ephemeral=True,
             )
@@ -925,7 +929,7 @@ def create_bot(config: Config) -> _ManabotClient:
                 mentions = " ".join(f"<@{u}>" for u in sorted(other_uids))
                 msg += f"\n\nFYI {mentions} — your entry was edited by {interaction.user.display_name}."
 
-        await interaction.response.send_message(msg)
+        await interaction.followup.send(msg)
 
     return bot
 
