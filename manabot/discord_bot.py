@@ -622,13 +622,15 @@ def create_bot(config: Config) -> _ManabotClient:
     async def cmd_buylist(interaction: discord.Interaction, tag: str = "") -> None:
         from manabot.buylist import load_buylist
 
+        await interaction.response.defer()
+
         try:
             items = load_buylist(bot.config.buylist_path)
         except FileNotFoundError:
-            await interaction.response.send_message("Buy list file not found.", ephemeral=True)
+            await interaction.followup.send("Buy list file not found.", ephemeral=True)
             return
         except Exception as e:
-            await interaction.response.send_message(f"Error loading buy list: {e}", ephemeral=True)
+            await interaction.followup.send(f"Error loading buy list: {e}", ephemeral=True)
             return
 
         if tag:
@@ -636,7 +638,7 @@ def create_bot(config: Config) -> _ManabotClient:
 
         if not items:
             suffix = f" matching tag {tag!r}" if tag else ""
-            await interaction.response.send_message(f"No items in buy list{suffix}.")
+            await interaction.followup.send(f"No items in buy list{suffix}.")
             return
 
         lines = []
@@ -653,9 +655,9 @@ def create_bot(config: Config) -> _ManabotClient:
         body = "\n".join(lines)
         content, file = _send_as_file_or_text(body, "buylist.txt")
         if file:
-            await interaction.response.send_message(header, file=file)
+            await interaction.followup.send(header, file=file)
         else:
-            await interaction.response.send_message(f"{header}\n{content}")
+            await interaction.followup.send(f"{header}\n{content}")
 
     # ── /mark-purchased ───────────────────────────────────────────────────────
 
@@ -688,12 +690,14 @@ def create_bot(config: Config) -> _ManabotClient:
             # Use exact quantities from the last cart, consuming FIFO
             purchases = [(item["card_name"], item["quantity"]) for item in last]
 
+        await interaction.response.defer()
+
         try:
             affected = await asyncio.to_thread(
                 remove_purchases_fifo, bot.config.buylist_path, purchases
             )
         except Exception as e:
-            await interaction.response.send_message(f"Error updating buy list: {e}", ephemeral=True)
+            await interaction.followup.send(f"Error updating buy list: {e}", ephemeral=True)
             return
 
         if not affected:
@@ -707,7 +711,7 @@ def create_bot(config: Config) -> _ManabotClient:
             except Exception:
                 last_meta = {}
             arb_hint = " (arb carts don't touch the buy list)" if last_meta.get("command") == "arbitrage" else ""
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "No matching cards found in buy list for: "
                 + ", ".join(all_names[:10])
                 + (f" ... and {len(all_names) - 10} more" if len(all_names) > 10 else "")
@@ -757,7 +761,7 @@ def create_bot(config: Config) -> _ManabotClient:
                     mention_parts.append(f"<@{uid}> ({name})")
             summary += f"\n\nFYI {' '.join(mention_parts)} — your cards have been purchased."
 
-        await interaction.response.send_message(summary[:2000])
+        await interaction.followup.send(summary[:2000])
 
     # ── /remove-card ──────────────────────────────────────────────────────────
 
