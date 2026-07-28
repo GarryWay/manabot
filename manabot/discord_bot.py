@@ -768,17 +768,20 @@ def create_bot(config: Config) -> _ManabotClient:
     @tree.command(name="remove-card", description="Remove a buy list entry you added (or any entry with force)")
     @app_commands.describe(
         card_name="Card name to remove",
+        quantity="Number of copies to remove (default 1; 0 = remove all)",
         force="Remove any matching entry, not just your own",
     )
     async def cmd_remove_card(
         interaction: discord.Interaction,
         card_name: str,
+        quantity: int = 1,
         force: bool = False,
     ) -> None:
         from manabot.buylist import remove_purchases_fifo
 
         caller_uid = str(interaction.user.id)
         uid_filter = None if force else caller_uid
+        qty_to_remove = -1 if quantity <= 0 else quantity
 
         await interaction.response.defer()
 
@@ -786,7 +789,7 @@ def create_bot(config: Config) -> _ManabotClient:
             affected = await asyncio.to_thread(
                 remove_purchases_fifo,
                 bot.config.buylist_path,
-                [(card_name.strip(), -1)],
+                [(card_name.strip(), qty_to_remove)],
                 uid_filter,
             )
         except Exception as e:
