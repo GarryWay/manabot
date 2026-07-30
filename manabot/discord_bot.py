@@ -297,9 +297,9 @@ def _arbitrage_pipeline(
 
 
 def _check_inventory_pipeline(config: Config, force_remove: bool) -> dict:
-    from manabot.buylist import load_buylist, remove_purchases_fifo
+    from manabot.buylist import load_buylist
     from manabot.api.manapool import ManaPoolClient
-    from manabot.inventory_check import find_overlap
+    from manabot.inventory_check import apply_force_remove, find_overlap
 
     buy_list = load_buylist(config.buylist_path)
     client = ManaPoolClient(email=config.manapool_email, token=config.manapool_token, use_bulk_export=config.use_bulk_export)
@@ -311,20 +311,12 @@ def _check_inventory_pipeline(config: Config, force_remove: bool) -> dict:
     removal_errors: list[str] = []
     decremented: list[dict] = []
     if force_remove and overlaps:
-        for o in overlaps:
-            for m in o.matches:
-                try:
-                    client.delete_seller_listing(m)
-                    removed_from_inventory += 1
-                except Exception as e:
-                    removal_errors.append(f"{m.card_name} [{m.set_code}]: {e}")
-        # Decrement only by the quantity we actually have on hand — a partial
-        # overlap should leave the remainder on the buy list.
-        purchases = [(o.buy_list_item.card_name, o.total_quantity) for o in overlaps]
-        affected = remove_purchases_fifo(config.buylist_path, purchases)
+        result = apply_force_remove(overlaps, client, config.buylist_path)
+        removed_from_inventory = result.listings_deleted + result.listings_updated
+        removal_errors = result.removal_errors
         decremented = [
             {"card_name": r.get("card_name", ""), "qty": int(r.get("qty_purchased", "1") or "1")}
-            for r in affected
+            for r in result.buylist_decremented
         ]
 
     return {
@@ -1048,7 +1040,7 @@ def create_bot(config: Config) -> _ManabotClient:
                 total_qty = sum(d["qty"] for d in decremented)
                 summary = "\n".join(f"  • {d['qty']}x {d['card_name']}" for d in decremented[:30])
                 msg = (
-                    f"Delisted {data['removed_from_inventory']} inventory listing(s); "
+                    f"Adjusted {data['removed_from_inventory']} inventory listing(s); "
                     f"decremented **{total_qty}** unit(s) across **{len(decremented)}** buy list row(s):\n{summary}"
                 )
                 if len(decremented) > 30:

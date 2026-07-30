@@ -940,9 +940,9 @@ def check_inventory(
     """
     _configure_logging(verbose)
     from manabot.config import load_config
-    from manabot.buylist import load_buylist, remove_purchases_fifo
+    from manabot.buylist import load_buylist
     from manabot.api.manapool import ManaPoolClient
-    from manabot.inventory_check import find_overlap
+    from manabot.inventory_check import apply_force_remove, find_overlap
 
     try:
         config = load_config(config_path)
@@ -990,23 +990,16 @@ def check_inventory(
         return
 
     click.echo("\nRemoving matched cards from inventory and decrementing the buy list...")
-    removed_from_inventory = 0
-    for o in overlaps:
-        for m in o.matches:
-            try:
-                client.delete_seller_listing(m)
-                removed_from_inventory += 1
-            except Exception as e:
-                click.echo(f"  Failed to remove {m.card_name} [{m.set_code}]: {e}", err=True)
+    result = apply_force_remove(overlaps, client, buylist_path)
 
-    # Decrement only by the quantity we actually have on hand — a partial
-    # overlap should leave the remainder on the buy list.
-    purchases = [(o.buy_list_item.card_name, o.total_quantity) for o in overlaps]
-    affected = remove_purchases_fifo(buylist_path, purchases)
-    total_qty = sum(int(r.get("qty_purchased", "1") or "1") for r in affected)
+    for err in result.removal_errors:
+        click.echo(f"  Failed to remove {err}", err=True)
+
+    total_qty = sum(int(r.get("qty_purchased", "1") or "1") for r in result.buylist_decremented)
     click.echo(
-        f"\nDelisted {removed_from_inventory} inventory listing(s); "
-        f"decremented {total_qty} unit(s) across {len(affected)} buy list row(s)."
+        f"\nDelisted {result.listings_deleted} inventory listing(s) and trimmed {result.listings_updated} "
+        f"more (removed {result.inventory_qty_removed} unit(s) total); "
+        f"decremented {total_qty} unit(s) across {len(result.buylist_decremented)} buy list row(s)."
     )
 
 
