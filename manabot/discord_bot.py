@@ -11,6 +11,7 @@ Commands
 /mark-purchased   Remove purchased cards; pings the Discord user who added each card
 /remove-card      Remove a buy list entry you added (force=True to remove any entry)
 /edit-card        Edit quantity, price, condition, or set restriction on your entry
+/check-inventory  Check if buy list cards are already in ManaPool inventory (force_remove=True to delist + decrement buy list)
 
 Parameters of note:
   /optimize margin_pct     — require cards to be X% below max price (replaces over_budget_pct)
@@ -292,6 +293,62 @@ def _arbitrage_pipeline(
         "items": items_data, "candidate_count": len(candidates),
         "subtotal": cart.subtotal_usd, "shipping": cart.shipping_usd,
         "fees": cart.fees_usd, "total": cart.total_usd, "net_value": cart.net_value_usd,
+    }
+
+
+def _check_inventory_pipeline(config: Config, force_remove: bool) -> dict:
+    from manabot.buylist import load_buylist, remove_purchases_fifo
+    from manabot.api.manapool import ManaPoolClient
+    from manabot.inventory_check import find_overlap
+
+    buy_list = load_buylist(config.buylist_path)
+    client = ManaPoolClient(email=config.manapool_email, token=config.manapool_token, use_bulk_export=config.use_bulk_export)
+    seller_inventory = client.get_seller_inventory()
+
+    overlaps = find_overlap(buy_list, seller_inventory)
+
+    removed_from_inventory = 0
+    removal_errors: list[str] = []
+    decremented: list[dict] = []
+    if force_remove and overlaps:
+        for o in overlaps:
+            for m in o.matches:
+                try:
+                    client.delete_seller_listing(m)
+                    removed_from_inventory += 1
+                except Exception as e:
+                    removal_errors.append(f"{m.card_name} [{m.set_code}]: {e}")
+        # Decrement only by the quantity we actually have on hand — a partial
+        # overlap should leave the remainder on the buy list.
+        purchases = [(o.buy_list_item.card_name, o.total_quantity) for o in overlaps]
+        affected = remove_purchases_fifo(config.buylist_path, purchases)
+        decremented = [
+            {"card_name": r.get("card_name", ""), "qty": int(r.get("qty_purchased", "1") or "1")}
+            for r in affected
+        ]
+
+    return {
+        "overlaps": [
+            {
+                "card_name": o.buy_list_item.card_name,
+                "target_quantity": o.buy_list_item.target_quantity,
+                "inventory_quantity": o.total_quantity,
+                "matches": [
+                    {
+                        "set_code": m.set_code, "condition": m.condition.value,
+                        "finish": m.finish.value, "quantity": m.quantity, "price": m.price_usd,
+                    }
+                    for m in o.matches
+                ],
+            }
+            for o in overlaps
+        ],
+        "total_checked": len(buy_list),
+        "inventory_count": len(seller_inventory),
+        "force_remove": force_remove,
+        "decremented": decremented,
+        "removed_from_inventory": removed_from_inventory,
+        "removal_errors": removal_errors,
     }
 
 
@@ -937,6 +994,69 @@ def create_bot(config: Config) -> _ManabotClient:
                 msg += f"\n\nFYI {mentions} — your entry was edited by {interaction.user.display_name}."
 
         await interaction.followup.send(msg)
+
+    # ── /check-inventory ─────────────────────────────────────────────────────
+
+    @tree.command(
+        name="check-inventory",
+        description="Check if buy list cards are already in your ManaPool inventory",
+    )
+    @app_commands.describe(
+        force_remove="Delist matched cards from inventory (qty=0) and decrement the buy list by the overlapping quantity",
+    )
+    async def cmd_check_inventory(interaction: discord.Interaction, force_remove: bool = False) -> None:
+        await interaction.response.defer(thinking=True)
+        try:
+            data = await asyncio.to_thread(_check_inventory_pipeline, bot.config, force_remove)
+        except Exception as e:
+            log.exception("check-inventory pipeline error")
+            await interaction.followup.send(f"Error: {e}")
+            return
+
+        overlaps = data["overlaps"]
+        if not overlaps:
+            await interaction.followup.send(
+                f"No overlap — checked {data['total_checked']} buy list item(s) against "
+                f"{data['inventory_count']} inventory listing(s)."
+            )
+            return
+
+        color = 0xE74C3C if force_remove else 0xF1C40F
+        title = f"{len(overlaps)} buy list card(s) already in inventory"
+        if force_remove:
+            title += " — decremented"
+        embed = discord.Embed(title=title, color=color)
+        embed.set_footer(text=f"Checked {data['total_checked']} buy list item(s) against {data['inventory_count']} inventory listing(s).")
+        if not force_remove:
+            embed.description = "Run again with `force_remove: True` to delist these and decrement the buy list by the overlapping quantity."
+
+        lines = []
+        for o in overlaps:
+            match_str = ", ".join(
+                f"{m['quantity']}x [{m['set_code']}] {m['condition']}/{m['finish']} ${m['price']:.2f}"
+                for m in o["matches"]
+            )
+            lines.append(
+                f"{o['card_name']} (want {o['target_quantity']}x, have {o['inventory_quantity']}x): {match_str}"
+            )
+        content, file = _send_as_file_or_text("\n".join(lines), "inventory_overlap.txt")
+        await interaction.followup.send(**_send_kwargs(embed, content, file))
+
+        if force_remove:
+            decremented = data["decremented"]
+            if decremented:
+                total_qty = sum(d["qty"] for d in decremented)
+                summary = "\n".join(f"  • {d['qty']}x {d['card_name']}" for d in decremented[:30])
+                msg = (
+                    f"Delisted {data['removed_from_inventory']} inventory listing(s); "
+                    f"decremented **{total_qty}** unit(s) across **{len(decremented)}** buy list row(s):\n{summary}"
+                )
+                if len(decremented) > 30:
+                    msg += f"\n  ... and {len(decremented) - 30} more"
+                await interaction.followup.send(msg[:2000])
+            if data["removal_errors"]:
+                errs = "\n".join(data["removal_errors"][:10])
+                await interaction.followup.send(f"Some inventory removals failed:\n```\n{errs}\n```")
 
     return bot
 

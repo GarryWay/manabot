@@ -916,6 +916,100 @@ def order_info(order_id: str, config_path: Path | None, dump_json: bool) -> None
         click.echo(f"\nAdditional fields: {_json.dumps(extra, indent=2)}")
 
 
+@cli.command("check-inventory")
+@click.option("--config", "config_path", type=click.Path(path_type=Path), default=None)
+@click.option("--buylist", "buylist_path_override", type=click.Path(path_type=Path), default=None)
+@click.option("--force-remove", is_flag=True,
+              help="Delist matched cards from ManaPool seller inventory and decrement the buy list by the overlapping quantity.")
+@click.option("--verbose", "-v", is_flag=True, help="Enable debug logging.")
+@click.pass_context
+def check_inventory(
+    ctx: click.Context,
+    config_path: Path | None,
+    buylist_path_override: Path | None,
+    force_remove: bool,
+    verbose: bool,
+) -> None:
+    """Check whether buy list cards are already held in your ManaPool seller inventory.
+
+    Matches by scryfall_id when pinned, otherwise by normalized card name -
+    any condition/finish already in stock counts as an overlap. Pass
+    --force-remove to delist the matched inventory and decrement the buy
+    list by the overlapping quantity (a partial overlap leaves the
+    remainder on the buy list).
+    """
+    _configure_logging(verbose)
+    from manabot.config import load_config
+    from manabot.buylist import load_buylist, remove_purchases_fifo
+    from manabot.api.manapool import ManaPoolClient
+    from manabot.inventory_check import find_overlap
+
+    try:
+        config = load_config(config_path)
+    except (ValueError, FileNotFoundError) as e:
+        click.echo(f"Config error: {e}", err=True)
+        sys.exit(1)
+
+    buylist_path = buylist_path_override or config.buylist_path
+    try:
+        buy_list = load_buylist(buylist_path)
+    except Exception as e:
+        click.echo(f"Buy list error: {e}", err=True)
+        sys.exit(1)
+
+    client = ManaPoolClient(
+        email=config.manapool_email,
+        token=config.manapool_token,
+        use_bulk_export=config.use_bulk_export,
+    )
+    try:
+        seller_inventory = client.get_seller_inventory()
+    except Exception as e:
+        click.echo(f"ManaPool API error: {e}", err=True)
+        sys.exit(1)
+
+    overlaps = find_overlap(buy_list, seller_inventory)
+    if not overlaps:
+        click.echo(
+            f"No overlap — checked {len(buy_list)} buy list item(s) against "
+            f"{len(seller_inventory)} inventory listing(s)."
+        )
+        return
+
+    click.echo(f"\n{len(overlaps)} buy list card(s) already in inventory:")
+    for o in overlaps:
+        click.echo(
+            f"  {o.buy_list_item.card_name} "
+            f"(want {o.buy_list_item.target_quantity}x, have {o.total_quantity}x)"
+        )
+        for m in o.matches:
+            click.echo(f"    - {m.quantity}x [{m.set_code}] {m.condition.value}/{m.finish.value}  ${m.price_usd:.2f}")
+
+    if not force_remove:
+        click.echo("\nRun with --force-remove to delist these cards and decrement the buy list by the overlapping quantity.")
+        return
+
+    click.echo("\nRemoving matched cards from inventory and decrementing the buy list...")
+    removed_from_inventory = 0
+    for o in overlaps:
+        for m in o.matches:
+            try:
+                client.delete_seller_listing(m)
+                removed_from_inventory += 1
+            except Exception as e:
+                click.echo(f"  Failed to remove {m.card_name} [{m.set_code}]: {e}", err=True)
+
+    # Decrement only by the quantity we actually have on hand — a partial
+    # overlap should leave the remainder on the buy list.
+    purchases = [(o.buy_list_item.card_name, o.total_quantity) for o in overlaps]
+    affected = remove_purchases_fifo(buylist_path, purchases)
+    total_qty = sum(int(r.get("qty_purchased", "1") or "1") for r in affected)
+    click.echo(
+        f"\nDelisted {removed_from_inventory} inventory listing(s); "
+        f"decremented {total_qty} unit(s) across {len(affected)} buy list row(s)."
+    )
+
+
 @cli.command("price-update")
 @click.option("--config", "config_path", type=click.Path(path_type=Path), default=None)
 @click.option("--dry-run", "-n", is_flag=True,
