@@ -296,6 +296,68 @@ def _arbitrage_pipeline(
     }
 
 
+def _add_cards_sync(path: Path, cards_text: str, username: str, uid: int) -> tuple[list[str], list[str]]:
+    """Parse and append each line of a bulk /add-cards submission. Runs in a worker
+    thread (asyncio.to_thread) — each append_to_buylist call is its own blocking
+    file open/read/write, and looping that directly on the event loop can stall
+    other users' interactions long enough to make Discord expire them."""
+    from manabot.buylist import append_to_buylist
+
+    added: list[str] = []
+    errors: list[str] = []
+
+    for line_num, raw in enumerate(cards_text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            parts = [p.strip() for p in next(csv.reader([line]))]
+        except Exception:
+            errors.append(f"Line {line_num}: could not parse — got: {line!r}")
+            continue
+        if len(parts) < 3:
+            errors.append(f"Line {line_num}: need name,qty,price — got: {line!r}")
+            continue
+        card_name = parts[0]
+        if not card_name:
+            errors.append(f"Line {line_num}: card_name is empty")
+            continue
+        try:
+            qty = int(parts[1])
+            price = float(parts[2])
+        except ValueError:
+            errors.append(f"Line {line_num} ({card_name!r}): qty must be int, price must be float")
+            continue
+
+        cond_str = parts[3].strip().upper() if len(parts) > 3 and parts[3].strip() else "NM"
+        if cond_str not in {c.value for c in Condition}:
+            errors.append(f"Line {line_num} ({card_name!r}): invalid condition {cond_str!r}")
+            continue
+        set_str = parts[4].strip().upper() if len(parts) > 4 and parts[4].strip() else ""
+        foil_str = parts[5].strip().lower() if len(parts) > 5 and parts[5].strip() else "any"
+        if foil_str not in {f.value for f in Finish}:
+            errors.append(f"Line {line_num} ({card_name!r}): invalid foil {foil_str!r}")
+            continue
+
+        item = BuyListItem(
+            card_name=card_name,
+            target_quantity=qty,
+            max_price_usd=price,
+            min_condition=Condition(cond_str),
+            foil=Finish(foil_str),
+            allowed_sets=[set_str] if set_str else [],
+            tags=[f"user:{username}", f"uid:{uid}"],
+        )
+        try:
+            append_to_buylist(path, item)
+            set_label = f" [{set_str}]" if set_str else ""
+            added.append(f"{qty}x {card_name}{set_label}  max ${price:.2f}  {cond_str}")
+        except Exception as e:
+            errors.append(f"Line {line_num} ({card_name!r}): {e}")
+
+    return added, errors
+
+
 def _check_inventory_pipeline(config: Config, force_remove: bool) -> dict:
     from manabot.buylist import load_buylist
     from manabot.api.manapool import ManaPoolClient
@@ -379,6 +441,42 @@ def create_bot(config: Config) -> _ManabotClient:
     """Build and return the configured Discord client. Call bot.run(token) to start."""
     bot = _ManabotClient(config)
     tree = bot.tree
+
+    @tree.error
+    async def on_tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+        """Safety net for anything raised outside a command's own try/except —
+        e.g. a failed interaction.response.defer() itself. Without this, discord.py's
+        default handler still logs the traceback, but gives us no chance to add
+        context or spare the log from noise on the one error we can't do anything about.
+        """
+        cmd_name = interaction.command.name if interaction.command else "?"
+        # CommandInvokeError (raised when a command's own body throws) wraps the
+        # real exception in .original; other AppCommandError subtypes (checks,
+        # transformers, ...) are themselves the meaningful error.
+        original = getattr(error, "original", None) or error
+
+        if isinstance(original, discord.NotFound) and getattr(original, "code", None) == 10062:
+            # Discord invalidated the interaction (no response reached it within
+            # ~3s — usually a network/gateway hiccup) before we could even defer.
+            # The interaction token is dead; nothing we send will land, so just
+            # log for visibility instead of trying (and failing) to notify the user.
+            log.warning(
+                "/%s: interaction expired before the bot could respond "
+                "(Discord-side latency, not an app error) — user should just retry.",
+                cmd_name,
+            )
+            return
+
+        # Not inside an except block here, so log.exception()'s implicit sys.exc_info()
+        # would be empty — pass the wrapped exception explicitly instead.
+        log.error("Unhandled error in /%s", cmd_name, exc_info=original)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"Unexpected error: {original}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"Unexpected error: {original}", ephemeral=True)
+        except discord.HTTPException:
+            pass  # interaction is dead — nothing more we can do
 
     # ── /run ─────────────────────────────────────────────────────────────────
 
@@ -578,14 +676,18 @@ def create_bot(config: Config) -> _ManabotClient:
             allowed_sets=allowed_sets,
             tags=[f"user:{username}", f"uid:{interaction.user.id}"],
         )
+
+        await interaction.response.defer()
+
         try:
-            append_to_buylist(bot.config.buylist_path, item)
+            await asyncio.to_thread(append_to_buylist, bot.config.buylist_path, item)
         except Exception as e:
-            await interaction.response.send_message(f"Error adding card: {e}", ephemeral=True)
+            log.exception("add-card error")
+            await interaction.followup.send(f"Error adding card: {e}", ephemeral=True)
             return
 
         set_str = f" [{set_code.upper()}]" if set_code.strip() else ""
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Added **{quantity}x {card_name}{set_str}** to the buy list "
             f"(max ${max_price:.2f}, {condition}, {foil})."
         )
@@ -600,60 +702,17 @@ def create_bot(config: Config) -> _ManabotClient:
         cards="Each line: card_name,quantity,max_price[,condition[,set_code[,foil]]]\nExample: Lightning Bolt,4,1.50,LP"
     )
     async def cmd_add_cards(interaction: discord.Interaction, cards: str) -> None:
-        from manabot.buylist import append_to_buylist
+        await interaction.response.defer()
 
         username = interaction.user.display_name
-        added: list[str] = []
-        errors: list[str] = []
-
-        for line_num, raw in enumerate(cards.splitlines(), start=1):
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            try:
-                parts = [p.strip() for p in next(csv.reader([line]))]
-            except Exception:
-                errors.append(f"Line {line_num}: could not parse — got: {line!r}")
-                continue
-            if len(parts) < 3:
-                errors.append(f"Line {line_num}: need name,qty,price — got: {line!r}")
-                continue
-            card_name = parts[0]
-            if not card_name:
-                errors.append(f"Line {line_num}: card_name is empty")
-                continue
-            try:
-                qty = int(parts[1])
-                price = float(parts[2])
-            except ValueError:
-                errors.append(f"Line {line_num} ({card_name!r}): qty must be int, price must be float")
-                continue
-
-            cond_str = parts[3].strip().upper() if len(parts) > 3 and parts[3].strip() else "NM"
-            if cond_str not in {c.value for c in Condition}:
-                errors.append(f"Line {line_num} ({card_name!r}): invalid condition {cond_str!r}")
-                continue
-            set_str = parts[4].strip().upper() if len(parts) > 4 and parts[4].strip() else ""
-            foil_str = parts[5].strip().lower() if len(parts) > 5 and parts[5].strip() else "any"
-            if foil_str not in {f.value for f in Finish}:
-                errors.append(f"Line {line_num} ({card_name!r}): invalid foil {foil_str!r}")
-                continue
-
-            item = BuyListItem(
-                card_name=card_name,
-                target_quantity=qty,
-                max_price_usd=price,
-                min_condition=Condition(cond_str),
-                foil=Finish(foil_str),
-                allowed_sets=[set_str] if set_str else [],
-                tags=[f"user:{username}", f"uid:{interaction.user.id}"],
+        try:
+            added, errors = await asyncio.to_thread(
+                _add_cards_sync, bot.config.buylist_path, cards, username, interaction.user.id
             )
-            try:
-                append_to_buylist(bot.config.buylist_path, item)
-                set_label = f" [{set_str}]" if set_str else ""
-                added.append(f"{qty}x {card_name}{set_label}  max ${price:.2f}  {cond_str}")
-            except Exception as e:
-                errors.append(f"Line {line_num} ({card_name!r}): {e}")
+        except Exception as e:
+            log.exception("add-cards error")
+            await interaction.followup.send(f"Error adding cards: {e}", ephemeral=True)
+            return
 
         parts_msg: list[str] = []
         if added:
@@ -662,7 +721,7 @@ def create_bot(config: Config) -> _ManabotClient:
             parts_msg.append(f"{len(errors)} error(s):\n" + "\n".join(f"  ✗ {e}" for e in errors))
 
         msg = "\n\n".join(parts_msg) or "Nothing to add."
-        await interaction.response.send_message(msg[:2000])
+        await interaction.followup.send(msg[:2000])
 
     # ── /buylist ──────────────────────────────────────────────────────────────
 
@@ -674,11 +733,12 @@ def create_bot(config: Config) -> _ManabotClient:
         await interaction.response.defer()
 
         try:
-            items = load_buylist(bot.config.buylist_path)
+            items = await asyncio.to_thread(load_buylist, bot.config.buylist_path)
         except FileNotFoundError:
             await interaction.followup.send("Buy list file not found.", ephemeral=True)
             return
         except Exception as e:
+            log.exception("buylist error")
             await interaction.followup.send(f"Error loading buy list: {e}", ephemeral=True)
             return
 
@@ -723,15 +783,19 @@ def create_bot(config: Config) -> _ManabotClient:
     async def cmd_mark_purchased(interaction: discord.Interaction, cards: str = "") -> None:
         from manabot.buylist import remove_purchases_fifo
 
+        # Defer before any file I/O — even a small JSON read can add up with
+        # other commands doing blocking work on the same event loop.
+        await interaction.response.defer()
+
         if cards.strip():
             # Manual list — remove all copies of each named card, FIFO
             purchases: list[tuple[str, int]] = [
                 (n.strip(), -1) for n in cards.split(",") if n.strip()
             ]
         else:
-            last = _load_last_cart(bot.config)
+            last = await asyncio.to_thread(_load_last_cart, bot.config)
             if last is None:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "No recent run found. Provide card names or run `/optimize` first.",
                     ephemeral=True,
                 )
@@ -739,13 +803,12 @@ def create_bot(config: Config) -> _ManabotClient:
             # Use exact quantities from the last cart, consuming FIFO
             purchases = [(item["card_name"], item["quantity"]) for item in last]
 
-        await interaction.response.defer()
-
         try:
             affected = await asyncio.to_thread(
                 remove_purchases_fifo, bot.config.buylist_path, purchases
             )
         except Exception as e:
+            log.exception("mark-purchased error")
             await interaction.followup.send(f"Error updating buy list: {e}", ephemeral=True)
             return
 
@@ -842,6 +905,7 @@ def create_bot(config: Config) -> _ManabotClient:
                 uid_filter,
             )
         except Exception as e:
+            log.exception("remove-card error")
             await interaction.followup.send(f"Error updating buy list: {e}", ephemeral=True)
             return
 
@@ -932,6 +996,7 @@ def create_bot(config: Config) -> _ManabotClient:
                 uid_filter,
             )
         except Exception as e:
+            log.exception("edit-card error")
             await interaction.followup.send(f"Error updating buy list: {e}", ephemeral=True)
             return
 
@@ -956,8 +1021,9 @@ def create_bot(config: Config) -> _ManabotClient:
         # Re-read the updated row so we can show the new values
         from manabot.buylist import load_buylist as _load
         try:
+            reloaded = await asyncio.to_thread(_load, bot.config.buylist_path)
             updated_items = [
-                i for i in _load(bot.config.buylist_path)
+                i for i in reloaded
                 if i.card_name.lower() == card_name.strip().lower()
             ]
             updated_row = {
@@ -968,6 +1034,7 @@ def create_bot(config: Config) -> _ManabotClient:
                 "allowed_sets": ",".join(updated_items[0].allowed_sets),
             } if updated_items else {}
         except Exception:
+            log.debug("edit-card: could not re-read updated row for display", exc_info=True)
             updated_row = {}
 
         msg = f"Updated **{card_name}**:\n  Before: `{_fmt_row(original)}`"
