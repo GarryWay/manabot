@@ -105,6 +105,27 @@ def _send_kwargs(
     return kw
 
 
+async def _notify_dead_interaction(interaction: discord.Interaction, message: str) -> None:
+    """Post a plain channel message when the interaction token itself is dead —
+    every interaction-based response (defer/send_message/followup) is a dead end
+    at that point, but a normal channel message is a separate REST call and still
+    works. Without this, a timed-out command fails completely silently and the
+    user has no way to tell whether it ran.
+    """
+    channel = interaction.channel
+    if channel is None:
+        return
+    try:
+        mention = interaction.user.mention if interaction.user else ""
+        allowed = discord.AllowedMentions(
+            users=[interaction.user] if interaction.user else [], everyone=False, roles=False,
+        )
+        await channel.send(f"{mention} {message}".strip(), allowed_mentions=allowed)
+    except discord.HTTPException:
+        cmd_name = interaction.command.name if interaction.command else "?"
+        log.warning("Also failed to post fallback notice to channel for /%s (interaction dead)", cmd_name)
+
+
 # ── Synchronous pipeline helpers (run in thread via asyncio.to_thread) ───────
 
 def _run_pipeline(config: Config) -> dict:
@@ -457,13 +478,21 @@ def create_bot(config: Config) -> _ManabotClient:
 
         if isinstance(original, discord.NotFound) and getattr(original, "code", None) == 10062:
             # Discord invalidated the interaction (no response reached it within
-            # ~3s — usually a network/gateway hiccup) before we could even defer.
-            # The interaction token is dead; nothing we send will land, so just
-            # log for visibility instead of trying (and failing) to notify the user.
+            # ~3s — usually the host too slow/busy to get the ack out in time)
+            # before we could even defer. The interaction token is dead, so no
+            # interaction-based response will land — but every handler defers (or
+            # sends its first response) before touching any state, so if that's
+            # what failed here, nothing was mutated. Safe to say so via a plain
+            # channel message instead of leaving the user guessing.
             log.warning(
                 "/%s: interaction expired before the bot could respond "
                 "(Discord-side latency, not an app error) — user should just retry.",
                 cmd_name,
+            )
+            await _notify_dead_interaction(
+                interaction,
+                f"`/{cmd_name}` timed out before I could respond (the server was too slow to "
+                f"acknowledge it in time) — **nothing ran**. Please try again.",
             )
             return
 
@@ -476,7 +505,14 @@ def create_bot(config: Config) -> _ManabotClient:
             else:
                 await interaction.response.send_message(f"Unexpected error: {original}", ephemeral=True)
         except discord.HTTPException:
-            pass  # interaction is dead — nothing more we can do
+            # Interaction is dead for some other reason. Unlike the timeout case
+            # above, this can happen mid-command, so we can't promise nothing ran —
+            # just make the failure visible instead of leaving it silent.
+            await _notify_dead_interaction(
+                interaction,
+                f"`/{cmd_name}` hit an unexpected error and the bot couldn't respond directly "
+                f"({original}) — it may or may not have completed; check with an admin if unsure.",
+            )
 
     # ── /run ─────────────────────────────────────────────────────────────────
 
