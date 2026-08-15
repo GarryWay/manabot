@@ -3,8 +3,6 @@
 Loads data/scryfall_oracle.json (one record per unique card name) and exposes:
   - is_sanctioned(card_name)  — True if legal in at least one tournament format
   - get_market_price(card_name, foil)  — TCGPlayer market price from Scryfall
-  - get_oracle_id(card_name)  — Scryfall oracle_id, stable across every printing of the
-    card; sent to ManaPool's /buyer/optimizer as card_id (see manabot/optimizer.py)
 
 The ~170 MB file is parsed once and cached in the instance. Load time ~2-3s.
 Call download_oracle_cards() to fetch or refresh the file; the bot does this
@@ -102,9 +100,6 @@ class ScryfallBulk:
         self._path = path
         # card_name (lowered) → (usd, usd_foil, sanctioned)
         self._data: dict[str, tuple[Optional[float], Optional[float], bool]] = {}
-        # card_name (lowered) → Scryfall oracle_id (stable across every printing of the card —
-        # ManaPool's optimizer accepts this as card_id to mean "any interchangeable printing")
-        self._oracle_ids: dict[str, str] = {}
         self._token_names: set[str] = set()
         # set_code (lowered) → release date
         self._set_release_dates: dict[str, date] = {}
@@ -142,16 +137,11 @@ class ScryfallBulk:
             entry = (usd, usd_foil, sanctioned)
             key = name.lower()
             self._data[key] = entry
-            oracle_id: str = card.get("oracle_id", "")
-            if oracle_id:
-                self._oracle_ids[key] = oracle_id
             # DFC front-face alias so "Bala Ged Recovery" finds "Bala Ged Recovery // ..."
             if " // " in name:
                 front = name.split(" // ")[0].lower()
                 if front not in self._data:
                     self._data[front] = entry
-                if oracle_id and front not in self._oracle_ids:
-                    self._oracle_ids[front] = oracle_id
 
             if layout in _TOKEN_LAYOUTS:
                 self._token_names.add(key)
@@ -232,16 +222,6 @@ class ScryfallBulk:
         if entry is None:
             return None
         return entry[1] if foil else entry[0]
-
-    def get_oracle_id(self, card_name: str) -> Optional[str]:
-        """Return the Scryfall oracle_id for this card name, or None if not found.
-
-        oracle_id is stable across every printing of a card (unlike the per-printing
-        scryfall_id on PriceListing), which is exactly what ManaPool's optimizer
-        wants for its card_id field — "any interchangeable printing may be substituted".
-        """
-        self._ensure_loaded()
-        return self._oracle_ids.get(card_name.lower())
 
     @property
     def available(self) -> bool:

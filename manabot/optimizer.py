@@ -50,21 +50,6 @@ _CONDITIONS_BEST_FIRST: list[Condition] = [
     Condition.NM, Condition.LP, Condition.MP, Condition.HP, Condition.DMG
 ]
 
-# Lazily-created, module-cached ScryfallBulk used purely for oracle_id lookups (card_id
-# resolution) when a caller doesn't pass its own `scryfall=`. Several build_request_items()
-# call sites (arb expansion, mark-purchased cart rebuild) never pass scryfall since it's only
-# used for playable-set filtering there — but card_id is now mandatory on every optimizer
-# request regardless, so resolution can't depend on the caller having opted into filtering.
-_id_lookup_scryfall: "ScryfallBulk | None" = None
-
-
-def _get_id_lookup_scryfall() -> "ScryfallBulk":
-    global _id_lookup_scryfall
-    if _id_lookup_scryfall is None:
-        from manabot.api.scryfall_bulk import ScryfallBulk
-        _id_lookup_scryfall = ScryfallBulk()
-    return _id_lookup_scryfall
-
 _FINISH_IDS: dict[Finish, list[str]] = {
     Finish.NONFOIL: ["NF"],
     Finish.FOIL: ["FO"],
@@ -91,17 +76,7 @@ def build_request_items(
     non-playable sets (memorabilia, funny, token) are excluded so the estimated
     price reflects a sanctioned printing. Items whose estimated price exceeds
     max_price × (1 + over_budget_pct/100) are excluded.
-
-    Every item also gets a card_id (Scryfall oracle_id) resolved via `scryfall`
-    if given, else a module-cached ScryfallBulk instance — ManaPool's optimizer now
-    requires an identifier per item, and oracle_id is the one that lets it roam
-    across every interchangeable printing (matching the site's "Any printings"
-    mode) rather than pinning to the single printing our own pre-fetch happened
-    to pick. Items whose card_id can't be resolved are skipped with a warning,
-    since sending an item with no identifier at all fails the whole request.
     """
-    id_source = scryfall if scryfall is not None else _get_id_lookup_scryfall()
-
     items: list[CartRequestItem] = []
     for result in match_results:
         if result.status != MatchStatus.MATCHED or not result.listings or result.best_price is None:
@@ -127,14 +102,6 @@ def build_request_items(
             )
             continue
 
-        card_id = id_source.get_oracle_id(item.card_name) or ""
-        if not card_id:
-            log.warning(
-                "No Scryfall oracle_id for %r — skipping (optimizer now requires an identifier per item)",
-                item.card_name,
-            )
-            continue
-
         items.append(CartRequestItem(
             buy_list_item=item,
             set_code=best_listing.set_code,
@@ -143,7 +110,6 @@ def build_request_items(
             condition_ids=_acceptable_conditions(item.min_condition),
             finish_ids=_FINISH_IDS[item.foil],
             seller_id=best_listing.seller_id,
-            card_id=card_id,
         ))
 
     return items
@@ -234,17 +200,8 @@ def _build_optimizer_payload(items: list[CartRequestItem]) -> list[dict]:
             "finish_ids": item.finish_ids,
             "quantity_requested": item.buy_list_item.target_quantity,
         }
-        # card_id (Scryfall oracle_id) is now a required identifier per item, per
-        # ManaPool's own API docs: "Card the line asks for; any interchangeable
-        # printing of it may be substituted (use mtgjson_id to pin one printing)".
-        # Sending oracle_id (rather than a per-printing id) is what lets the optimizer
-        # roam across every sanctioned printing, matching the site's "Any printings"
-        # mode instead of pinning to whichever printing our own pre-fetch found cheapest.
-        if item.card_id:
-            entry["card_id"] = item.card_id
-        # Only constrain set_code when the user explicitly specified allowed_sets —
-        # set_code narrows card_id's search to that set while still letting the
-        # optimizer pick any interchangeable printing/collector number within it.
+        # Only constrain set_code when the user explicitly specified allowed_sets,
+        # so the optimizer can still find the cheapest printing across all sanctioned sets.
         if item.buy_list_item.allowed_sets:
             entry["set_code"] = item.set_code
         payload.append(entry)

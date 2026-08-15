@@ -6,7 +6,6 @@ from pathlib import Path
 import pytest
 import responses as resp_mock
 
-import manabot.optimizer as optimizer_module
 from manabot.api.manapool import ManaPool409Error, ManaPoolAPIError, ManaPoolClient
 from manabot.models import BuyListItem, CartRequestItem, CartResult, Condition, Finish, MatchResult, MatchStatus, PriceListing
 from manabot.optimizer import (
@@ -21,23 +20,6 @@ from manabot.optimizer import (
 )
 
 MANAPOOL_BASE = "https://manapool.com/api/v1"
-
-
-class _FakeScryfallBulk:
-    """Deterministic oracle_id stub so tests never touch the real ~170MB bulk file."""
-    def get_oracle_id(self, card_name: str):
-        return f"oracle-{card_name.lower()}"
-
-    def is_playable_set(self, set_code: str) -> bool:
-        return True
-
-
-@pytest.fixture(autouse=True)
-def _stub_id_lookup_scryfall(monkeypatch):
-    """build_request_items() falls back to a module-cached ScryfallBulk for card_id
-    (oracle_id) resolution when no scryfall= is passed in. Stub that fallback so tests
-    stay hermetic and fast instead of loading the real bulk data file from disk."""
-    monkeypatch.setattr(optimizer_module, "_get_id_lookup_scryfall", lambda: _FakeScryfallBulk())
 
 
 # ---------------------------------------------------------------------------
@@ -285,9 +267,6 @@ def test_build_optimizer_payload_structure():
     assert p["is_token"] is False
     assert p["include_non_sanctioned_legal"] is False
     assert p["language_ids"] == ["EN"]
-    # card_id (Scryfall oracle_id) is the required identifier — sent for every item so the
-    # optimizer can roam across interchangeable printings ("Any printings" mode).
-    assert p["card_id"] == "oracle-counterspell"
     # No allowed_sets on item → set_code omitted so optimizer can search all sanctioned printings
     assert "set_code" not in p
     assert p["quantity_requested"] == 4
@@ -302,60 +281,7 @@ def test_build_optimizer_payload_includes_set_code_when_allowed_sets_specified()
     cart_items = build_request_items([result])
 
     payload = _build_optimizer_payload(cart_items)
-    # set_code narrows card_id's search to this set; both are present together.
     assert payload[0]["set_code"] == "ICE"
-    assert payload[0]["card_id"] == "oracle-counterspell"
-
-
-def test_build_optimizer_payload_omits_card_id_when_missing():
-    """Defensive: a CartRequestItem built without a resolvable card_id (shouldn't normally
-    happen — build_request_items() skips those) must not send an empty card_id key."""
-    item = _item(name="Counterspell")
-    ci = CartRequestItem(
-        buy_list_item=item, set_code="ICE", estimated_price=1.50, estimated_margin=0.50,
-        condition_ids=["NM"], finish_ids=["NF"], card_id="",
-    )
-    payload = _build_optimizer_payload([ci])
-    assert "card_id" not in payload[0]
-
-
-# ---------------------------------------------------------------------------
-# card_id (oracle_id) resolution
-# ---------------------------------------------------------------------------
-
-def test_build_request_items_resolves_card_id_via_scryfall():
-    class _Stub:
-        def get_oracle_id(self, name):
-            return "oracle-xyz-123"
-
-        def is_playable_set(self, code):
-            return True
-
-    item = _item(name="Lightning Bolt")
-    result = _matched(item, _listing())
-    cart_items = build_request_items([result], scryfall=_Stub())
-    assert cart_items[0].card_id == "oracle-xyz-123"
-
-
-def test_build_request_items_falls_back_to_module_scryfall_when_none_passed():
-    """No scryfall= passed → falls back to the (stubbed) module-cached lookup."""
-    item = _item(name="Sol Ring")
-    result = _matched(item, _listing(name="Sol Ring"))
-    cart_items = build_request_items([result])
-    assert cart_items[0].card_id == "oracle-sol ring"
-
-
-def test_build_request_items_skips_when_oracle_id_unresolved():
-    class _NoIdStub:
-        def get_oracle_id(self, name):
-            return None
-
-        def is_playable_set(self, code):
-            return True
-
-    item = _item(name="Some Unknown Card")
-    result = _matched(item, _listing(name="Some Unknown Card"))
-    assert build_request_items([result], scryfall=_NoIdStub()) == []
 
 
 # ---------------------------------------------------------------------------
