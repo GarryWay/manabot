@@ -46,7 +46,7 @@ from manabot.models import (
     MatchStatus,
     _CONDITION_RANK,
 )
-from manabot.api.manapool import ManaPool409Error, ManaPoolClient
+from manabot.api.manapool import ManaPool409Error, ManaPoolAPIError, ManaPoolClient
 
 log = logging.getLogger(__name__)
 
@@ -523,7 +523,15 @@ def find_best_cart(
                 worst_in_grp = min(worst_grp, key=lambda x: x.estimated_margin)
                 trial_set = [x for x in current if x is not worst_in_grp]
 
-            trial = _run_single(trial_set, client, **_run_kwargs)
+            try:
+                trial = _run_single(trial_set, client, **_run_kwargs)
+            except ManaPoolAPIError as e:
+                # A single failed trial (e.g. "no valid cart" for this combination)
+                # shouldn't crash the whole run — treat it like a rejected trial and
+                # keep going with the next-worst seller.
+                log.warning("Trial removing seller %r failed (%s) — keeping it, locking it", worst_key, e)
+                locked_sellers.add(worst_key)
+                continue
             gross = sum(x.estimated_margin for x in worst_grp)
             if trial.total_usd < current_result.total_usd:
                 log.info(
@@ -559,7 +567,17 @@ def find_best_cart(
             locked.add(id(worst))
             continue
 
-        trial = _run_single(trial_set, client, **_run_kwargs)
+        try:
+            trial = _run_single(trial_set, client, **_run_kwargs)
+        except ManaPoolAPIError as e:
+            # A single failed trial shouldn't crash the whole run — treat it like a
+            # rejected trial and keep going with the next-worst candidate.
+            log.warning(
+                "Trial removing %r failed (%s) — keeping it, locking it",
+                worst.buy_list_item.card_name, e,
+            )
+            locked.add(id(worst))
+            continue
         log.debug(
             "Opt iteration %d: without %r ($%+.2f margin) → total $%.2f, net $%+.2f",
             iteration + 1, worst.buy_list_item.card_name, worst.estimated_margin,

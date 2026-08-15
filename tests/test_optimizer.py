@@ -659,6 +659,40 @@ def test_find_best_cart_keeps_item_when_shipping_consolidation_wins(mp_client):
 
 
 @resp_mock.activate
+def test_find_best_cart_survives_phase2_trial_returning_no_valid_cart(mp_client):
+    """A single failed removal trial (e.g. ManaPool's "no valid cart" response for that
+    combination) must not crash the whole run -- it's treated like a rejected trial."""
+    _mock_card_ids()
+    resp_mock.add(
+        resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer",
+        body=_optimizer_ndjson(subtotal_cents=500, shipping_cents=100, fee_cents=50),
+        content_type="application/x-ndjson",
+    )
+    # Trial (without Dark Ritual) fails outright — stats line only, no cart line.
+    resp_mock.add(
+        resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer",
+        body=json.dumps({"stats": {"response_time": 1}}) + "\n",
+        content_type="application/x-ndjson",
+    )
+
+    good = _matched(_item(name="Lightning Bolt", max_price=2.00, qty=4), _listing(price=1.50))
+    over_item = BuyListItem(
+        card_name="Dark Ritual", target_quantity=2,
+        max_price_usd=1.20, min_condition=Condition.NM,
+    )
+    over_listing = _listing(name="Dark Ritual", set_code="ICE", price=1.50, qty=2)
+    over = MatchResult(
+        buy_list_item=over_item, listings=[over_listing],
+        best_price=1.50, status=MatchStatus.MATCHED,
+    )
+
+    cart = find_best_cart([good, over], mp_client, over_budget_pct=30.0, max_iterations=1)
+    assert cart is not None
+    # The failed trial is treated as "keep it" — baseline cart (both items) survives.
+    assert len(cart.items) == 2
+
+
+@resp_mock.activate
 def test_find_best_cart_stops_after_max_iterations(mp_client):
     """Never makes more than 1 + max_iterations optimizer POST calls."""
     _mock_card_ids()
@@ -890,6 +924,35 @@ def test_find_best_cart_trims_when_shipping_pushes_over_cap(mp_client):
     assert cart is not None
     assert cart.total_usd == pytest.approx(7.00)
     assert cart.total_usd <= 8.00
+
+
+@resp_mock.activate
+def test_find_best_cart_survives_phase1_trial_returning_no_valid_cart(mp_client):
+    """A failed Phase 1 (budget enforcement) trial must not crash the run -- the seller
+    gets locked and find_best_cart still returns the best cart found so far."""
+    _mock_card_ids()
+    resp_mock.add(
+        resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer",
+        body=_optimizer_ndjson(subtotal_cents=870, shipping_cents=30, fee_cents=0),  # $9.00 total
+        content_type="application/x-ndjson",
+    )
+    # Removal trial fails outright — stats line only, no cart line.
+    resp_mock.add(
+        resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer",
+        body=json.dumps({"stats": {"response_time": 1}}) + "\n",
+        content_type="application/x-ndjson",
+    )
+
+    bolt = _matched(_item(name="Lightning Bolt", max_price=5.00, qty=2), _listing(price=3.00))
+    ritual = _matched(
+        _item(name="Dark Ritual", max_price=1.00, qty=2),
+        _listing(name="Dark Ritual", set_code="ICE", price=0.10, qty=2),
+    )
+
+    cart = find_best_cart([bolt, ritual], mp_client, max_cart_usd=8.00, max_iterations=3)
+    # Falls back to the over-budget baseline rather than crashing.
+    assert cart is not None
+    assert cart.total_usd == pytest.approx(9.00)
 
 
 # ---------------------------------------------------------------------------
