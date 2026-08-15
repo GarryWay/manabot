@@ -1,7 +1,8 @@
 """Scheduler for automated manabot tasks.
 
-Currently implements:
-  - Daily seller inventory price update (configurable hour + timezone)
+Currently implements, both on the same daily job (configurable hour + timezone):
+  - Seller inventory price update
+  - Buy list coalesce (merge duplicate rows, summing quantities)
 
 Requires: pip install 'apscheduler>=3.10.4'
 """
@@ -25,6 +26,7 @@ def schedule_daily_price_update(config: Config) -> None:
         ) from e
 
     from manabot.api.manapool import ManaPoolClient
+    from manabot.buylist import coalesce_buylist
     from manabot.db import open_db
     from manabot.pricer import PricingConfig, run_pricing_update
 
@@ -52,6 +54,17 @@ def schedule_daily_price_update(config: Config) -> None:
                 run_pricing_update(client, conn, config, pricing_cfg, dry_run=False)
         except Exception:
             log.exception("Price update job failed")
+
+        try:
+            merges = coalesce_buylist(config.buylist_path)
+            if merges:
+                log.info(
+                    "Buy list coalesce: merged %d duplicate group(s): %s",
+                    len(merges),
+                    ", ".join(f"{m['card_name']} ({m['rows_merged']}x rows -> {m['target_quantity']}x)" for m in merges),
+                )
+        except Exception:
+            log.exception("Buy list coalesce job failed")
 
     scheduler = BlockingScheduler(timezone=tz)
     scheduler.add_job(

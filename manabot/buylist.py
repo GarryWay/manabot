@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator
 
+from manabot.matcher import _normalize_name
 from manabot.models import BuyListItem, Condition, Finish
 
 if TYPE_CHECKING:
@@ -217,6 +218,96 @@ def edit_buylist_entry(
         return original
 
     return None
+
+
+def coalesce_buylist(path: Path) -> list[dict[str, str]]:
+    """Merge buy list rows that are duplicates in every field except target_quantity.
+
+    Two rows are considered duplicates when every field other than
+    target_quantity matches: card_name is compared via normalized text (so
+    casing/punctuation differences still merge), allowed_sets/tags are
+    compared as unordered sets (so field order doesn't block a merge), and
+    everything else is compared case-insensitively. This means rows tagged
+    for different Discord users (different 'uid:' tags) are never merged
+    into each other, since their tags field differs.
+
+    The first matching row (in file order) is kept — with its original
+    casing/column order intact — and its target_quantity becomes the sum
+    across the group. Later duplicate rows are dropped. Rows with no
+    duplicates are left untouched, and if nothing needs merging the file
+    is not rewritten at all.
+
+    Returns one snapshot per merge group that had more than one row:
+    {'card_name', 'target_quantity' (str, the new summed total), 'rows_merged' (str)}.
+    """
+    if not path.exists():
+        return []
+
+    with path.open(encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+
+    if not rows:
+        return []
+
+    def _signature(row: dict[str, str]) -> tuple:
+        sig = []
+        for fn in fieldnames:
+            if fn == "target_quantity":
+                continue
+            value = (row.get(fn) or "").strip()
+            if fn == "card_name":
+                sig.append(_normalize_name(value))
+            elif fn in ("allowed_sets", "tags"):
+                sig.append(tuple(sorted(p.strip().lower() for p in value.split(",") if p.strip())))
+            else:
+                sig.append(value.lower())
+        return tuple(sig)
+
+    def _row_qty(row: dict[str, str]) -> int:
+        try:
+            return max(1, int(row.get("target_quantity", "1") or "1"))
+        except ValueError:
+            return 1
+
+    groups: dict[tuple, list[int]] = {}
+    for i, row in enumerate(rows):
+        groups.setdefault(_signature(row), []).append(i)
+
+    merges: list[dict[str, str]] = []
+    new_rows: list[dict[str, str]] = []
+    emitted: set[tuple] = set()
+
+    for i, row in enumerate(rows):
+        sig = _signature(row)
+        indices = groups[sig]
+        if len(indices) == 1:
+            new_rows.append(row)
+            continue
+        if sig in emitted:
+            continue  # a later duplicate of a group already merged in
+        emitted.add(sig)
+
+        total_qty = sum(_row_qty(rows[j]) for j in indices)
+        merged = dict(row)
+        merged["target_quantity"] = str(total_qty)
+        new_rows.append(merged)
+        merges.append({
+            "card_name": row.get("card_name", ""),
+            "target_quantity": str(total_qty),
+            "rows_merged": str(len(indices)),
+        })
+
+    if not merges:
+        return []
+
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(new_rows)
+
+    return merges
 
 
 def remove_from_buylist(path: Path, card_names: list[str]) -> int:

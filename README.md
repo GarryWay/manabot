@@ -80,6 +80,9 @@ python -m manabot pricer-scheduler
 # Validate your buylist CSV for errors
 python -m manabot validate-buylist --buylist data/buylist.csv
 
+# Merge duplicate buylist rows (identical except quantity) into one, summing quantities
+python -m manabot coalesce-buylist --buylist data/buylist.csv
+
 # Match your buylist against live ManaPool prices (dry run)
 python -m manabot run --buylist data/buylist.csv --dry-run
 

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from manabot.buylist import BuyListError, load_buylist, append_to_buylist, remove_from_buylist, remove_purchases_fifo, edit_buylist_entry
+from manabot.buylist import BuyListError, load_buylist, append_to_buylist, remove_from_buylist, remove_purchases_fifo, edit_buylist_entry, coalesce_buylist
 from manabot.models import BuyListItem, Condition, Finish
 
 
@@ -421,3 +421,136 @@ def test_edit_no_match_returns_none(tmp_path):
 
 def test_edit_missing_file_returns_none(tmp_path):
     assert edit_buylist_entry(tmp_path / "none.csv", "Lightning Bolt", {"target_quantity": "1"}) is None
+
+
+# ── coalesce_buylist ─────────────────────────────────────────────────────────
+
+def test_coalesce_merges_identical_rows_summing_quantity(tmp_path):
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", target_quantity=2))
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", target_quantity=3))
+    merges = coalesce_buylist(path)
+    assert len(merges) == 1
+    assert merges[0] == {"card_name": "Lightning Bolt", "target_quantity": "5", "rows_merged": "2"}
+    items = load_buylist(path)
+    assert len(items) == 1
+    assert items[0].target_quantity == 5
+
+
+def test_coalesce_matches_name_case_insensitively(tmp_path):
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="lightning bolt", target_quantity=1))
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt!", target_quantity=1))
+    merges = coalesce_buylist(path)
+    assert len(merges) == 1
+    assert merges[0]["target_quantity"] == "2"
+
+
+def test_coalesce_spans_more_than_two_rows(tmp_path):
+    path = tmp_path / "bl.csv"
+    for _ in range(3):
+        append_to_buylist(path, _make_item(card_name="Lightning Bolt", target_quantity=1))
+    merges = coalesce_buylist(path)
+    assert merges[0]["rows_merged"] == "3"
+    assert merges[0]["target_quantity"] == "3"
+    assert len(load_buylist(path)) == 1
+
+
+def test_coalesce_does_not_merge_different_max_price(tmp_path):
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", max_price_usd=1.00))
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", max_price_usd=1.50))
+    assert coalesce_buylist(path) == []
+    assert len(load_buylist(path)) == 2
+
+
+def test_coalesce_does_not_merge_different_condition(tmp_path):
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", min_condition=Condition.NM))
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", min_condition=Condition.LP))
+    assert coalesce_buylist(path) == []
+
+
+def test_coalesce_does_not_merge_different_foil(tmp_path):
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", foil=Finish.FOIL))
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", foil=Finish.NONFOIL))
+    assert coalesce_buylist(path) == []
+
+
+def test_coalesce_does_not_merge_different_scryfall_id(tmp_path):
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", scryfall_id="aaa"))
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", scryfall_id="bbb"))
+    assert coalesce_buylist(path) == []
+
+
+def test_coalesce_does_not_merge_different_uid_tags(tmp_path):
+    """Per-user tags (uid:...) must never be merged across different users."""
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", tags=["uid:111"]))
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", tags=["uid:222"]))
+    assert coalesce_buylist(path) == []
+    assert len(load_buylist(path)) == 2
+
+
+def test_coalesce_treats_tag_order_as_equivalent(tmp_path):
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", target_quantity=1, tags=["burn-deck", "uid:111"]))
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", target_quantity=1, tags=["uid:111", "burn-deck"]))
+    merges = coalesce_buylist(path)
+    assert len(merges) == 1
+    assert merges[0]["target_quantity"] == "2"
+
+
+def test_coalesce_treats_allowed_sets_order_as_equivalent(tmp_path):
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", allowed_sets=["LEA", "LEB"]))
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", allowed_sets=["LEB", "LEA"]))
+    merges = coalesce_buylist(path)
+    assert len(merges) == 1
+
+
+def test_coalesce_keeps_first_row_casing_and_position(tmp_path):
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="Dark Ritual", target_quantity=1))
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", target_quantity=1))
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", target_quantity=1))
+    coalesce_buylist(path)
+    items = load_buylist(path)
+    assert len(items) == 2
+    assert items[0].card_name == "Dark Ritual"
+    assert items[1].card_name == "Lightning Bolt"
+    assert items[1].target_quantity == 2
+
+
+def test_coalesce_does_not_touch_unrelated_cards(tmp_path):
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", target_quantity=2))
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", target_quantity=3))
+    append_to_buylist(path, _make_item(card_name="Dark Ritual", target_quantity=4))
+    merges = coalesce_buylist(path)
+    assert len(merges) == 1
+    items = load_buylist(path)
+    assert len(items) == 2
+    names = {i.card_name: i.target_quantity for i in items}
+    assert names["Dark Ritual"] == 4
+    assert names["Lightning Bolt"] == 5
+
+
+def test_coalesce_no_duplicates_returns_empty(tmp_path):
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt"))
+    append_to_buylist(path, _make_item(card_name="Dark Ritual"))
+    assert coalesce_buylist(path) == []
+    assert len(load_buylist(path)) == 2
+
+
+def test_coalesce_missing_file_returns_empty(tmp_path):
+    assert coalesce_buylist(tmp_path / "none.csv") == []
+
+
+def test_coalesce_empty_file_returns_empty(tmp_path):
+    path = tmp_path / "bl.csv"
+    path.write_text("card_name,target_quantity,max_price_usd,min_condition\n", encoding="utf-8")
+    assert coalesce_buylist(path) == []

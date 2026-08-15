@@ -209,6 +209,39 @@ def validate_buylist(ctx: click.Context, buylist_path_override: Path | None, con
         sys.exit(1)
 
 
+@cli.command("coalesce-buylist")
+@click.option("--buylist", "buylist_path_override", type=click.Path(path_type=Path), default=None)
+@click.option("--config", "config_path", type=click.Path(path_type=Path), default=None)
+@click.pass_context
+def coalesce_buylist_cmd(ctx: click.Context, buylist_path_override: Path | None, config_path: Path | None) -> None:
+    """Merge buy list rows that are duplicates in every field except target_quantity.
+
+    Matches card_name by normalized text and treats allowed_sets/tags as
+    unordered, so only field order can differ between merged rows — every
+    other field (including tags, so per-user 'uid:' entries are never
+    merged across users) must match exactly. Quantities are summed into
+    the first occurrence of each duplicate group; later duplicates are removed.
+    """
+    from manabot.config import load_config
+    from manabot.buylist import coalesce_buylist
+
+    try:
+        config = load_config(config_path)
+    except (ValueError, FileNotFoundError) as e:
+        click.echo(f"Config error: {e}", err=True)
+        sys.exit(1)
+
+    buylist_path = buylist_path_override or config.buylist_path
+    merges = coalesce_buylist(buylist_path)
+    if not merges:
+        click.echo("No duplicate rows found — buy list is already coalesced.")
+        return
+
+    click.echo(f"Merged {len(merges)} duplicate group(s):")
+    for m in merges:
+        click.echo(f"  {m['card_name']}: {m['rows_merged']} rows -> {m['target_quantity']}x")
+
+
 @cli.command()
 @click.option("--config", "config_path", type=click.Path(path_type=Path), default=None)
 @click.option("--buylist", "buylist_path_override", type=click.Path(path_type=Path), default=None)
