@@ -318,8 +318,12 @@ class ManaPoolClient:
                     f"HTTP 409 from optimizer: could not resolve {names or 'unknown items'}",
                     unresolvable_names=names,
                 ) from e
+            log.error(
+                "HTTP %s from POST /buyer/optimizer — full response body: %s",
+                e.response.status_code, e.response.text,
+            )
             raise ManaPoolAPIError(
-                f"HTTP {e.response.status_code} from POST /buyer/optimizer: {e.response.text[:200]}"
+                f"HTTP {e.response.status_code} from POST /buyer/optimizer: {e.response.text[:500]}"
             ) from e
         except (requests.ConnectionError, requests.Timeout) as e:
             raise ManaPoolAPIError("Network error calling optimizer") from e
