@@ -266,6 +266,34 @@ class ManaPoolClient:
             raise ManaPoolAPIError(f"Timeout fetching {url}") from e
         return resp.json()
 
+    def get_card_ids_by_scryfall_id(self, scryfall_ids: list[str]) -> dict[str, str]:
+        """GET /products/singles?scryfall_ids=... — resolve Scryfall IDs to ManaPool's card_id.
+
+        card_id is ManaPool's own catalog identifier for a printing, required on every
+        POST /buyer/optimizer cart item as of ~2026-08 (name alone is no longer enough).
+        It's an mtgjson-style UUID per ManaPool's own docs ("as accepted by the
+        mtgjson_uuids filter and by unique single creation") — sourced directly from
+        their catalog here rather than derived, since guessing at that mapping (e.g.
+        assuming it equals scryfall_id or a Scryfall oracle_id) was tried and confirmed
+        wrong via live 400/409 responses.
+
+        Batches at 100 IDs per call (API max). Returns {scryfall_id: card_id}; IDs with
+        no match are simply absent from the result rather than raising.
+        """
+        if not scryfall_ids:
+            return {}
+        result: dict[str, str] = {}
+        unique_ids = list(dict.fromkeys(scryfall_ids))  # de-dup, keep order
+        for i in range(0, len(unique_ids), 100):
+            batch = unique_ids[i:i + 100]
+            data = self._get("/products/singles", params={"scryfall_ids": batch})
+            for entry in data.get("data", []):
+                sid = entry.get("scryfall_id")
+                cid = entry.get("card_id")
+                if sid and cid:
+                    result[sid] = cid
+        return result
+
     def run_optimizer(
         self,
         cart: list[dict],

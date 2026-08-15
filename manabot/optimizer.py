@@ -13,17 +13,21 @@ Scoring
 Iteration
 ---------
     1.  Build eligible items: estimated_price ≤ max_price × (1 + over_budget_pct%).
-    2.  If max_cart_usd is set, greedily pre-select the highest-value items that fit
+    2.  Resolve each item's ManaPool card_id via GET /products/singles (batched, keyed by
+        scryfall_id) — required identifier on every optimizer cart item as of ~2026-08;
+        items with no match are dropped rather than sent unidentified.
+    3.  If max_cart_usd is set, greedily pre-select the highest-value items that fit
         within that estimated dollar cap (sorted by relative margin rate × qty).
-    3.  Run optimizer → baseline result.
-    4.  Iterate up to max_iterations times:
+    4.  Run optimizer → baseline result.
+    5.  Iterate up to max_iterations times:
         a.  If cart total > max_cart_usd: force-remove the worst-margin item to get
             closer to budget.
         b.  Else if any negative-margin items remain: try removing the worst; keep
             removal only if net value improves.
         c.  Stop when within budget with no negative-margin removal opportunities.
 
-Total API calls: 1 (baseline) + up to max_iterations (one removal trial each).
+Total API calls: 1 (card_id resolution, batched at 100/call) + 1 (baseline)
+                + up to max_iterations (one removal trial each).
 """
 from __future__ import annotations
 
@@ -110,9 +114,37 @@ def build_request_items(
             condition_ids=_acceptable_conditions(item.min_condition),
             finish_ids=_FINISH_IDS[item.foil],
             seller_id=best_listing.seller_id,
+            scryfall_id=best_listing.scryfall_id,
         ))
 
     return items
+
+
+def _resolve_card_ids(items: list[CartRequestItem], client: ManaPoolClient) -> list[CartRequestItem]:
+    """Resolve card_id (ManaPool's required optimizer identifier) via scryfall_id, batched
+    in one call, for any item that doesn't already have one. Callers may pre-supply
+    card_id directly (e.g. arbitrage candidates already resolved elsewhere) to skip the
+    lookup for those items. Items that end up with no card_id are dropped (logged as a
+    warning) rather than sent unidentified, since one bad item 400s the whole request.
+    """
+    if not items:
+        return items
+    need_lookup = [x for x in items if not x.card_id and x.scryfall_id]
+    if need_lookup:
+        card_ids = client.get_card_ids_by_scryfall_id([x.scryfall_id for x in need_lookup])
+        for item in need_lookup:
+            item.card_id = card_ids.get(item.scryfall_id, "")
+
+    resolved: list[CartRequestItem] = []
+    for item in items:
+        if not item.card_id:
+            log.warning(
+                "No ManaPool card_id for %r (scryfall_id=%r) — skipping (optimizer requires an identifier per item)",
+                item.buy_list_item.card_name, item.scryfall_id,
+            )
+            continue
+        resolved.append(item)
+    return resolved
 
 
 def _select_within_budget(
@@ -200,6 +232,10 @@ def _build_optimizer_payload(items: list[CartRequestItem]) -> list[dict]:
             "finish_ids": item.finish_ids,
             "quantity_requested": item.buy_list_item.target_quantity,
         }
+        # card_id is now a required identifier (see _resolve_card_ids) — sourced from
+        # ManaPool's own catalog via GET /products/singles, not derived/guessed.
+        if item.card_id:
+            entry["card_id"] = item.card_id
         # Only constrain set_code when the user explicitly specified allowed_sets,
         # so the optimizer can still find the cheapest printing across all sanctioned sets.
         if item.buy_list_item.allowed_sets:
@@ -303,7 +339,8 @@ def find_best_cart(
     Pass preselected to bypass build_request_items and _select_within_budget
     (e.g. when the caller has already done greedy budget packing for arbitrage).
 
-    Total API calls: 1 (baseline) + Phase 1 removals + Phase 2 (≤ max_iterations)
+    Total API calls: 1-2 (card_id resolution, batched at 100/call) + 1 (baseline)
+                    + Phase 1 removals + Phase 2 (≤ max_iterations)
                     + Phase 3 free riders + Phase 4 (≤ max_iterations new-seller probes).
     """
     _run_expansion = target_cart_usd is not None or expansion_pool is not None
@@ -363,6 +400,12 @@ def find_best_cart(
             _overflow = []
 
         _extra_pool = _overflow + list(expansion_pool or [])
+
+    eligible = _resolve_card_ids(eligible, client)
+    if not eligible:
+        log.warning("No eligible items have a resolvable ManaPool card_id")
+        return None
+    _extra_pool = _resolve_card_ids(_extra_pool, client)
 
     log.info("Starting cart optimization: %d eligible items", len(eligible))
 

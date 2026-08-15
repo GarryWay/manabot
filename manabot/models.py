@@ -118,6 +118,9 @@ class CartRequestItem:
     condition_ids: list[str]  # e.g. ["NM", "LP"] for min_condition=LP
     finish_ids: list[str]     # e.g. ["NF"] for nonfoil
     seller_id: str = ""     # seller from the pre-fetch scan (proxy for optimizer's choice)
+    scryfall_id: str = ""    # from the chosen listing; lookup key for card_id resolution
+    card_id: str = ""       # ManaPool's own catalog id for this printing (GET /products/singles),
+                             # resolved from scryfall_id — required identifier on optimizer requests
 
 
 @dataclass

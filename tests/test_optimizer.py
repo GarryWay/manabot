@@ -13,6 +13,7 @@ from manabot.optimizer import (
     _acceptable_conditions,
     _group_by_seller,
     _is_better,
+    _resolve_card_ids,
     _select_within_budget,
     build_request_items,
     find_best_cart,
@@ -96,6 +97,23 @@ def _optimizer_ndjson(
         },
     })
     return f"{stats}\n{cart}\n"
+
+
+def _mock_card_ids() -> None:
+    """Register a GET /products/singles mock that resolves any scryfall_ids to a
+    deterministic card_id, for tests that exercise find_best_cart() end-to-end
+    (it always resolves card_id via this endpoint before calling the optimizer)."""
+    def _callback(request):
+        from urllib.parse import parse_qs, urlparse
+        qs = parse_qs(urlparse(request.url).query)
+        scryfall_ids = qs.get("scryfall_ids", [])
+        data = [{"scryfall_id": sid, "card_id": f"card-{sid}"} for sid in scryfall_ids]
+        body = json.dumps({"meta": {"as_of": "2026-01-01T00:00:00Z"}, "data": data})
+        return (200, {"Content-Type": "application/json"}, body)
+
+    resp_mock.add_callback(
+        resp_mock.GET, f"{MANAPOOL_BASE}/products/singles", callback=_callback,
+    )
 
 
 @pytest.fixture
@@ -284,6 +302,109 @@ def test_build_optimizer_payload_includes_set_code_when_allowed_sets_specified()
     assert payload[0]["set_code"] == "ICE"
 
 
+def test_build_optimizer_payload_omits_card_id_when_unresolved():
+    """build_request_items() doesn't resolve card_id itself (that's _resolve_card_ids,
+    which needs a client) — so a freshly built item has no card_id yet."""
+    item = _item(name="Counterspell")
+    result = _matched(item, _listing(name="Counterspell"))
+    cart_items = build_request_items([result])
+    assert cart_items[0].card_id == ""
+    payload = _build_optimizer_payload(cart_items)
+    assert "card_id" not in payload[0]
+
+
+def test_build_optimizer_payload_includes_card_id_when_resolved():
+    item = _item(name="Counterspell")
+    ci = CartRequestItem(
+        buy_list_item=item, set_code="ICE", estimated_price=1.50, estimated_margin=0.50,
+        condition_ids=["NM"], finish_ids=["NF"], scryfall_id="sf-1", card_id="card-1",
+    )
+    payload = _build_optimizer_payload([ci])
+    assert payload[0]["card_id"] == "card-1"
+
+
+def test_build_request_items_sets_scryfall_id_from_chosen_listing():
+    item = _item(name="Lightning Bolt")
+    result = _matched(item, _listing(scryfall_id="bolt-sf-id"))
+    cart_items = build_request_items([result])
+    assert cart_items[0].scryfall_id == "bolt-sf-id"
+    assert cart_items[0].card_id == ""  # not resolved yet — needs _resolve_card_ids
+
+
+# ---------------------------------------------------------------------------
+# _resolve_card_ids
+# ---------------------------------------------------------------------------
+
+class _FakeCardIdClient:
+    """Records requested scryfall_ids and returns a deterministic card_id for each,
+    minus any explicitly listed as unresolvable."""
+    def __init__(self, unresolvable: set[str] | None = None):
+        self.requested: list[str] | None = None
+        self._unresolvable = unresolvable or set()
+
+    def get_card_ids_by_scryfall_id(self, scryfall_ids: list[str]) -> dict[str, str]:
+        self.requested = list(scryfall_ids)
+        return {
+            sid: f"card-{sid}" for sid in scryfall_ids
+            if sid not in self._unresolvable
+        }
+
+
+def test_resolve_card_ids_empty_list_returns_empty():
+    assert _resolve_card_ids([], _FakeCardIdClient()) == []
+
+
+def test_resolve_card_ids_sets_card_id_from_client():
+    ci = _cart_item("Lightning Bolt", est_price=1.00, margin=1.00)
+    ci.card_id = ""
+    ci.scryfall_id = "bolt-sf"
+    client = _FakeCardIdClient()
+    resolved = _resolve_card_ids([ci], client)
+    assert len(resolved) == 1
+    assert resolved[0].card_id == "card-bolt-sf"
+
+
+def test_resolve_card_ids_skips_lookup_for_already_resolved_items():
+    """An item with a pre-supplied card_id shouldn't trigger a lookup at all."""
+    ci = _cart_item("Lightning Bolt", est_price=1.00, margin=1.00)
+    ci.card_id = "already-set"
+    ci.scryfall_id = "bolt-sf"
+    client = _FakeCardIdClient()
+    resolved = _resolve_card_ids([ci], client)
+    assert resolved[0].card_id == "already-set"
+    assert client.requested is None  # never called
+
+
+def test_resolve_card_ids_drops_unresolvable_items():
+    ci = _cart_item("Mystery Card", est_price=1.00, margin=1.00)
+    ci.card_id = ""
+    ci.scryfall_id = "unknown-sf"
+    client = _FakeCardIdClient(unresolvable={"unknown-sf"})
+    assert _resolve_card_ids([ci], client) == []
+
+
+def test_resolve_card_ids_drops_items_with_no_scryfall_id():
+    ci = _cart_item("No Scryfall ID", est_price=1.00, margin=1.00)
+    ci.card_id = ""
+    ci.scryfall_id = ""
+    client = _FakeCardIdClient()
+    assert _resolve_card_ids([ci], client) == []
+
+
+def test_resolve_card_ids_mixed_resolved_and_unresolved():
+    resolved_ci = _cart_item("Lightning Bolt", est_price=1.00, margin=1.00)
+    resolved_ci.card_id = ""
+    resolved_ci.scryfall_id = "bolt-sf"
+    unresolved_ci = _cart_item("Mystery Card", est_price=1.00, margin=1.00)
+    unresolved_ci.card_id = ""
+    unresolved_ci.scryfall_id = "unknown-sf"
+
+    client = _FakeCardIdClient(unresolvable={"unknown-sf"})
+    result = _resolve_card_ids([resolved_ci, unresolved_ci], client)
+    assert len(result) == 1
+    assert result[0].buy_list_item.card_name == "Lightning Bolt"
+
+
 # ---------------------------------------------------------------------------
 # ManaPoolClient.run_optimizer
 # ---------------------------------------------------------------------------
@@ -382,6 +503,7 @@ def test_run_optimizer_sends_filter_flags(mp_client):
 
 @resp_mock.activate
 def test_find_best_cart_exclude_ub_when_any_item_flagged(mp_client):
+    _mock_card_ids()
     resp_mock.add(
         resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer",
         body=_optimizer_ndjson(subtotal_cents=200, shipping_cents=100, fee_cents=0),
@@ -393,13 +515,15 @@ def test_find_best_cart_exclude_ub_when_any_item_flagged(mp_client):
 
     find_best_cart([_matched(item_ub, _listing()), _matched(item_ok, _listing())], mp_client)
 
-    sent = json.loads(resp_mock.calls[0].request.body)
+    post_calls = [c for c in resp_mock.calls if c.request.method == "POST"]
+    sent = json.loads(post_calls[0].request.body)
     sf = sent["filters"]["productFilters"]["singleFilters"]
     assert sf["excludeUniversesBeyond"] is True
 
 
 @resp_mock.activate
 def test_find_best_cart_no_ub_filter_when_no_items_flagged(mp_client):
+    _mock_card_ids()
     resp_mock.add(
         resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer",
         body=_optimizer_ndjson(subtotal_cents=200, shipping_cents=100, fee_cents=0),
@@ -409,7 +533,8 @@ def test_find_best_cart_no_ub_filter_when_no_items_flagged(mp_client):
 
     find_best_cart([_matched(item, _listing())], mp_client)
 
-    sent = json.loads(resp_mock.calls[0].request.body)
+    post_calls = [c for c in resp_mock.calls if c.request.method == "POST"]
+    sent = json.loads(post_calls[0].request.body)
     assert "filters" not in sent
 
 
@@ -422,6 +547,7 @@ def test_find_best_cart_happy_path(mp_client):
     # 4× Lightning Bolt at $1.50 each; max_price $2.00; total budget $8.00
     # Optimizer: subtotal $6, ship $2, fees $0.50 → total $8.50
     # net = $8.00 − $8.50 = −$0.50  (slightly over; still usable)
+    _mock_card_ids()
     resp_mock.add(
         resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer",
         body=_optimizer_ndjson(subtotal_cents=600, shipping_cents=200, fee_cents=50),
@@ -453,6 +579,7 @@ def test_find_best_cart_no_matched_results_returns_none(mp_client):
 @resp_mock.activate
 def test_find_best_cart_removes_item_when_net_improves(mp_client):
     """Over-budget item is removed when doing so improves net value."""
+    _mock_card_ids()
     # Baseline (2 items): net worse because over-budget item adds cost with no shipping benefit
     resp_mock.add(
         resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer",
@@ -489,6 +616,7 @@ def test_find_best_cart_removes_item_when_net_improves(mp_client):
 @resp_mock.activate
 def test_find_best_cart_keeps_item_when_shipping_consolidation_wins(mp_client):
     """Over-budget item is kept when removing it worsens net value (shipping consolidation)."""
+    _mock_card_ids()
     # Baseline (2 items): shipping is cheap because items ship from same seller
     # value_budget = 2.00×4 + 1.20×2 = $10.40; total $6.50; net $3.90
     resp_mock.add(
@@ -532,7 +660,8 @@ def test_find_best_cart_keeps_item_when_shipping_consolidation_wins(mp_client):
 
 @resp_mock.activate
 def test_find_best_cart_stops_after_max_iterations(mp_client):
-    """Never makes more than 1 + max_iterations API calls."""
+    """Never makes more than 1 + max_iterations optimizer POST calls."""
+    _mock_card_ids()
     # 3 items: one positive, two negative-margin (each will prompt a removal trial)
     for _ in range(4):  # baseline + 2 trials (max_iterations=2) + 1 extra
         resp_mock.add(
@@ -551,8 +680,9 @@ def test_find_best_cart_stops_after_max_iterations(mp_client):
 
     find_best_cart([good, over1, over2], mp_client, over_budget_pct=35.0, max_iterations=2)
 
-    # baseline (1) + at most 2 trials = 3 total calls
-    assert len(resp_mock.calls) <= 3
+    # 1 card_id lookup + baseline (1) + at most 2 trials = 4 total calls
+    post_calls = [c for c in resp_mock.calls if c.request.method == "POST"]
+    assert len(post_calls) <= 3
 
 
 # ---------------------------------------------------------------------------
@@ -696,6 +826,7 @@ def test_is_better_both_over_budget_prefers_cheaper_total():
 @resp_mock.activate
 def test_find_best_cart_respects_spending_cap(mp_client):
     """Items that would bust the cap are dropped during pre-selection."""
+    _mock_card_ids()
     # Two items: Bolt ($6 estimated) + Dual ($10 estimated) = $16 total
     # Budget $8 → only Bolt fits in pre-selection
     resp_mock.add(
@@ -715,7 +846,8 @@ def test_find_best_cart_respects_spending_cap(mp_client):
     assert cart is not None
     assert len(cart.items) == 1
     assert cart.items[0].buy_list_item.card_name == "Lightning Bolt"
-    assert len(resp_mock.calls) == 1  # only baseline, no iteration needed
+    post_calls = [c for c in resp_mock.calls if c.request.method == "POST"]
+    assert len(post_calls) == 1  # only baseline, no iteration needed
 
 
 def test_find_best_cart_returns_none_when_nothing_fits_budget(mp_client):
@@ -731,6 +863,7 @@ def test_find_best_cart_returns_none_when_nothing_fits_budget(mp_client):
 @resp_mock.activate
 def test_find_best_cart_trims_when_shipping_pushes_over_cap(mp_client):
     """When shipping pushes the optimizer total over the cap, the worst item is removed."""
+    _mock_card_ids()
     # effective_cap = $8.00 * 0.80 = $6.40
     # Bolt: $3.00 * 2 = $6.00 ≤ $6.40 → selected.
     # Ritual: $0.10 * 2 = $0.20 → $6.20 ≤ $6.40 → selected.
@@ -766,6 +899,7 @@ def test_find_best_cart_trims_when_shipping_pushes_over_cap(mp_client):
 @resp_mock.activate
 def test_find_best_cart_retries_after_409(mp_client):
     """When the baseline 409s, the offending item is removed and the call is retried."""
+    _mock_card_ids()
     body_409 = json.dumps({
         "status": 409,
         "message": "Could not find inventory to satisfy request",
@@ -841,6 +975,9 @@ def _cart_item(
         estimated_margin=margin,
         condition_ids=["NM"],
         finish_ids=["NF"],
+        # Pre-supplied so find_best_cart's card_id resolution treats this item as
+        # already resolved and skips the GET /products/singles lookup for it.
+        card_id=f"card-{name.lower()}",
     )
 
 
@@ -983,6 +1120,7 @@ def test_group_by_seller_unknown_seller_singleton():
 @resp_mock.activate
 def test_forced_card_included_despite_over_budget_pct_filter(mp_client):
     """A forced card bypasses the over_budget_pct price filter and is always eligible."""
+    _mock_card_ids()
     # Counterspell: max_price=$1.00, listing=$1.50 — 50% over max → normally filtered out.
     # With forced, it must appear in the initial eligible set and in the final cart.
     resp_mock.add(
@@ -1011,6 +1149,7 @@ def test_forced_card_included_despite_over_budget_pct_filter(mp_client):
 @resp_mock.activate
 def test_forced_card_not_removed_in_phase2_only_forced_item(mp_client):
     """When the only item is forced, Phase 2 has no candidates and makes no removal trials."""
+    _mock_card_ids()
     # Counterspell is forced and is the only item.
     # Phase 2 filters out forced items → candidates=[] → loop breaks immediately.
     resp_mock.add(
@@ -1031,7 +1170,8 @@ def test_forced_card_not_removed_in_phase2_only_forced_item(mp_client):
         max_iterations=3,
         forced_card_names=frozenset({"Counterspell"}),
     )
-    assert len(resp_mock.calls) == 1  # baseline only — no Phase 2 trials
+    post_calls = [c for c in resp_mock.calls if c.request.method == "POST"]
+    assert len(post_calls) == 1  # baseline only — no Phase 2 trials
     assert cart is not None
     assert cart.items[0].buy_list_item.card_name == "Counterspell"
 
@@ -1039,6 +1179,7 @@ def test_forced_card_not_removed_in_phase2_only_forced_item(mp_client):
 @resp_mock.activate
 def test_forced_card_cost_deducted_from_optional_budget(mp_client):
     """Forced card's estimated cost is deducted from the optional build budget."""
+    _mock_card_ids()
     # max_cart_usd=$10 → build_budget=$8 (×0.80). Forced Dual=$5 → optional_budget=$3.
     # Bolt costs $4/ea × 1 = $4 > $3 → Bolt excluded from initial selection.
     # The optimizer baseline runs with only the forced Dual Land.

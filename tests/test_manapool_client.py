@@ -141,3 +141,79 @@ def test_parse_listing_unknown_condition(client):
     listing = client._parse_listing(raw, datetime.now(timezone.utc))
     # Unknown condition should fall back to LP (lenient default)
     assert listing.condition == Condition.LP
+
+
+# ---------------------------------------------------------------------------
+# get_card_ids_by_scryfall_id
+# ---------------------------------------------------------------------------
+
+def test_get_card_ids_empty_input_returns_empty_no_call(client):
+    assert client.get_card_ids_by_scryfall_id([]) == {}
+
+
+@resp_mock.activate
+def test_get_card_ids_single_batch(client):
+    resp_mock.add(
+        resp_mock.GET, f"{BASE}/products/singles",
+        json={
+            "meta": {"as_of": "2026-01-01T00:00:00Z"},
+            "data": [
+                {"scryfall_id": "sf-1", "card_id": "card-1", "name": "Lightning Bolt"},
+                {"scryfall_id": "sf-2", "card_id": "card-2", "name": "Counterspell"},
+            ],
+        },
+    )
+    result = client.get_card_ids_by_scryfall_id(["sf-1", "sf-2"])
+    assert result == {"sf-1": "card-1", "sf-2": "card-2"}
+
+
+@resp_mock.activate
+def test_get_card_ids_missing_id_absent_from_result(client):
+    resp_mock.add(
+        resp_mock.GET, f"{BASE}/products/singles",
+        json={"meta": {"as_of": "2026-01-01T00:00:00Z"}, "data": []},
+    )
+    result = client.get_card_ids_by_scryfall_id(["sf-unknown"])
+    assert result == {}
+
+
+@resp_mock.activate
+def test_get_card_ids_dedupes_input(client):
+    """Duplicate scryfall_ids in the input are sent only once."""
+    calls = []
+
+    def _callback(request):
+        from urllib.parse import parse_qs, urlparse
+        qs = parse_qs(urlparse(request.url).query)
+        calls.append(qs.get("scryfall_ids", []))
+        return (200, {}, json.dumps({
+            "meta": {"as_of": "2026-01-01T00:00:00Z"},
+            "data": [{"scryfall_id": "sf-1", "card_id": "card-1"}],
+        }))
+
+    resp_mock.add_callback(resp_mock.GET, f"{BASE}/products/singles", callback=_callback)
+    client.get_card_ids_by_scryfall_id(["sf-1", "sf-1", "sf-1"])
+    assert len(calls) == 1
+    assert calls[0] == ["sf-1"]
+
+
+@resp_mock.activate
+def test_get_card_ids_batches_at_100(client):
+    """More than 100 IDs are split across multiple calls."""
+    call_sizes = []
+
+    def _callback(request):
+        from urllib.parse import parse_qs, urlparse
+        qs = parse_qs(urlparse(request.url).query)
+        batch = qs.get("scryfall_ids", [])
+        call_sizes.append(len(batch))
+        return (200, {}, json.dumps({
+            "meta": {"as_of": "2026-01-01T00:00:00Z"},
+            "data": [{"scryfall_id": sid, "card_id": f"card-{sid}"} for sid in batch],
+        }))
+
+    resp_mock.add_callback(resp_mock.GET, f"{BASE}/products/singles", callback=_callback)
+    ids = [f"sf-{i}" for i in range(150)]
+    result = client.get_card_ids_by_scryfall_id(ids)
+    assert call_sizes == [100, 50]
+    assert len(result) == 150
