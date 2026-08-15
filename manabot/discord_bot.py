@@ -28,7 +28,7 @@ import csv
 import io
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import discord
@@ -124,6 +124,52 @@ async def _notify_dead_interaction(interaction: discord.Interaction, message: st
     except discord.HTTPException:
         cmd_name = interaction.command.name if interaction.command else "?"
         log.warning("Also failed to post fallback notice to channel for /%s (interaction dead)", cmd_name)
+
+
+# Discord interaction (followup webhook) tokens are valid for ~15 minutes from the
+# initial response. Long-running commands (e.g. /optimize with a high max_iterations
+# on a big buy list) can outlive that — leave a safety margin rather than finding out
+# via a failed followup.send().
+_INTERACTION_TOKEN_SAFE_WINDOW = timedelta(minutes=13)
+
+
+async def _reply(interaction: discord.Interaction, started_at: datetime, **kwargs) -> None:
+    """Deliver a command's result via the interaction followup, or fall back to a plain
+    channel message if the run took long enough that the token may have expired.
+
+    Without this, a long-running command silently fails to deliver even its own error
+    message once the token's ~15-minute window has passed (observed live: a 51-item
+    /optimize run took ~50 minutes and the fallback "Optimizer error: ..." followup.send
+    itself raised discord.HTTPException 401 Invalid Webhook Token).
+
+    kwargs are forwarded as-is to followup.send()/channel.send() — both accept the same
+    content/embed/file keywords, so callers don't need to know which path was taken.
+    """
+    elapsed = datetime.now(timezone.utc) - started_at
+    if elapsed < _INTERACTION_TOKEN_SAFE_WINDOW:
+        try:
+            await interaction.followup.send(**kwargs)
+            return
+        except discord.HTTPException:
+            log.warning(
+                "Interaction followup failed after %.0fs elapsed — falling back to channel message",
+                elapsed.total_seconds(),
+            )
+
+    channel = interaction.channel
+    if channel is None:
+        return
+    mention = interaction.user.mention if interaction.user else ""
+    allowed = discord.AllowedMentions(
+        users=[interaction.user] if interaction.user else [], everyone=False, roles=False,
+    )
+    content = kwargs.pop("content", None)
+    kwargs["content"] = f"{mention} {content}".strip() if content else mention
+    try:
+        await channel.send(allowed_mentions=allowed, **kwargs)
+    except discord.HTTPException:
+        cmd_name = interaction.command.name if interaction.command else "?"
+        log.warning("Also failed to post fallback channel message for /%s (token expired)", cmd_name)
 
 
 # ── Synchronous pipeline helpers (run in thread via asyncio.to_thread) ───────
@@ -571,6 +617,7 @@ def create_bot(config: Config) -> _ManabotClient:
         force_cards: str = "",
     ) -> None:
         await interaction.response.defer(thinking=True)
+        started_at = datetime.now(timezone.utc)
         # margin_pct is user-facing (positive = require discount); optimizer uses over_budget_pct (inverted sign)
         over_budget_pct = -margin_pct
         max_cart = max_cart_usd if max_cart_usd > 0 else None
@@ -584,11 +631,11 @@ def create_bot(config: Config) -> _ManabotClient:
             )
         except Exception as e:
             log.exception("optimize pipeline error")
-            await interaction.followup.send(f"Optimizer error: {e}")
+            await _reply(interaction, started_at, content=f"Optimizer error: {e}")
             return
 
         if "error" in data:
-            await interaction.followup.send(f"No results: {data['error']}")
+            await _reply(interaction, started_at, content=f"No results: {data['error']}")
             return
 
         _save_last_cart(bot.config, data["items"], "optimize")
@@ -613,7 +660,7 @@ def create_bot(config: Config) -> _ManabotClient:
             sign = "+" if x["margin"] >= 0 else "-"
             lines.append(f"{x['quantity']}x {x['card_name']} [{x['set_code']}]  ${x['price']:.2f}/ea  ({sign}${abs(x['margin']):.2f})")
         content, file = _send_as_file_or_text("\n".join(lines), "cart.txt")
-        await interaction.followup.send(**_send_kwargs(embed, content, file))
+        await _reply(interaction, started_at, **_send_kwargs(embed, content, file))
 
     # ── /arbitrage ────────────────────────────────────────────────────────────
 
@@ -634,6 +681,7 @@ def create_bot(config: Config) -> _ManabotClient:
         max_iterations: int = 0,
     ) -> None:
         await interaction.response.defer(thinking=True)
+        started_at = datetime.now(timezone.utc)
         max_cart = max_cart_usd if max_cart_usd > 0 else None
         target_cart = target_cart_usd if target_cart_usd > 0 else None
         max_iter = max_iterations if max_iterations > 0 else None
@@ -643,11 +691,11 @@ def create_bot(config: Config) -> _ManabotClient:
             )
         except Exception as e:
             log.exception("arbitrage pipeline error")
-            await interaction.followup.send(f"Arbitrage error: {e}")
+            await _reply(interaction, started_at, content=f"Arbitrage error: {e}")
             return
 
         if "error" in data:
-            await interaction.followup.send(f"No results: {data['error']}")
+            await _reply(interaction, started_at, content=f"No results: {data['error']}")
             return
 
         _save_last_cart(bot.config, data["items"], "arbitrage")
@@ -673,7 +721,7 @@ def create_bot(config: Config) -> _ManabotClient:
                 f"  ${x['price']:.2f}/ea  (market ${x['market_price']:.2f}, -{x['discount_pct']:.1f}%)"
             )
         content, file = _send_as_file_or_text("\n".join(lines), "arbitrage_cart.txt")
-        await interaction.followup.send(**_send_kwargs(embed, content, file))
+        await _reply(interaction, started_at, **_send_kwargs(embed, content, file))
 
     # ── /add-card ─────────────────────────────────────────────────────────────
 
