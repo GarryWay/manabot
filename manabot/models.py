@@ -118,6 +118,10 @@ class CartRequestItem:
     condition_ids: list[str]  # e.g. ["NM", "LP"] for min_condition=LP
     finish_ids: list[str]     # e.g. ["NF"] for nonfoil
     seller_id: str = ""     # seller from the pre-fetch scan (proxy for optimizer's choice)
+    card_id: str = ""       # Scryfall oracle_id — sent as the optimizer's card_id (required
+                             # identifier); unlike a per-printing id this lets the optimizer
+                             # roam across all interchangeable printings, matching ManaPool's
+                             # own "Any printings" mode rather than pinning one printing
 
 
 @dataclass

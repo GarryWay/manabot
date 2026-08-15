@@ -116,6 +116,7 @@ def _write_bulk(cards: list[dict], tmp_dir: str) -> Path:
 
 _BOLT = {
     "id": "abc",
+    "oracle_id": "oracle-bolt-uuid",
     "name": "Lightning Bolt",
     "prices": {"usd": "1.25", "usd_foil": "3.00"},
     "legalities": {"vintage": "legal", "legacy": "legal", "modern": "legal",
@@ -132,6 +133,7 @@ _PLANEQUAKE = {
 
 _DFC = {
     "id": "ghi",
+    "oracle_id": "oracle-dfc-uuid",
     "name": "Bala Ged Recovery // Bala Ged Sanctuary",
     "layout": "modal_dfc",
     "prices": {"usd": "2.50", "usd_foil": None},
@@ -197,6 +199,32 @@ def test_dfc_front_face_lookup():
         bulk = ScryfallBulk(_write_bulk([_DFC], d))
         assert bulk.get_market_price("Bala Ged Recovery") == 2.50
         assert bulk.is_sanctioned("Bala Ged Recovery") is True
+
+
+# ── get_oracle_id ────────────────────────────────────────────────────────────
+
+def test_get_oracle_id_known_card():
+    with tempfile.TemporaryDirectory() as d:
+        bulk = ScryfallBulk(_write_bulk([_BOLT], d))
+        assert bulk.get_oracle_id("Lightning Bolt") == "oracle-bolt-uuid"
+
+
+def test_get_oracle_id_case_insensitive():
+    with tempfile.TemporaryDirectory() as d:
+        bulk = ScryfallBulk(_write_bulk([_BOLT], d))
+        assert bulk.get_oracle_id("lightning bolt") == "oracle-bolt-uuid"
+
+
+def test_get_oracle_id_unknown_returns_none():
+    with tempfile.TemporaryDirectory() as d:
+        bulk = ScryfallBulk(_write_bulk([], d))
+        assert bulk.get_oracle_id("Unknown Card") is None
+
+
+def test_get_oracle_id_dfc_front_face_lookup():
+    with tempfile.TemporaryDirectory() as d:
+        bulk = ScryfallBulk(_write_bulk([_DFC], d))
+        assert bulk.get_oracle_id("Bala Ged Recovery") == "oracle-dfc-uuid"
 
 
 def test_missing_file_does_not_crash():
