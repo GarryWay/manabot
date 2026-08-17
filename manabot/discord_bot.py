@@ -91,6 +91,22 @@ def _send_as_file_or_text(text: str, filename: str) -> tuple[str | None, discord
     return None, discord.File(io.BytesIO(text.encode()), filename=filename)
 
 
+def _mass_entry_kwargs(items: list[dict]) -> dict:
+    """Build followup.send kwargs for a plain 'quantity name' list, one card per line
+    (e.g. "4 Lightning Bolt") — the exact format ManaPool's own Mass Entry box accepts,
+    so the cart can be pasted straight in rather than retyped from the detailed
+    cost/set/margin breakdown. Deliberately omits set code/price/margin: those are
+    useful for reviewing the decision here, but ManaPool's own Mass Entry only wants
+    quantity + name.
+    """
+    lines = [f"{x['quantity']} {x['card_name']}" for x in items]
+    content, file = _send_as_file_or_text("\n".join(lines), "manapool_mass_entry.txt")
+    kw: dict = {"content": "**Paste into ManaPool's Mass Entry:**" + (f"\n{content}" if content else "")}
+    if file is not None:
+        kw["file"] = file
+    return kw
+
+
 def _send_kwargs(
     embed: discord.Embed,
     content: str | None = None,
@@ -661,6 +677,7 @@ def create_bot(config: Config) -> _ManabotClient:
             lines.append(f"{x['quantity']}x {x['card_name']} [{x['set_code']}]  ${x['price']:.2f}/ea  ({sign}${abs(x['margin']):.2f})")
         content, file = _send_as_file_or_text("\n".join(lines), "cart.txt")
         await _reply(interaction, started_at, **_send_kwargs(embed, content, file))
+        await _reply(interaction, started_at, **_mass_entry_kwargs(items))
 
     # ── /arbitrage ────────────────────────────────────────────────────────────
 
@@ -722,6 +739,7 @@ def create_bot(config: Config) -> _ManabotClient:
             )
         content, file = _send_as_file_or_text("\n".join(lines), "arbitrage_cart.txt")
         await _reply(interaction, started_at, **_send_kwargs(embed, content, file))
+        await _reply(interaction, started_at, **_mass_entry_kwargs(items))
 
     # ── /add-card ─────────────────────────────────────────────────────────────
 
