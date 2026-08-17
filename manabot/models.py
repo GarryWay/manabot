@@ -118,9 +118,13 @@ class CartRequestItem:
     condition_ids: list[str]  # e.g. ["NM", "LP"] for min_condition=LP
     finish_ids: list[str]     # e.g. ["NF"] for nonfoil
     seller_id: str = ""     # seller from the pre-fetch scan (proxy for optimizer's choice)
-    scryfall_id: str = ""    # from the chosen listing; lookup key for card_id resolution
-    card_id: str = ""       # ManaPool's own catalog id for this printing (GET /products/singles),
-                             # resolved from scryfall_id — required identifier on optimizer requests
+    scryfall_id: str = ""    # from the chosen listing; lookup key for card_id resolution (identifies
+                             # the card, not a pinned printing — see card_id below)
+    card_id: str = ""       # ManaPool's own catalog id for this card (GET /products/singles), resolved
+                             # from scryfall_id — required identifier on optimizer requests. Despite being
+                             # looked up via one specific printing, the optimizer treats it as card-level:
+                             # verified live that it can substitute any interchangeable printing to fill
+                             # quantity, not just the one scryfall_id was resolved from.
 
 
 @dataclass

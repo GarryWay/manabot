@@ -269,13 +269,19 @@ class ManaPoolClient:
     def get_card_ids_by_scryfall_id(self, scryfall_ids: list[str]) -> dict[str, str]:
         """GET /products/singles?scryfall_ids=... — resolve Scryfall IDs to ManaPool's card_id.
 
-        card_id is ManaPool's own catalog identifier for a printing, required on every
-        POST /buyer/optimizer cart item as of ~2026-08 (name alone is no longer enough).
+        card_id is ManaPool's own catalog identifier, required on every POST
+        /buyer/optimizer cart item as of ~2026-08 (name alone is no longer enough).
         It's an mtgjson-style UUID per ManaPool's own docs ("as accepted by the
         mtgjson_uuids filter and by unique single creation") — sourced directly from
         their catalog here rather than derived, since guessing at that mapping (e.g.
         assuming it equals scryfall_id or a Scryfall oracle_id) was tried and confirmed
         wrong via live 400/409 responses.
+
+        Despite being looked up per printing (via scryfall_id), the optimizer treats
+        card_id as card-level, not printing-level: verified live by requesting 600x a
+        card via one printing's card_id when that printing only had 528 in stock — the
+        optimizer filled the rest from 17 other printings. "Any printings" search is
+        preserved; use mtgjson_id instead of card_id if a specific printing must be pinned.
 
         Batches at 100 IDs per call (API max). Returns {scryfall_id: card_id}; IDs with
         no match are simply absent from the result rather than raising.
