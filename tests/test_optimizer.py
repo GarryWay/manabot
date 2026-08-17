@@ -1,7 +1,9 @@
 """Tests for the cart optimizer module and ManaPoolClient.run_optimizer."""
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import responses as resp_mock
@@ -9,12 +11,15 @@ import responses as resp_mock
 from manabot.api.manapool import ManaPool409Error, ManaPoolAPIError, ManaPoolClient
 from manabot.models import BuyListItem, CartRequestItem, CartResult, Condition, Finish, MatchResult, MatchStatus, PriceListing
 from manabot.optimizer import (
+    _bisect_batch_removal,
     _build_optimizer_payload,
     _acceptable_conditions,
+    _chunk,
     _group_by_seller,
     _is_better,
     _resolve_card_ids,
     _select_within_budget,
+    _try_batch,
     build_request_items,
     find_best_cart,
     try_add_items,
@@ -114,6 +119,26 @@ def _mock_card_ids() -> None:
     resp_mock.add_callback(
         resp_mock.GET, f"{MANAPOOL_BASE}/products/singles", callback=_callback,
     )
+
+
+def _mock_optimizer_by_names(scorer) -> None:
+    """Register a POST /buyer/optimizer callback mock that computes its response from
+    which card names are present in the request payload, via
+    scorer(names: list[str]) -> (subtotal_cents, shipping_cents, fee_cents).
+
+    Deterministic regardless of call order or concurrency, unlike a FIFO-queued
+    resp_mock.add() sequence — needed for find_best_cart() tests now that Phase 2 fires
+    some trials concurrently (_bisect_batch_removal's parallel probe) rather than
+    strictly one at a time.
+    """
+    def _callback(request):
+        payload = json.loads(request.body)
+        names = [entry["name"] for entry in payload["cart"]]
+        subtotal_cents, shipping_cents, fee_cents = scorer(names)
+        body = _optimizer_ndjson(subtotal_cents=subtotal_cents, shipping_cents=shipping_cents, fee_cents=fee_cents)
+        return (200, {"Content-Type": "application/x-ndjson"}, body)
+
+    resp_mock.add_callback(resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer", callback=_callback)
 
 
 @pytest.fixture
@@ -615,27 +640,25 @@ def test_find_best_cart_removes_item_when_net_improves(mp_client):
 
 @resp_mock.activate
 def test_find_best_cart_keeps_item_when_shipping_consolidation_wins(mp_client):
-    """Over-budget item is kept when removing it worsens net value (shipping consolidation)."""
+    """Over-budget item is kept when removing it (alone or together with the other
+    candidate) worsens net value (shipping consolidation). Uses a name-keyed callback
+    mock rather than a FIFO response queue, since Phase 2 may probe both removals
+    concurrently instead of in a fixed order."""
     _mock_card_ids()
-    # Baseline (2 items): shipping is cheap because items ship from same seller
-    # value_budget = 2.00×4 + 1.20×2 = $10.40; total $6.50; net $3.90
-    resp_mock.add(
-        resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer",
-        body=_optimizer_ndjson(subtotal_cents=500, shipping_cents=100, fee_cents=50),
-        content_type="application/x-ndjson",
-    )
-    # Trial 1 (without Dark Ritual): shipping skyrockets → net worsens → lock Dark Ritual
-    resp_mock.add(
-        resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer",
-        body=_optimizer_ndjson(subtotal_cents=400, shipping_cents=400, fee_cents=40),
-        content_type="application/x-ndjson",
-    )
-    # Trial 2 (without Lightning Bolt, only Dark Ritual): much worse → lock Lightning Bolt
-    resp_mock.add(
-        resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer",
-        body=_optimizer_ndjson(subtotal_cents=150, shipping_cents=200, fee_cents=10),
-        content_type="application/x-ndjson",
-    )
+
+    def _scorer(names: list[str]) -> tuple[int, int, int]:
+        has_bolt = "Lightning Bolt" in names
+        has_ritual = "Dark Ritual" in names
+        if has_bolt and has_ritual:
+            # Baseline: value_budget = 2.00×4 + 1.20×2 = $10.40; total $6.50; net $3.90
+            return 500, 100, 50
+        if has_bolt:  # Dark Ritual removed — shipping skyrockets, net worsens
+            return 400, 400, 40
+        if has_ritual:  # Lightning Bolt removed — much worse, net worsens further
+            return 150, 200, 10
+        return 0, 0, 0  # both removed (shouldn't be reachable — nothing left to sell)
+
+    _mock_optimizer_by_names(_scorer)
 
     good = _matched(_item(name="Lightning Bolt", max_price=2.00, qty=4), _listing(price=1.50))
 
@@ -693,30 +716,73 @@ def test_find_best_cart_survives_phase2_trial_returning_no_valid_cart(mp_client)
 
 
 @resp_mock.activate
-def test_find_best_cart_stops_after_max_iterations(mp_client):
-    """Never makes more than 1 + max_iterations optimizer POST calls."""
+def test_find_best_cart_phase2_not_bounded_by_max_iterations(mp_client):
+    """Phase 2 batches its removals (_bisect_batch_removal) instead of looping once per
+    candidate, so it isn't limited by max_iterations the way the old one-at-a-time
+    algorithm was. Five negative-margin candidates, max_iterations=1 -- the old algorithm
+    could only ever have tried one of them; the batched version still removes all five,
+    each validated standalone in parallel (not swept up in one blind batch call) plus
+    one merge-validate call, well under 5 sequential one-at-a-time trials."""
     _mock_card_ids()
-    # 3 items: one positive, two negative-margin (each will prompt a removal trial)
-    for _ in range(4):  # baseline + 2 trials (max_iterations=2) + 1 extra
-        resp_mock.add(
-            resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer",
-            body=_optimizer_ndjson(subtotal_cents=300, shipping_cents=500, fee_cents=30),
-            content_type="application/x-ndjson",
-        )
 
-    good = _matched(_item(name="Bolt", max_price=2.00, qty=1), _listing(name="Bolt", price=1.00))
-    over1_item = BuyListItem(card_name="Card A", target_quantity=1, max_price_usd=1.00, min_condition=Condition.NM)
-    over1 = MatchResult(buy_list_item=over1_item, listings=[_listing(name="Card A", price=1.20, qty=1)],
-                        best_price=1.20, status=MatchStatus.MATCHED)
-    over2_item = BuyListItem(card_name="Card B", target_quantity=1, max_price_usd=1.00, min_condition=Condition.NM)
-    over2 = MatchResult(buy_list_item=over2_item, listings=[_listing(name="Card B", price=1.30, qty=1)],
-                        best_price=1.30, status=MatchStatus.MATCHED)
+    def _scorer(names: list[str]) -> tuple[int, int, int]:
+        # $1.00/ea flat, regardless of which subset remains — removing any negative-margin
+        # candidate always helps (value_budget drops less than cost does per removed item,
+        # since each costs more than its own $0.50 max_price).
+        return len(names) * 100, 0, 0
 
-    find_best_cart([good, over1, over2], mp_client, over_budget_pct=35.0, max_iterations=2)
+    _mock_optimizer_by_names(_scorer)
 
-    # 1 card_id lookup + baseline (1) + at most 2 trials = 4 total calls
+    good = _matched(_item(name="Good", max_price=5.00, qty=1), _listing(name="Good", price=1.00))
+    bad_results = []
+    for i in range(5):
+        name = f"Bad{i}"
+        item = _item(name=name, max_price=0.50, qty=1)
+        bad_results.append(_matched(item, _listing(name=name, price=1.00)))
+
+    cart = find_best_cart([good, *bad_results], mp_client, over_budget_pct=100.0, max_iterations=1)
+
+    assert cart is not None
+    assert len(cart.items) == 1
+    assert cart.items[0].buy_list_item.card_name == "Good"
+    # baseline (1) + Phase 2a: 5 standalone probes (one per Bad item, in parallel) +
+    # 1 merge-validate call = 7 total, despite max_iterations=1 -- the old per-item
+    # loop would have needed 6+ sequential calls just for the 5 Bad items alone.
     post_calls = [c for c in resp_mock.calls if c.request.method == "POST"]
-    assert len(post_calls) <= 3
+    assert len(post_calls) == 7
+
+
+@resp_mock.activate
+def test_find_best_cart_max_parallel_controls_group_size(mp_client):
+    """max_parallel is a real, tunable knob on find_best_cart -- max_parallel=1 forces
+    every Phase 2 candidate into a single group (no per-item parallelism at all),
+    verifying it actually threads through to _bisect_batch_removal rather than being
+    silently ignored."""
+    _mock_card_ids()
+
+    def _scorer(names: list[str]) -> tuple[int, int, int]:
+        return len(names) * 100, 0, 0
+
+    _mock_optimizer_by_names(_scorer)
+
+    good = _matched(_item(name="Good", max_price=5.00, qty=1), _listing(name="Good", price=1.00))
+    bad_results = []
+    for i in range(5):
+        name = f"Bad{i}"
+        item = _item(name=name, max_price=0.50, qty=1)
+        bad_results.append(_matched(item, _listing(name=name, price=1.00)))
+
+    cart = find_best_cart(
+        [good, *bad_results], mp_client, over_budget_pct=100.0, max_iterations=1, max_parallel=1,
+    )
+
+    assert cart is not None
+    assert len(cart.items) == 1
+    assert cart.items[0].buy_list_item.card_name == "Good"
+    # With max_parallel=1, all 5 Bad candidates form one group: 1 probe call (removing
+    # all 5 at once) + 1 merge-validate call = 2 Phase 2a calls, not 5 standalone probes.
+    post_calls = [c for c in resp_mock.calls if c.request.method == "POST"]
+    assert len(post_calls) == 1 + 2  # baseline + 2
 
 
 # ---------------------------------------------------------------------------
@@ -1282,3 +1348,212 @@ def test_forced_card_cost_deducted_from_optional_budget(mp_client):
     # The cart contains at minimum the forced Dual Land.
     names = {x.buy_list_item.card_name for x in cart.items}
     assert "Dual Land" in names
+
+
+# ---------------------------------------------------------------------------
+# _chunk
+# ---------------------------------------------------------------------------
+
+def test_chunk_splits_evenly():
+    assert _chunk([1, 2, 3, 4], 2) == [[1, 2], [3, 4]]
+
+
+def test_chunk_handles_remainder():
+    assert _chunk([1, 2, 3, 4, 5], 2) == [[1, 2, 3], [4, 5]]
+
+
+def test_chunk_caps_at_item_count():
+    """Asking for more chunks than items just gives one item per chunk."""
+    assert _chunk([1, 2], 10) == [[1], [2]]
+
+
+def test_chunk_empty_input():
+    assert _chunk([], 4) == []
+
+
+# ---------------------------------------------------------------------------
+# _try_batch
+# ---------------------------------------------------------------------------
+
+def test_try_batch_returns_none_when_removing_everything():
+    ci = _cart_item("Lightning Bolt", est_price=1.00, margin=1.00)
+    client = MagicMock()
+    assert _try_batch([ci], [ci], client, {"model": "lowest_price", "destination": "US"}) is None
+    client.run_optimizer.assert_not_called()
+
+
+def test_try_batch_returns_none_on_api_error():
+    ci_keep = _cart_item("Lightning Bolt", est_price=1.00, margin=1.00)
+    ci_remove = _cart_item("Dark Ritual", est_price=1.00, margin=1.00)
+    client = MagicMock()
+    client.run_optimizer.side_effect = ManaPoolAPIError("boom")
+    result = _try_batch([ci_remove], [ci_keep, ci_remove], client, {"model": "lowest_price", "destination": "US"})
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _bisect_batch_removal
+# ---------------------------------------------------------------------------
+
+class _FakeOptimizerClient:
+    """Deterministic stand-in for ManaPoolClient.run_optimizer(), for testing
+    _bisect_batch_removal's control flow without any HTTP mocking. penalty_if_absent
+    simulates a card that quietly earns shipping-consolidation credit -- removing it
+    makes every other trial that also lacks it worse, even though its own margin looks bad.
+    """
+    def __init__(self, base_prices, penalty_if_absent=None, fail_names=None):
+        self.base_prices = base_prices
+        self.penalty_if_absent = penalty_if_absent or {}
+        self.fail_names = fail_names or set()
+        self.call_count = 0
+        self.thread_ids: set = set()
+
+    def run_optimizer(self, cart, **kwargs):
+        self.call_count += 1
+        self.thread_ids.add(threading.get_ident())
+        names = [entry["name"] for entry in cart]
+        if any(n in self.fail_names for n in names):
+            raise ManaPoolAPIError("simulated failure")
+        subtotal = sum(self.base_prices.get(n, 1.0) for n in names)
+        penalty = sum(v for k, v in self.penalty_if_absent.items() if k not in names)
+        return {
+            "cart": [{"inventory_id": f"inv-{n}", "quantity_selected": 1} for n in names],
+            "totals": {
+                "subtotal_cents": round(subtotal * 100),
+                "shipping_cents": round(penalty * 100),
+                "buyer_fee_cents": 0,
+                "total_cents": round((subtotal + penalty) * 100),
+            },
+        }
+
+
+def _net_value_accept(trial: CartResult, baseline: CartResult) -> bool:
+    return trial.net_value_usd >= baseline.net_value_usd
+
+
+def _run_kwargs_for_fake():
+    return {"model": "lowest_price", "destination": "US"}
+
+
+def test_bisect_batch_removal_no_candidates_is_a_noop():
+    ci = _cart_item("Lightning Bolt", est_price=1.00, margin=1.00)
+    baseline = _cart_result([ci], total_usd=1.00, net_value_usd=1.00)
+    client = MagicMock()
+    current, result, removed = _bisect_batch_removal(
+        [], [ci], baseline, client, {}, _net_value_accept,
+    )
+    assert current == [ci]
+    assert result is baseline
+    assert removed == []
+    client.run_optimizer.assert_not_called()
+
+
+def test_bisect_batch_removal_validates_each_group_before_merging():
+    """All candidates are unambiguously bad and removing them together improves net
+    value with no interaction effects -- resolves via one round of small-group probing
+    (each item checked standalone) plus one merge-validate call, deliberately never a
+    single blind whole-batch call (see _bisect_batch_removal's docstring: a large batch
+    passing in aggregate doesn't prove every item in it individually deserved removal)."""
+    good = _cart_item("Good Card", est_price=1.00, margin=4.00)  # max_price implied 5.00
+    bad1 = _cart_item("Bad One", est_price=2.00, margin=-1.00)   # max_price implied 1.00
+    bad2 = _cart_item("Bad Two", est_price=2.00, margin=-1.00)
+
+    client = _FakeOptimizerClient(base_prices={"Good Card": 1.00, "Bad One": 2.00, "Bad Two": 2.00})
+    baseline_raw = client.run_optimizer(_build_optimizer_payload([good, bad1, bad2]))
+    from manabot.optimizer import _score
+    baseline_result = _score([good, bad1, bad2], baseline_raw)
+    client.call_count = 0  # don't count the baseline call above against the assertion below
+
+    current, result, removed = _bisect_batch_removal(
+        [bad1, bad2], [good, bad1, bad2], baseline_result, client, _run_kwargs_for_fake(), _net_value_accept,
+    )
+
+    # 2 standalone probes (Bad One alone, Bad Two alone) + 1 merge-validate call.
+    assert client.call_count == 3
+    assert {x.buy_list_item.card_name for x in removed} == {"Bad One", "Bad Two"}
+    assert [x.buy_list_item.card_name for x in current] == ["Good Card"]
+    assert result.net_value_usd > baseline_result.net_value_usd
+
+
+def test_bisect_batch_removal_isolates_shipping_consolidation_item():
+    """Whole-batch removal fails because one candidate (C4) is quietly earning
+    shipping-consolidation credit. Parallel probing should find that C1-C3 are safe to
+    remove together, validate that combination in one merge call, then correctly keep
+    C4 despite its own negative margin -- matching what the old sequential algorithm
+    would conclude, just via batched/parallel calls instead of one-at-a-time."""
+    good = _cart_item("Good Card", est_price=1.00, margin=4.00)  # max_price 5.00
+    c1 = _cart_item("C1", est_price=2.00, margin=-1.00)          # max_price 1.00
+    c2 = _cart_item("C2", est_price=2.00, margin=-1.00)
+    c3 = _cart_item("C3", est_price=2.00, margin=-1.00)
+    c4 = _cart_item("C4", est_price=1.50, margin=-0.50)          # max_price 1.00
+
+    client = _FakeOptimizerClient(
+        base_prices={"Good Card": 1.00, "C1": 2.00, "C2": 2.00, "C3": 2.00, "C4": 1.50},
+        penalty_if_absent={"C4": 5.00},
+    )
+    baseline_raw = client.run_optimizer(_build_optimizer_payload([good, c1, c2, c3, c4]))
+    from manabot.optimizer import _score
+    baseline_result = _score([good, c1, c2, c3, c4], baseline_raw)
+    client.call_count = 0
+
+    current, result, removed = _bisect_batch_removal(
+        [c1, c2, c3, c4], [good, c1, c2, c3, c4], baseline_result,
+        client, _run_kwargs_for_fake(), _net_value_accept,
+    )
+
+    removed_names = {x.buy_list_item.card_name for x in removed}
+    current_names = {x.buy_list_item.card_name for x in current}
+    assert removed_names == {"C1", "C2", "C3"}
+    assert current_names == {"Good Card", "C4"}
+    assert result.net_value_usd > baseline_result.net_value_usd
+    # Sanity: this took meaningfully fewer calls than one-per-candidate would for a
+    # bigger cart, and used more than one thread (the parallel probe actually ran
+    # concurrently, not silently degraded to sequential).
+    assert client.call_count <= 7
+    assert len(client.thread_ids) > 1
+
+
+def test_bisect_batch_removal_all_candidates_stay_when_nothing_helps():
+    """If removing anything (alone or together) makes things worse, everything is kept
+    and nothing is reported as removed."""
+    good = _cart_item("Good Card", est_price=1.00, margin=4.00)
+    c1 = _cart_item("C1", est_price=1.00, margin=4.00)  # actually fine, "candidate" only nominally
+
+    # Any removal increases total (bad) -- simulate via a heavy shared penalty that
+    # applies whenever either item is missing.
+    client = _FakeOptimizerClient(
+        base_prices={"Good Card": 1.00, "C1": 1.00},
+        penalty_if_absent={"Good Card": 10.0, "C1": 10.0},
+    )
+    baseline_raw = client.run_optimizer(_build_optimizer_payload([good, c1]))
+    from manabot.optimizer import _score
+    baseline_result = _score([good, c1], baseline_raw)
+    client.call_count = 0
+
+    current, result, removed = _bisect_batch_removal(
+        [c1], [good, c1], baseline_result, client, _run_kwargs_for_fake(), _net_value_accept,
+    )
+    assert removed == []
+    assert {x.buy_list_item.card_name for x in current} == {"Good Card", "C1"}
+
+
+def test_bisect_batch_removal_treats_api_failure_as_rejection():
+    good = _cart_item("Good Card", est_price=1.00, margin=4.00)
+    flaky = _cart_item("Flaky Card", est_price=2.00, margin=-1.00)
+
+    client = _FakeOptimizerClient(base_prices={"Good Card": 1.00, "Flaky Card": 2.00})
+
+    # Make the only possible trial (removing Flaky) always fail, simulating a
+    # ManaPoolAPIError on that specific combination.
+    def _always_fail(cart, **kwargs):
+        raise ManaPoolAPIError("simulated failure")
+
+    client.run_optimizer = _always_fail
+    baseline = _cart_result([good, flaky], total_usd=3.00, net_value_usd=2.00)
+
+    current, result, removed = _bisect_batch_removal(
+        [flaky], [good, flaky], baseline, client, _run_kwargs_for_fake(), _net_value_accept,
+    )
+    # The only trial possible (removing Flaky) always fails -> treated as rejected, kept.
+    assert removed == []
+    assert {x.buy_list_item.card_name for x in current} == {"Good Card", "Flaky Card"}

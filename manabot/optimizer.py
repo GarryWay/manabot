@@ -19,20 +19,26 @@ Iteration
     3.  If max_cart_usd is set, greedily pre-select the highest-value items that fit
         within that estimated dollar cap (sorted by relative margin rate × qty).
     4.  Run optimizer → baseline result.
-    5.  Iterate up to max_iterations times:
-        a.  If cart total > max_cart_usd: force-remove the worst-margin item to get
-            closer to budget.
-        b.  Else if any negative-margin items remain: try removing the worst; keep
-            removal only if net value improves.
-        c.  Stop when within budget with no negative-margin removal opportunities.
+    5.  Phase 1 (if max_cart_usd set): remove seller packages, worst-gross-margin first,
+        until under budget.
+    6.  Phase 2a: batch-remove every negative-margin item via _bisect_batch_removal —
+        each item is validated standalone in a small parallel group before being
+        merged into the actual removal, never swept out in one blind whole-batch call.
+    7.  Phase 2b: same batch/bisect treatment for whatever's left (positive-margin but
+        marginal items), as its own pass — separate from 2a since mixing profitable
+        items in would make most of 2a's groups fail to improve net value. Neither
+        pass is bounded by max_iterations — batching makes an iteration cap
+        unnecessary here, unlike the one-at-a-time loop this replaced.
 
 Total API calls: 1 (card_id resolution, batched at 100/call) + 1 (baseline)
-                + up to max_iterations (one removal trial each).
+                + Phase 1 removals + Phase 2 (O(n / max_parallel) rounds, not one-per-item)
+                + Phase 3/4 (≤ max_iterations new-seller probes).
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
-from typing import TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from manabot.api.scryfall_bulk import ScryfallBulk
@@ -290,6 +296,139 @@ def _run_single(
     return _score(items, raw)
 
 
+# Higher = smaller, more numerous groups per round (finer-grained per-item validation,
+# since a group only gets merged in after checking out on its own — see
+# _bisect_batch_removal), at the cost of more concurrent requests to ManaPool per round.
+_DEFAULT_MAX_PARALLEL_TRIALS = 8
+
+
+def _try_batch(
+    items_to_remove: list[CartRequestItem],
+    current: list[CartRequestItem],
+    client: ManaPoolClient,
+    run_kwargs: dict,
+) -> CartResult | None:
+    """Run one optimizer trial with `items_to_remove` pulled from `current`.
+
+    Returns None (rather than raising) when the trial fails or removes everything, so
+    callers can treat a failed trial as simply rejected — the same tolerance the
+    sequential Phase 1/2 loops already have for a single bad trial.
+    """
+    remove_ids = {id(x) for x in items_to_remove}
+    trial_set = [x for x in current if id(x) not in remove_ids]
+    if not trial_set:
+        return None
+    try:
+        return _run_single(trial_set, client, **run_kwargs)
+    except ManaPoolAPIError as e:
+        log.debug("Trial removing %d item(s) failed (%s)", len(items_to_remove), e)
+        return None
+
+
+def _chunk(items: list, n: int) -> list[list]:
+    """Split items into up to n roughly-equal, non-empty chunks."""
+    if not items:
+        return []
+    n = max(1, min(n, len(items)))
+    size = -(-len(items) // n)  # ceil division
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def _bisect_batch_removal(
+    candidates: list[CartRequestItem],
+    current: list[CartRequestItem],
+    current_result: CartResult,
+    client: ManaPoolClient,
+    run_kwargs: dict,
+    accept: Callable[[CartResult, CartResult], bool],
+    max_parallel: int = _DEFAULT_MAX_PARALLEL_TRIALS,
+) -> tuple[list[CartRequestItem], CartResult, list[CartRequestItem]]:
+    """Try removing every item in `candidates` from `current`, using small parallel
+    groups rather than one all-or-nothing sweep — so a removal only ever gets committed
+    after it (or a small group containing it) has been checked on its own, not because
+    it happened to ride along in a large batch whose *aggregate* looked fine.
+
+    Deliberately does NOT try removing the whole candidate list in one call: a big
+    batch passing net_value_usd doesn't mean every item in it individually deserved
+    removal — a few genuinely-good items could ride along, their loss masked by
+    everything else in the same batch actually being bad. Smaller groups make that
+    much less likely without going all the way back to one-call-per-item.
+
+    1. Split candidates into up to `max_parallel` groups and fire all of their removal
+       trials at once (ThreadPoolExecutor — these are I/O-bound waits on ManaPool, not
+       CPU work, so real Python threads parallelize them fine). Each group is tested
+       standalone against the *same* current baseline.
+    2. Groups whose standalone removal would be accepted are merged into one "validate
+       the combined removal" call — a single trial removing all of them together, since
+       two groups accepted independently can still interact (e.g. both leaning on the
+       same seller's shipping) in ways a standalone probe can't see. This still only
+       combines groups that already passed their own smaller-granularity check.
+    3. If that combined validation holds up, commit it and recurse only on whatever's
+       left over (re-chunked into smaller groups again next round). If it doesn't hold
+       up, fall back to recursing into every group individually — same guarantee as
+       before, just rarer to hit.
+    4. A group of one candidate is the base case: test it directly, no further chunking.
+
+    A failed API call for any trial counts as a rejected trial rather than raising.
+    Returns (updated current, updated current_result, items actually removed).
+    """
+    if not candidates:
+        return current, current_result, []
+
+    if len(candidates) == 1:
+        whole = _try_batch(candidates, current, client, run_kwargs)
+        if whole is not None and accept(whole, current_result):
+            remove_ids = {id(x) for x in candidates}
+            return [x for x in current if id(x) not in remove_ids], whole, list(candidates)
+        return current, current_result, []
+
+    groups = _chunk(candidates, max_parallel)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(groups)) as pool:
+        futures = [pool.submit(_try_batch, g, current, client, run_kwargs) for g in groups]
+        results = [f.result() for f in futures]
+
+    accepted_mask = [res is not None and accept(res, current_result) for res in results]
+    accepted_groups = [g for g, ok in zip(groups, accepted_mask) if ok]
+    rejected_groups = [g for g, ok in zip(groups, accepted_mask) if not ok]
+
+    if accepted_groups:
+        merged_candidates = [x for g in accepted_groups for x in g]
+        merged = _try_batch(merged_candidates, current, client, run_kwargs)
+        if merged is not None and accept(merged, current_result):
+            remove_ids = {id(x) for x in merged_candidates}
+            new_current = [x for x in current if id(x) not in remove_ids]
+            leftover = [x for g in rejected_groups for x in g]
+            new_current, new_result, more_removed = _bisect_batch_removal(
+                leftover, new_current, merged, client, run_kwargs, accept, max_parallel,
+            )
+            return new_current, new_result, merged_candidates + more_removed
+        # Combined validation didn't hold up despite each group looking fine alone (an
+        # interaction effect) — fall through to the full per-group recursion below,
+        # since the baseline may shift as groups get applied and stale probe results
+        # can no longer be trusted.
+        removed_all: list[CartRequestItem] = []
+        for g in groups:
+            current, current_result, removed = _bisect_batch_removal(
+                g, current, current_result, client, run_kwargs, accept, max_parallel,
+            )
+            removed_all.extend(removed)
+        return current, current_result, removed_all
+
+    # Nothing was accepted in the probe, so the baseline hasn't moved — a rejected
+    # single-item group's result is still valid, no need to re-test it. Only groups
+    # with more than one item need recursing into (to find a smaller sub-batch that
+    # might still work within them).
+    removed_all = []
+    for g in groups:
+        if len(g) == 1:
+            continue
+        current, current_result, removed = _bisect_batch_removal(
+            g, current, current_result, client, run_kwargs, accept, max_parallel,
+        )
+        removed_all.extend(removed)
+    return current, current_result, removed_all
+
+
 def find_best_cart(
     match_results: list[MatchResult],
     client: ManaPoolClient,
@@ -304,6 +443,7 @@ def find_best_cart(
     target_cart_usd: float | None = None,
     expansion_pool: list[CartRequestItem] | None = None,
     forced_card_names: frozenset[str] | None = None,
+    max_parallel: int = _DEFAULT_MAX_PARALLEL_TRIALS,
 ) -> CartResult | None:
     """Find the cart configuration that maximizes net value.
 
@@ -321,6 +461,11 @@ def find_best_cart(
                            Phase 2, and are re-added if their seller's package is
                            dropped in Phase 1 (the optimizer sources them elsewhere).
                            Their cost still counts toward max_cart_usd.
+        max_parallel:      Phase 2's group size knob (see _bisect_batch_removal) —
+                           higher means smaller, more numerous groups per round (each
+                           validated standalone before merging) at the cost of more
+                           concurrent calls per round. Set >= the candidate count to
+                           make every group size 1 (no batching at all, still parallel).
 
     Iteration
     ---------
@@ -330,7 +475,11 @@ def find_best_cart(
             is None and max_cart_usd is set, defaults to max_cart_usd × 0.80.
         3.  Run optimizer → baseline result.
         4.  Phase 1: If cart total > max_cart_usd, remove worst-margin seller packages.
-        5.  Phase 2: Remove negative-margin items up to max_iterations times.
+        5.  Phase 2a: batch-remove negative-margin items via _bisect_batch_removal —
+            small parallel groups validated standalone before merging, not one blind
+            whole-batch call. Phase 2b: same treatment for whatever's left
+            (positive-margin but marginal items), as a separate pass. Neither is
+            bounded by max_iterations.
         6.  Phase 3 (when expansion pool exists): add free-rider cards from sellers
             already in the cart — their shipping is already paid.
         7.  Phase 4 (when expansion pool exists): try the best-margin card from each
@@ -340,7 +489,7 @@ def find_best_cart(
     (e.g. when the caller has already done greedy budget packing for arbitrage).
 
     Total API calls: 1-2 (card_id resolution, batched at 100/call) + 1 (baseline)
-                    + Phase 1 removals + Phase 2 (≤ max_iterations)
+                    + Phase 1 removals + Phase 2 (O(log n) typical, not one-per-item)
                     + Phase 3 free riders + Phase 4 (≤ max_iterations new-seller probes).
     """
     _run_expansion = target_cart_usd is not None or expansion_pool is not None
@@ -554,54 +703,59 @@ def find_best_cart(
         else:
             log.warning("Budget enforcement loop exhausted without reaching cap.")
 
-    # Phase 2: Value optimization — remove negative-margin items up to max_iterations.
-    # Forced items are never removed regardless of their margin.
-    for iteration in range(max_iterations):
-        candidates = [x for x in current if id(x) not in locked and x.buy_list_item.card_name not in forced_names]
+    # Phase 2: Value optimization, batched — replaces the old one-at-a-time removal
+    # loop with _bisect_batch_removal, run in two passes:
+    #   2a. Negative-margin candidates only. Batching a *homogeneous* "these all look
+    #       bad" set means the very first whole-batch trial usually succeeds outright
+    #       (1 call resolves all of them), since removing genuinely unprofitable items
+    #       together almost always helps net value.
+    #   2b. Whatever's left (positive-margin but marginal items) gets the same
+    #       batch/bisect treatment, just as its own pass — mixing profitable items into
+    #       2a's batch would make that first whole-batch trial fail almost every time
+    #       (removing a profitable item on top of the bad ones is rarely a net win),
+    #       forcing unnecessary bisection. Keeping them separate lets 2a's common case
+    #       stay fast while 2b still gets parallel probing instead of the old
+    #       one-call-per-item loop.
+    # Neither pass is bounded by max_iterations — batching removes the need for an
+    # iteration cap here; max_iterations still bounds Phase 4's new-seller trials below.
+    def _phase2_accept(trial: CartResult, baseline: CartResult) -> bool:
+        return trial.net_value_usd >= baseline.net_value_usd
+
+    def _run_phase2_pass(label: str, candidates: list[CartRequestItem]) -> None:
+        nonlocal current, current_result, best
         if not candidates:
-            break
-
-        worst = min(candidates, key=lambda x: x.estimated_margin / x.estimated_price)
-        trial_set = [x for x in current if x is not worst]
-        if not trial_set:
-            locked.add(id(worst))
-            continue
-
-        try:
-            trial = _run_single(trial_set, client, **_run_kwargs)
-        except ManaPoolAPIError as e:
-            # A single failed trial shouldn't crash the whole run — treat it like a
-            # rejected trial and keep going with the next-worst candidate.
-            log.warning(
-                "Trial removing %r failed (%s) — keeping it, locking it",
-                worst.buy_list_item.card_name, e,
-            )
-            locked.add(id(worst))
-            continue
-        log.debug(
-            "Opt iteration %d: without %r ($%+.2f margin) → total $%.2f, net $%+.2f",
-            iteration + 1, worst.buy_list_item.card_name, worst.estimated_margin,
-            trial.total_usd, trial.net_value_usd,
+            return
+        current, current_result, removed = _bisect_batch_removal(
+            candidates, current, current_result, client, _run_kwargs, _phase2_accept, max_parallel,
         )
+        if removed:
+            log.info(
+                "%s: removed %d item(s) — net value now $%+.2f",
+                label, len(removed), current_result.net_value_usd,
+            )
+            if _is_better(current_result, best, max_cart_usd):
+                best = current_result
+        removed_ids = {id(x) for x in removed}
+        kept = [x for x in candidates if id(x) not in removed_ids]
+        if kept:
+            log.info(
+                "%s: kept %d item(s) — net value doesn't improve by removing them "
+                "(shipping consolidation or already profitable)",
+                label, len(kept),
+            )
+            locked.update(id(x) for x in kept)
 
-        if trial.net_value_usd >= current_result.net_value_usd:
-            log.info(
-                "Removed %r (margin $%+.2f) — net value %s ($%.2f → $%.2f)",
-                worst.buy_list_item.card_name, worst.estimated_margin,
-                "improved" if trial.net_value_usd > current_result.net_value_usd else "unchanged",
-                current_result.net_value_usd, trial.net_value_usd,
-            )
-            current = trial_set
-            current_result = trial
-            if _is_better(trial, best, max_cart_usd):
-                best = trial
-        else:
-            log.info(
-                "Kept %r — shipping consolidation worth $%.2f",
-                worst.buy_list_item.card_name,
-                current_result.net_value_usd - trial.net_value_usd,
-            )
-            locked.add(id(worst))
+    negative_candidates = [
+        x for x in current
+        if id(x) not in locked and x.buy_list_item.card_name not in forced_names
+        and x.estimated_margin < 0
+    ]
+    _run_phase2_pass("Phase 2a", negative_candidates)
+
+    marginal_candidates = [
+        x for x in current if id(x) not in locked and x.buy_list_item.card_name not in forced_names
+    ]
+    _run_phase2_pass("Phase 2b", marginal_candidates)
 
     # Phase 3: Free-rider expansion — add cards from sellers already in the cart.
     # Their shipping is already paid so any positive-margin card from that seller
