@@ -6,7 +6,7 @@ Commands
 /optimize         Run the ManaPool optimizer and show the best cart
 /arbitrage        Find listings trading below market value
 /add-card         Add a single card to the buy list (tagged with your username + Discord ID)
-/add-cards        Add multiple cards at once via a multi-line form popup (one per line, CSV format)
+/add-cards        Add multiple cards at once via a multi-line form popup (one per line: name;qty;price)
 /buylist          Display the current buy list, with optional tag filter (e.g. user:Garrett)
 /mark-purchased   Remove purchased cards; pings the Discord user who added each card
 /remove-card      Remove a buy list entry you added (force=True to remove any entry)
@@ -383,7 +383,14 @@ def _add_cards_sync(path: Path, cards_text: str, username: str, uid: int) -> tup
     """Parse and append each line of a bulk /add-cards submission. Runs in a worker
     thread (asyncio.to_thread) — each append_to_buylist call is its own blocking
     file open/read/write, and looping that directly on the event loop can stall
-    other users' interactions long enough to make Discord expire them."""
+    other users' interactions long enough to make Discord expire them.
+
+    Fields are semicolon-delimited (name;qty;price[;condition[;set[;foil]]]), not
+    comma-delimited — plenty of real card names contain a comma as part of the name
+    itself (e.g. "Muldrotha, the Gravetide"), which would otherwise get shredded into
+    extra fields by a plain comma split. Semicolons essentially never appear in a
+    card name, so they're unambiguous here.
+    """
     from manabot.buylist import append_to_buylist
 
     added: list[str] = []
@@ -394,12 +401,12 @@ def _add_cards_sync(path: Path, cards_text: str, username: str, uid: int) -> tup
         if not line or line.startswith("#"):
             continue
         try:
-            parts = [p.strip() for p in next(csv.reader([line]))]
+            parts = [p.strip() for p in next(csv.reader([line], delimiter=";"))]
         except Exception:
             errors.append(f"Line {line_num}: could not parse — got: {line!r}")
             continue
         if len(parts) < 3:
-            errors.append(f"Line {line_num}: need name,qty,price — got: {line!r}")
+            errors.append(f"Line {line_num}: need name;qty;price — got: {line!r}")
             continue
         card_name = parts[0]
         if not card_name:
@@ -806,9 +813,9 @@ def create_bot(config: Config) -> _ManabotClient:
 
     class AddCardsModal(discord.ui.Modal, title="Add Multiple Cards"):
         cards_input = discord.ui.TextInput(
-            label="Cards — one per line",
+            label="Cards — one per line (name;qty;price)",
             style=discord.TextStyle.paragraph,
-            placeholder="Lightning Bolt,4,1.50,LP\nCounterspell,2,2.00\nSol Ring,1,5.00",
+            placeholder="Lightning Bolt;4;1.50;LP\nMuldrotha, the Gravetide;1;8.00\nSol Ring;1;5.00",
             required=True,
             max_length=4000,
         )
@@ -838,7 +845,7 @@ def create_bot(config: Config) -> _ManabotClient:
 
     @tree.command(
         name="add-cards",
-        description="Add multiple cards to the buy list via a multi-line form (one per line)",
+        description="Add multiple cards to the buy list via a multi-line form: name;qty;price[;condition[;set[;foil]]]",
     )
     async def cmd_add_cards(interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(AddCardsModal())
