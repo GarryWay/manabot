@@ -6,7 +6,7 @@ Commands
 /optimize         Run the ManaPool optimizer and show the best cart
 /arbitrage        Find listings trading below market value
 /add-card         Add a single card to the buy list (tagged with your username + Discord ID)
-/add-cards        Add multiple cards at once (one per line, CSV format)
+/add-cards        Add multiple cards at once via a multi-line form popup (one per line, CSV format)
 /buylist          Display the current buy list, with optional tag filter (e.g. user:Garrett)
 /mark-purchased   Remove purchased cards; pings the Discord user who added each card
 /remove-card      Remove a buy list entry you added (force=True to remove any entry)
@@ -795,35 +795,53 @@ def create_bot(config: Config) -> _ManabotClient:
         )
 
     # ── /add-cards ────────────────────────────────────────────────────────────
+    #
+    # A plain slash-command string option renders as a single-line field in every
+    # Discord client — there's no way to type a newline into it, which makes "one
+    # card per line" input impossible to paste. A Modal's TextInput, set to the
+    # paragraph style, renders as a real multi-line textarea instead. The tradeoff:
+    # modal text inputs cap at 4000 characters (Discord's hard limit), smaller than
+    # what a command string option could technically hold — plenty for a normal bulk
+    # add, but a genuinely huge paste may need splitting across two /add-cards calls.
+
+    class AddCardsModal(discord.ui.Modal, title="Add Multiple Cards"):
+        cards_input = discord.ui.TextInput(
+            label="Cards — one per line",
+            style=discord.TextStyle.paragraph,
+            placeholder="Lightning Bolt,4,1.50,LP\nCounterspell,2,2.00\nSol Ring,1,5.00",
+            required=True,
+            max_length=4000,
+        )
+
+        async def on_submit(self, interaction: discord.Interaction) -> None:
+            await interaction.response.defer()
+
+            username = interaction.user.display_name
+            try:
+                added, errors = await asyncio.to_thread(
+                    _add_cards_sync, bot.config.buylist_path, self.cards_input.value,
+                    username, interaction.user.id,
+                )
+            except Exception as e:
+                log.exception("add-cards error")
+                await interaction.followup.send(f"Error adding cards: {e}", ephemeral=True)
+                return
+
+            parts_msg: list[str] = []
+            if added:
+                parts_msg.append(f"Added {len(added)} card(s):\n" + "\n".join(f"  • {a}" for a in added))
+            if errors:
+                parts_msg.append(f"{len(errors)} error(s):\n" + "\n".join(f"  ✗ {e}" for e in errors))
+
+            msg = "\n\n".join(parts_msg) or "Nothing to add."
+            await interaction.followup.send(msg[:2000])
 
     @tree.command(
         name="add-cards",
-        description="Add multiple cards to the buy list — one per line: name,qty,price[,condition[,set[,foil]]]",
+        description="Add multiple cards to the buy list via a multi-line form (one per line)",
     )
-    @app_commands.describe(
-        cards="Each line: card_name,quantity,max_price[,condition[,set_code[,foil]]]\nExample: Lightning Bolt,4,1.50,LP"
-    )
-    async def cmd_add_cards(interaction: discord.Interaction, cards: str) -> None:
-        await interaction.response.defer()
-
-        username = interaction.user.display_name
-        try:
-            added, errors = await asyncio.to_thread(
-                _add_cards_sync, bot.config.buylist_path, cards, username, interaction.user.id
-            )
-        except Exception as e:
-            log.exception("add-cards error")
-            await interaction.followup.send(f"Error adding cards: {e}", ephemeral=True)
-            return
-
-        parts_msg: list[str] = []
-        if added:
-            parts_msg.append(f"Added {len(added)} card(s):\n" + "\n".join(f"  • {a}" for a in added))
-        if errors:
-            parts_msg.append(f"{len(errors)} error(s):\n" + "\n".join(f"  ✗ {e}" for e in errors))
-
-        msg = "\n\n".join(parts_msg) or "Nothing to add."
-        await interaction.followup.send(msg[:2000])
+    async def cmd_add_cards(interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(AddCardsModal())
 
     # ── /buylist ──────────────────────────────────────────────────────────────
 

@@ -140,7 +140,7 @@ Or via `setup_bot.py` — it registers a startup service automatically (systemd 
 | Command | Parameters | Description |
 |---------|-----------|-------------|
 | `/add-card` | `card_name`, `quantity`, `max_price`, `condition`, `set_code`, `foil` | Add a single card — automatically tagged with your username and Discord ID |
-| `/add-cards` | `cards` (multi-line) | Add multiple cards at once; one per line in CSV format: `name,qty,price[,condition[,set[,foil]]]` |
+| `/add-cards` | — (opens a multi-line form popup) | Add multiple cards at once; one per line in CSV format: `name,qty,price[,condition[,set[,foil]]]` |
 | `/buylist` | `tag` (optional) | Show the current buy list; filter by tag to see only your cards (e.g. `user:Garrett`) |
 | `/remove-card` | `card_name`, `force` | Remove an entry you added; `force=True` lets you remove anyone's entry |
 | `/edit-card` | `card_name`, `quantity`, `max_price`, `condition`, `set_code`, `foil`, `force` | Edit an existing entry — quantity, price, condition, or set restriction |
