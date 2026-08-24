@@ -56,6 +56,7 @@ def schedule_daily_price_update(config: Config) -> None:
             log.exception("Price update job failed")
 
         try:
+            log.info("Buy list coalesce starting (%s)...", config.buylist_path)
             merges = coalesce_buylist(config.buylist_path)
             if merges:
                 log.info(
@@ -63,6 +64,8 @@ def schedule_daily_price_update(config: Config) -> None:
                     len(merges),
                     ", ".join(f"{m['card_name']} ({m['rows_merged']}x rows -> {m['target_quantity']}x)" for m in merges),
                 )
+            else:
+                log.info("Buy list coalesce: no duplicate rows found.")
         except Exception:
             log.exception("Buy list coalesce job failed")
 
