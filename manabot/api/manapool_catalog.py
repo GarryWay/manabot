@@ -156,8 +156,15 @@ def build_variant_index(records: list[dict]) -> dict[VariantKey, CatalogVariant]
 def build_name_index(records: list[dict]) -> dict[tuple[str, str], dict]:
     """Index records by (set_code, name) for same-set name lookups.
 
-    When multiple records share the same set+name (shouldn't happen but defensive),
-    the one with the highest market price is kept.
+    Multiple records legitimately share the same (set_code, name) whenever a token
+    sheet reuses one generic name across several distinct printings — e.g. an
+    "Edge of Eternities Tokens" set can have five different "Lander" products (one
+    per collector number) that all display as plain "Lander". This index picks
+    whichever one has the highest market price and discards the rest, which is fine
+    for a simple "does this name exist in this set" check but is NOT safe for
+    resolving which specific printing a double-sided token's face refers to — use
+    build_number_index() for that instead, keyed by the token's own compound
+    collector number (see SellerListing.number), which IS unique per printing.
     """
     index: dict[tuple[str, str], dict] = {}
     for record in records:
@@ -171,6 +178,22 @@ def build_name_index(records: list[dict]) -> dict[tuple[str, str], dict]:
             old_mkt = existing.get("price_market") or 0
             if new_mkt > old_mkt:
                 index[key] = record
+    return index
+
+
+def build_number_index(records: list[dict]) -> dict[tuple[str, str], dict]:
+    """Index records by (set_code, collector_number) — unlike name, a collector
+    number is unique per printing within a set, so this correctly disambiguates
+    token-sheet names that get reused across several distinct products (see
+    build_name_index's docstring). Records with no number are skipped.
+    """
+    index: dict[tuple[str, str], dict] = {}
+    for record in records:
+        number = record.get("number")
+        if not number:
+            continue
+        key = (str(record.get("set_code", "")).upper(), str(number))
+        index[key] = record
     return index
 
 

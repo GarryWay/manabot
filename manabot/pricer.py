@@ -351,6 +351,7 @@ def apply_double_sided_upgrades(
     pricing_config: PricingConfig,
     client: "ManaPoolClient",
     dry_run: bool = False,
+    number_index: "dict[tuple[str, str], dict] | None" = None,
 ) -> list[DoubleSidedUpgrade]:
     """For each double-sided token listing, treat DFT + each face as three alternatives
     and pick the one with the highest suggested list price (computed by the same pricing
@@ -359,6 +360,17 @@ def apply_double_sided_upgrades(
     Multiple DFT listings that target the same single-sided face are batched together:
     all are deleted and their quantities summed into one create or quantity update so
     inventory counts remain accurate.
+
+    Resolving each face to the correct catalog record: a token sheet often reuses one
+    generic name (e.g. "Lander") across several distinct printings that pair with
+    different fronts — name alone can't tell them apart, and the DFT listing's own
+    `scryfall_id` is no help either (ManaPool sets it to the FRONT face's own id, not
+    anything identifying the pairing). What IS unique per pairing is the listing's
+    compound collector `number` (e.g. "2-7" — confirmed live: the two halves are the
+    two faces' own numbers in ascending order, not front-then-back, so don't assume
+    position). When present, number_index resolves each half independently and exactly;
+    this is preferred whenever available. Falls back to name_index (which can pick an
+    arbitrary printing when the name is reused) only when no usable number is present.
     """
     from collections import defaultdict
 
@@ -396,6 +408,8 @@ def apply_double_sided_upgrades(
         )
         return rec.new_price_usd
 
+    number_index = number_index or {}
+
     # Phase 1: identify all upgrades — no API calls yet
     upgrades: list[DoubleSidedUpgrade] = []
     for listing in inventory:
@@ -417,21 +431,41 @@ def apply_double_sided_upgrades(
             current_price=listing.price_usd,
         )
 
+        # Resolve each face to its exact catalog record — see the compound-number
+        # explanation in the docstring above. number_parts holds both halves in
+        # whatever order ManaPool returned them; each is looked up independently, so
+        # order never matters. Track (face_name, record) explicitly rather than
+        # trusting the record to carry its own "name" — the number-based lookup
+        # doesn't know the name in advance so must read it from the record, but the
+        # name-based fallback already knows it from the lookup key itself.
+        number_parts = [n.strip() for n in listing.number.split("-")] if listing.number else []
+        face_records: list[tuple[str, dict]] = []
+        if len(number_parts) == 2 and all(number_parts):
+            for n in number_parts:
+                record = number_index.get((listing.set_code, n))
+                if record is not None:
+                    face_records.append((record.get("name", ""), record))
+        if not face_records:
+            # No usable compound number (older/incomplete listing data) — fall back to
+            # same-name lookup, which can pick an arbitrary printing if this set reuses
+            # the name across several products.
+            for face in faces:
+                record = name_index.get((listing.set_code, face))
+                if record is not None:
+                    face_records.append((face, record))
+
         best_scryfall_id: Optional[str] = None
         best_face_name: Optional[str] = None
         best_face_suggested = 0.0
 
-        for face in faces:
-            single_record = name_index.get((listing.set_code, face))
-            if single_record is None:
-                continue
+        for face_name, single_record in face_records:
             face_scryfall_id = single_record.get("scryfall_id")
             if face_scryfall_id == listing.scryfall_id:
                 continue
-            face_suggested = _suggested_price(face_scryfall_id or "", face, single_record, is_foil)
+            face_suggested = _suggested_price(face_scryfall_id or "", face_name, single_record, is_foil)
             if face_suggested > best_face_suggested:
                 best_face_suggested = face_suggested
-                best_face_name = face
+                best_face_name = face_name
                 best_scryfall_id = face_scryfall_id
 
         if best_scryfall_id is None or best_face_suggested <= dft_suggested:
@@ -475,10 +509,12 @@ def apply_double_sided_upgrades(
             existing = existing_by_key.get((scryfall_id, condition, finish, language))
 
             deleted_qty = 0
+            deleted: list[DoubleSidedUpgrade] = []
             for u in group:
                 try:
                     client.delete_seller_listing(u.listing)
                     deleted_qty += u.listing.quantity
+                    deleted.append(u)
                 except Exception:
                     log.exception(
                         "Failed to delete DFT '%s' [%s] id=%s — skipping its quantity",
@@ -512,12 +548,32 @@ def apply_double_sided_upgrades(
                         deleted_qty, face_price, len(group),
                     )
             except Exception:
-                log.exception(
-                    "LISTING LOST: deleted DFT(s) for '%s' [%s] but failed to create/update"
-                    " '%s' — manual recovery needed (%d qty)",
-                    group[0].listing.card_name, group[0].listing.set_code,
-                    face_name, deleted_qty,
+                # delete_seller_listing() isn't a true delete — ManaPool has no DELETE
+                # endpoint, so it's a PUT that zeroes price/quantity. That means the
+                # "deleted" DFT listing(s) can be restored by the exact same PUT call,
+                # just with their original price/quantity — no guessing at a recovery
+                # endpoint required. Restore each one individually so a partial failure
+                # here doesn't compound the loss.
+                log.error(
+                    "Failed to create/update '%s' [%s] after deleting %d DFT listing(s) for "
+                    "'%s' — restoring the original listing(s) instead of losing the stock",
+                    face_name, group[0].listing.set_code, len(deleted), group[0].listing.card_name,
                 )
+                for u in deleted:
+                    try:
+                        client.update_seller_listing_price(u.listing, u.listing.price_usd, u.listing.quantity)
+                        log.info(
+                            "Restored '%s' [%s] id=%s to qty=%d $%.2f",
+                            u.listing.card_name, u.listing.set_code, u.listing.inventory_id,
+                            u.listing.quantity, u.listing.price_usd,
+                        )
+                    except Exception:
+                        log.exception(
+                            "LISTING LOST: could not restore '%s' [%s] id=%s after failed "
+                            "relist to '%s' — manual recovery needed (%d qty at $%.2f)",
+                            u.listing.card_name, u.listing.set_code, u.listing.inventory_id,
+                            face_name, u.listing.quantity, u.listing.price_usd,
+                        )
 
     log.info(
         "Double-sided token check: %d upgrade(s) → %d unique target(s)%s",
@@ -535,7 +591,7 @@ def run_pricing_update(
     dry_run: bool = False,
 ) -> list[PriceRecommendation]:
     """Load catalog, fetch seller inventory, compute + apply price updates."""
-    from manabot.api.manapool_catalog import build_name_index, build_variant_index, load_catalog
+    from manabot.api.manapool_catalog import build_name_index, build_number_index, build_variant_index, load_catalog
     from manabot.api.tcgtracking import TCGTrackingClient
     from manabot.db import (
         get_cost_basis, get_days_below_floor, get_last_sales_sync,
@@ -580,8 +636,10 @@ def run_pricing_update(
     log.info("Catalog indexed: %d variants", len(variant_index))
 
     name_index = build_name_index(records)
+    number_index = build_number_index(records)
     upgrades = apply_double_sided_upgrades(
         our_inventory, name_index, variant_index, pricing_config, client, dry_run=dry_run,
+        number_index=number_index,
     )
     # Remove relisted listings from the pricing loop — they no longer exist on ManaPool
     if not dry_run and upgrades:

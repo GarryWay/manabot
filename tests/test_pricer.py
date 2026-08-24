@@ -345,6 +345,7 @@ def _seller_listing(
     finish: Finish = Finish.NONFOIL,
     price_usd: float = 0.25,
     quantity: int = 4,
+    number: str = "",
 ) -> SellerListing:
     return SellerListing(
         inventory_id=inventory_id,
@@ -357,6 +358,7 @@ def _seller_listing(
         language="EN",
         quantity=quantity,
         price_usd=price_usd,
+        number=number,
     )
 
 
@@ -516,3 +518,266 @@ def test_mdfc_spell_skipped_not_a_token():
     upgrades = apply_double_sided_upgrades(inventory, name_index, {}, PricingConfig(), client, dry_run=True)
     assert len(upgrades) == 0
     client.delete_seller_listing.assert_not_called()
+
+
+def test_double_sided_upgrade_restores_listing_when_create_fails():
+    """Regression: production hit an HTTP 405 creating the single-sided listing after
+    the DFT was already deleted, silently losing the stock ('LISTING LOST'). Since
+    delete_seller_listing() is just a PUT that zeroes price/quantity (ManaPool has no
+    real DELETE endpoint), a failed create must restore the original DFT listing via
+    that same PUT mechanism rather than leaving the stock gone."""
+    listing = _seller_listing(
+        "Faerie Rogue // Thopter", "TBFZ",
+        scryfall_id="dft-123", inventory_id="inv-abc",
+        quantity=3, price_usd=0.20,
+    )
+    name_index = {
+        ("TBFZ", "Faerie Rogue // Thopter"): {
+            "scryfall_id": "dft-123", "price_market": 20, "price_market_foil": None,
+            "variants": _TOKEN_VARIANT,
+        },
+        ("TBFZ", "Faerie Rogue"): {
+            "scryfall_id": "single-456", "price_market": 120, "price_market_foil": None,
+            "variants": _TOKEN_VARIANT,
+        },
+    }
+    client = MagicMock()
+    client.create_seller_listing.side_effect = Exception("HTTP 405 Method Not Allowed")
+
+    upgrades = apply_double_sided_upgrades([listing], name_index, {}, PricingConfig(), client, dry_run=False)
+
+    assert len(upgrades) == 1
+    client.delete_seller_listing.assert_called_once_with(listing)
+    client.create_seller_listing.assert_called_once()
+    # Restore call puts the DFT listing back at its original price/quantity, not lost.
+    client.update_seller_listing_price.assert_called_once_with(listing, listing.price_usd, listing.quantity)
+
+
+def test_double_sided_upgrade_logs_manual_recovery_when_restore_also_fails():
+    """If even the restore PUT fails, the listing really is unrecoverable automatically
+    -- must not raise (would crash the whole pricing run over one card) and must not
+    claim success; the 'manual recovery' log path is the last resort, not the default."""
+    listing = _seller_listing(
+        "Faerie Rogue // Thopter", "TBFZ",
+        scryfall_id="dft-123", inventory_id="inv-abc",
+        quantity=3, price_usd=0.20,
+    )
+    name_index = {
+        ("TBFZ", "Faerie Rogue // Thopter"): {
+            "scryfall_id": "dft-123", "price_market": 20, "price_market_foil": None,
+            "variants": _TOKEN_VARIANT,
+        },
+        ("TBFZ", "Faerie Rogue"): {
+            "scryfall_id": "single-456", "price_market": 120, "price_market_foil": None,
+            "variants": _TOKEN_VARIANT,
+        },
+    }
+    client = MagicMock()
+    client.create_seller_listing.side_effect = Exception("HTTP 405 Method Not Allowed")
+    client.update_seller_listing_price.side_effect = Exception("restore also failed")
+
+    # Must not raise -- one card's total failure shouldn't kill the whole pricing run.
+    upgrades = apply_double_sided_upgrades([listing], name_index, {}, PricingConfig(), client, dry_run=False)
+    assert len(upgrades) == 1
+    client.update_seller_listing_price.assert_called_once_with(listing, listing.price_usd, listing.quantity)
+
+
+def test_double_sided_upgrade_restores_all_merged_dfts_on_update_failure():
+    """When multiple DFT listings consolidate into one target and the final
+    update_seller_listing_price (merging into an existing target listing) fails, every
+    deleted DFT in the group must be restored, not just one."""
+    listing_a = _seller_listing(
+        "Faerie Rogue // Thopter", "TBFZ", scryfall_id="dft-123",
+        inventory_id="inv-a", product_id="prod-a", quantity=2, price_usd=0.20,
+    )
+    listing_b = _seller_listing(
+        "Faerie Rogue // Thopter", "TBFZ", scryfall_id="dft-123",
+        inventory_id="inv-b", product_id="prod-b", quantity=5, price_usd=0.18,
+    )
+    existing_target = _seller_listing(
+        "Faerie Rogue", "TBFZ", scryfall_id="single-456",
+        inventory_id="inv-existing", product_id="prod-existing", quantity=10, price_usd=1.00,
+    )
+    name_index = {
+        ("TBFZ", "Faerie Rogue // Thopter"): {
+            "scryfall_id": "dft-123", "price_market": 20, "price_market_foil": None,
+            "variants": _TOKEN_VARIANT,
+        },
+        ("TBFZ", "Faerie Rogue"): {
+            "scryfall_id": "single-456", "price_market": 120, "price_market_foil": None,
+            "variants": _TOKEN_VARIANT,
+        },
+    }
+    client = MagicMock()
+
+    def _update_side_effect(target_listing, price, qty):
+        if target_listing is existing_target:
+            raise Exception("HTTP 500")
+        return None  # deletes (also update_seller_listing_price under the hood) succeed
+
+    client.update_seller_listing_price.side_effect = _update_side_effect
+
+    upgrades = apply_double_sided_upgrades(
+        [listing_a, listing_b, existing_target], name_index, {}, PricingConfig(), client, dry_run=False,
+    )
+
+    assert len(upgrades) == 2
+    # Both DFTs restored to their own original price/quantity.
+    restore_calls = [
+        c for c in client.update_seller_listing_price.call_args_list
+        if c.args[0] is listing_a or c.args[0] is listing_b
+    ]
+    restored_ids = {id(c.args[0]) for c in restore_calls}
+    assert restored_ids == {id(listing_a), id(listing_b)}
+    for c in restore_calls:
+        listing_arg = c.args[0]
+        assert c.args[1] == listing_arg.price_usd
+        assert c.args[2] == listing_arg.quantity
+
+
+# ---------------------------------------------------------------------------
+# Double-sided upgrade: reused token-sheet names (compound collector numbers)
+#
+# Regression for a real production incident: a token sheet ("Edge of Eternities
+# Tokens") reuses the generic name "Lander" across five distinct printings (numbers
+# 4/5/6/7/8), each pairing with different front faces. build_name_index() collapses
+# same-name records to one arbitrary "winner", so every "* // Lander" DFT listing was
+# resolving to the SAME wrong scryfall_id regardless of which Lander it actually
+# printed with -- multiple unrelated DFTs got merged into one target_group, and the
+# reported quantity (deleted_qty, summed across the whole wrongly-merged group) didn't
+# match any single card the seller could point to. The DFT listing's own scryfall_id
+# is no help either -- ManaPool sets it to the FRONT face's own id, carrying no
+# information about which back face it's paired with. The fix: use the listing's
+# compound `number` field (e.g. "2-7") to resolve each face via number_index instead
+# -- collector numbers ARE unique per printing, unlike name.
+# ---------------------------------------------------------------------------
+
+def _lander_number_index():
+    """Five distinct 'Lander' printings sharing one name, real TEOE numbers/scryfall_ids."""
+    return {
+        ("TEOE", "4"): {"name": "Lander", "scryfall_id": "lander-4", "price_market": 40, "price_market_foil": None, "variants": _TOKEN_VARIANT},
+        ("TEOE", "5"): {"name": "Lander", "scryfall_id": "lander-5", "price_market": 50, "price_market_foil": None, "variants": _TOKEN_VARIANT},
+        ("TEOE", "6"): {"name": "Lander", "scryfall_id": "lander-6", "price_market": 60, "price_market_foil": None, "variants": _TOKEN_VARIANT},
+        ("TEOE", "7"): {"name": "Lander", "scryfall_id": "lander-7", "price_market": 70, "price_market_foil": None, "variants": _TOKEN_VARIANT},
+        ("TEOE", "8"): {"name": "Lander", "scryfall_id": "lander-8", "price_market": 80, "price_market_foil": None, "variants": _TOKEN_VARIANT},
+        ("TEOE", "2"): {"name": "Human Soldier", "scryfall_id": "human-soldier-2", "price_market": 5, "price_market_foil": None, "variants": _TOKEN_VARIANT},
+        ("TEOE", "10"): {"name": "Robot", "scryfall_id": "robot-10", "price_market": 5, "price_market_foil": None, "variants": _TOKEN_VARIANT},
+    }
+
+
+def _lander_name_index_bug():
+    """What build_name_index() actually produces for this data: one arbitrary
+    'winner' per name (highest market price -- Lander #8 here), discarding the rest.
+    Used to prove the fallback path alone reproduces the bug; number_index fixes it."""
+    return {
+        ("TEOE", "Lander"): {"name": "Lander", "scryfall_id": "lander-8", "price_market": 80, "price_market_foil": None, "variants": _TOKEN_VARIANT},
+        ("TEOE", "Human Soldier"): {"name": "Human Soldier", "scryfall_id": "human-soldier-2", "price_market": 5, "price_market_foil": None, "variants": _TOKEN_VARIANT},
+        ("TEOE", "Robot"): {"name": "Robot", "scryfall_id": "robot-10", "price_market": 5, "price_market_foil": None, "variants": _TOKEN_VARIANT},
+    }
+
+
+def test_double_sided_upgrade_resolves_correct_printing_via_compound_number():
+    """Three distinct 'Human Soldier // Lander' printings (numbers 2-4, 2-7, 2-8) all
+    share the same (front-face) scryfall_id -- number_index must resolve each to its
+    own distinct Lander, not collapse them to one."""
+    listing_2_4 = _seller_listing(
+        "Human Soldier // Lander", "TEOE", scryfall_id="human-soldier-2",
+        inventory_id="inv-2-4", product_id="prod-2-4", number="2-4", quantity=1, price_usd=0.15,
+    )
+    listing_2_7 = _seller_listing(
+        "Human Soldier // Lander", "TEOE", scryfall_id="human-soldier-2",
+        inventory_id="inv-2-7", product_id="prod-2-7", number="2-7", quantity=2, price_usd=0.15,
+    )
+    listing_2_8 = _seller_listing(
+        "Human Soldier // Lander", "TEOE", scryfall_id="human-soldier-2",
+        inventory_id="inv-2-8", product_id="prod-2-8", number="2-8", quantity=1, price_usd=0.15,
+    )
+    client = MagicMock()
+    upgrades = apply_double_sided_upgrades(
+        [listing_2_4, listing_2_7, listing_2_8],
+        _lander_name_index_bug(), {}, PricingConfig(), client, dry_run=True,
+        number_index=_lander_number_index(),
+    )
+
+    assert len(upgrades) == 3
+    by_inventory_id = {u.listing.inventory_id: u for u in upgrades}
+    assert by_inventory_id["inv-2-4"].upgrade_scryfall_id == "lander-4"
+    assert by_inventory_id["inv-2-7"].upgrade_scryfall_id == "lander-7"
+    assert by_inventory_id["inv-2-8"].upgrade_scryfall_id == "lander-8"
+    # None of them collapsed to the name-index "winner" (lander-8) except the one
+    # that's genuinely supposed to resolve there.
+    assert by_inventory_id["inv-2-4"].upgrade_scryfall_id != "lander-8"
+    assert by_inventory_id["inv-2-7"].upgrade_scryfall_id != "lander-8"
+
+
+def test_double_sided_upgrade_without_number_index_reproduces_the_bug():
+    """Sanity check that the test fixtures above actually model the real incident:
+    without number_index, all three DFTs collapse onto the SAME wrong scryfall_id via
+    the name-index fallback -- confirming the fix (not the test data) is what's load-bearing."""
+    listing_2_4 = _seller_listing(
+        "Human Soldier // Lander", "TEOE", scryfall_id="human-soldier-2",
+        inventory_id="inv-2-4", number="2-4", quantity=1, price_usd=0.15,
+    )
+    listing_2_7 = _seller_listing(
+        "Human Soldier // Lander", "TEOE", scryfall_id="human-soldier-2",
+        inventory_id="inv-2-7", number="2-7", quantity=2, price_usd=0.15,
+    )
+    client = MagicMock()
+    upgrades = apply_double_sided_upgrades(
+        [listing_2_4, listing_2_7], _lander_name_index_bug(), {}, PricingConfig(), client, dry_run=True,
+        number_index=None,  # simulates the pre-fix call signature
+    )
+    # Both wrongly resolve to the same (arbitrary "highest price") Lander.
+    assert {u.upgrade_scryfall_id for u in upgrades} == {"lander-8"}
+
+
+def test_double_sided_upgrade_groups_by_resolved_printing_not_front_face():
+    """'Human Soldier // Lander' (2-7) and 'Robot // Lander' (7-10) both genuinely
+    resolve to the same physical Lander #7 -- they SHOULD consolidate into one target
+    group (that's correct, not a bug), while a third listing targeting Lander #8 must
+    stay in its own separate group."""
+    human_soldier_2_7 = _seller_listing(
+        "Human Soldier // Lander", "TEOE", scryfall_id="human-soldier-2",
+        inventory_id="inv-hs-2-7", product_id="prod-hs-2-7", number="2-7", quantity=2, price_usd=0.15,
+    )
+    robot_7_10 = _seller_listing(
+        "Robot // Lander", "TEOE", scryfall_id="robot-10",
+        inventory_id="inv-robot-7-10", product_id="prod-robot-7-10", number="7-10", quantity=1, price_usd=0.15,
+    )
+    human_soldier_2_8 = _seller_listing(
+        "Human Soldier // Lander", "TEOE", scryfall_id="human-soldier-2",
+        inventory_id="inv-hs-2-8", product_id="prod-hs-2-8", number="2-8", quantity=3, price_usd=0.15,
+    )
+    client = MagicMock()
+    upgrades = apply_double_sided_upgrades(
+        [human_soldier_2_7, robot_7_10, human_soldier_2_8],
+        _lander_name_index_bug(), {}, PricingConfig(), client, dry_run=False,
+        number_index=_lander_number_index(),
+    )
+    assert len(upgrades) == 3
+
+    create_calls = client.create_seller_listing.call_args_list
+    by_scryfall = {c.kwargs["scryfall_id"]: c.kwargs["quantity"] for c in create_calls}
+    # Lander #7's two contributing DFTs (qty 2 + 1) consolidated into one create call.
+    assert by_scryfall["lander-7"] == 3
+    # Lander #8 stayed separate, with only its own quantity.
+    assert by_scryfall["lander-8"] == 3
+    assert len(create_calls) == 2
+
+
+def test_double_sided_upgrade_malformed_number_falls_back_to_name_index():
+    """A listing with no usable compound number (blank, or not exactly two parts)
+    falls back to the old name-based lookup rather than silently finding nothing."""
+    listing = _seller_listing(
+        "Human Soldier // Lander", "TEOE", scryfall_id="human-soldier-2",
+        inventory_id="inv-1", number="",  # no number data at all
+        quantity=1, price_usd=0.15,
+    )
+    client = MagicMock()
+    upgrades = apply_double_sided_upgrades(
+        [listing], _lander_name_index_bug(), {}, PricingConfig(), client, dry_run=True,
+        number_index=_lander_number_index(),
+    )
+    assert len(upgrades) == 1
+    # Falls back to whatever build_name_index() picked -- not a crash, not silently dropped.
+    assert upgrades[0].upgrade_scryfall_id == "lander-8"

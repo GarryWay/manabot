@@ -217,3 +217,75 @@ def test_get_card_ids_batches_at_100(client):
     result = client.get_card_ids_by_scryfall_id(ids)
     assert call_sizes == [100, 50]
     assert len(result) == 150
+
+
+# ---------------------------------------------------------------------------
+# get_seller_inventory / _parse_seller_listing
+# ---------------------------------------------------------------------------
+
+@resp_mock.activate
+def test_get_seller_inventory_parses_number_and_mtgjson_id(client):
+    """Regression: number/mtgjson_id were present in the raw API response all along
+    (confirmed live) but silently discarded -- they're what's needed to disambiguate
+    reused token-sheet names like double-sided token "Lander" backs (see
+    pricer.apply_double_sided_upgrades)."""
+    resp_mock.add(
+        resp_mock.GET, f"{BASE}/seller/inventory",
+        json={
+            "inventory": [{
+                "id": "inv-1",
+                "product": {
+                    "id": "prod-1",
+                    "single": {
+                        "scryfall_id": "human-soldier-2",
+                        "mtgjson_id": "mtgjson-2-7",
+                        "name": "Human Soldier // Lander",
+                        "set": "teoe",
+                        "number": "2-7",
+                        "language_id": "EN",
+                        "condition_id": "NM",
+                        "finish_id": "NF",
+                    },
+                },
+                "price_cents": 15,
+                "quantity": 2,
+            }],
+            "pagination": {"next_cursor": None},
+        },
+    )
+    listings = client.get_seller_inventory()
+    assert len(listings) == 1
+    assert listings[0].number == "2-7"
+    assert listings[0].mtgjson_id == "mtgjson-2-7"
+    assert listings[0].set_code == "TEOE"
+
+
+@resp_mock.activate
+def test_get_seller_inventory_defaults_number_when_absent(client):
+    """Ordinary (non-token) listings won't have a number field -- must default to
+    empty string, not crash or store None."""
+    resp_mock.add(
+        resp_mock.GET, f"{BASE}/seller/inventory",
+        json={
+            "inventory": [{
+                "id": "inv-1",
+                "product": {
+                    "id": "prod-1",
+                    "single": {
+                        "scryfall_id": "bolt-id",
+                        "name": "Lightning Bolt",
+                        "set": "lea",
+                        "language_id": "EN",
+                        "condition_id": "NM",
+                        "finish_id": "NF",
+                    },
+                },
+                "price_cents": 150,
+                "quantity": 4,
+            }],
+            "pagination": {"next_cursor": None},
+        },
+    )
+    listings = client.get_seller_inventory()
+    assert listings[0].number == ""
+    assert listings[0].mtgjson_id == ""

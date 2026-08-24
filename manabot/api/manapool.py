@@ -526,6 +526,8 @@ class ManaPoolClient:
             language=single.get("language_id", "EN"),
             quantity=int(item.get("quantity", 0)),
             price_usd=float(item.get("price_cents", 0)) / 100.0,
+            number=str(single.get("number") or ""),
+            mtgjson_id=str(single.get("mtgjson_id") or ""),
         )
 
     def update_seller_listing_price(

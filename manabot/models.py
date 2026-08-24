@@ -149,7 +149,9 @@ class SellerListing:
     """Our own inventory listing on ManaPool (seller side)."""
     inventory_id: str       # UUID from GET /seller/inventory
     product_id: str         # ManaPool product UUID — required for DFT updates
-    scryfall_id: str
+    scryfall_id: str        # for a double-sided token, this is only the FRONT face's own
+                             # id — it carries no information about which specific back
+                             # face this listing is paired with (see `number` below)
     card_name: str
     set_code: str
     condition: Condition
@@ -157,6 +159,11 @@ class SellerListing:
     language: str           # "EN", "JA", etc.
     quantity: int
     price_usd: float
+    number: str = ""        # ManaPool collector number, e.g. "42" or, for a double-sided
+                             # token pairing, a compound "2-7" (each half is one face's own
+                             # number in this set — order is ascending, not front/back, so
+                             # don't assume position; resolve each half independently)
+    mtgjson_id: str = ""    # unlike scryfall_id, unique per exact double-sided pairing
 
 
 @dataclass
