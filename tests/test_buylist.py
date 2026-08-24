@@ -464,6 +464,64 @@ def test_coalesce_does_not_merge_different_max_price(tmp_path):
     assert len(load_buylist(path)) == 2
 
 
+def test_coalesce_merges_max_price_written_with_different_decimal_formatting(tmp_path):
+    """Regression: production rows for the same card/price ("8" vs "8.0") failed to
+    merge because max_price_usd was compared as raw text, not numerically. Different
+    code paths (or manual edits) don't always format the same float identically."""
+    path = tmp_path / "bl.csv"
+    path.write_text(
+        "card_name,target_quantity,max_price_usd,min_condition,foil,tags\n"
+        "Birds of Paradise,1,8,MP,any,\"user:MachZero,uid:1\"\n"
+        "Birds of Paradise,2,8.0,MP,any,\"user:MachZero,uid:1\"\n",
+        encoding="utf-8",
+    )
+    merges = coalesce_buylist(path)
+    assert len(merges) == 1
+    assert merges[0]["target_quantity"] == "3"
+    items = load_buylist(path)
+    assert len(items) == 1
+    assert items[0].target_quantity == 3
+
+
+def test_coalesce_merges_max_price_with_trailing_zero_padding(tmp_path):
+    path = tmp_path / "bl.csv"
+    path.write_text(
+        "card_name,target_quantity,max_price_usd,min_condition\n"
+        "Sol Ring,1,5.00,NM\n"
+        "Sol Ring,1,5,NM\n"
+        "Sol Ring,1,5.0,NM\n",
+        encoding="utf-8",
+    )
+    merges = coalesce_buylist(path)
+    assert len(merges) == 1
+    assert merges[0]["target_quantity"] == "3"
+
+
+def test_coalesce_merges_in_universe_only_written_as_different_truthy_strings(tmp_path):
+    path = tmp_path / "bl.csv"
+    path.write_text(
+        "card_name,target_quantity,max_price_usd,min_condition,in_universe_only\n"
+        "Black Lotus,1,500,NM,true\n"
+        "Black Lotus,1,500,NM,1\n"
+        "Black Lotus,1,500,NM,yes\n",
+        encoding="utf-8",
+    )
+    merges = coalesce_buylist(path)
+    assert len(merges) == 1
+    assert merges[0]["target_quantity"] == "3"
+
+
+def test_coalesce_does_not_merge_in_universe_only_true_vs_false(tmp_path):
+    path = tmp_path / "bl.csv"
+    path.write_text(
+        "card_name,target_quantity,max_price_usd,min_condition,in_universe_only\n"
+        "Black Lotus,1,500,NM,true\n"
+        "Black Lotus,1,500,NM,\n",
+        encoding="utf-8",
+    )
+    assert coalesce_buylist(path) == []
+
+
 def test_coalesce_does_not_merge_different_condition(tmp_path):
     path = tmp_path / "bl.csv"
     append_to_buylist(path, _make_item(card_name="Lightning Bolt", min_condition=Condition.NM))

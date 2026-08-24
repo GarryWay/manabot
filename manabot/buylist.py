@@ -226,10 +226,16 @@ def coalesce_buylist(path: Path) -> list[dict[str, str]]:
     Two rows are considered duplicates when every field other than
     target_quantity matches: card_name is compared via normalized text (so
     casing/punctuation differences still merge), allowed_sets/tags are
-    compared as unordered sets (so field order doesn't block a merge), and
-    everything else is compared case-insensitively. This means rows tagged
-    for different Discord users (different 'uid:' tags) are never merged
-    into each other, since their tags field differs.
+    compared as unordered sets (so field order doesn't block a merge),
+    max_price_usd is compared numerically (so "8" and "8.0" match — a real
+    case seen in production, where price strings written by different code
+    paths didn't format identically despite being the same price),
+    in_universe_only/exclude_ub are compared as booleans (so "true"/"1"/"yes"
+    all match each other), and everything else is compared case-insensitively.
+    This means rows tagged for different Discord users (different 'uid:' tags)
+    are never merged into each other, since their tags field differs — and
+    rows with genuinely different notes, price, or condition are correctly
+    kept apart too.
 
     The first matching row (in file order) is kept — with its original
     casing/column order intact — and its target_quantity becomes the sum
@@ -251,6 +257,8 @@ def coalesce_buylist(path: Path) -> list[dict[str, str]]:
     if not rows:
         return []
 
+    _BOOLISH_FIELDS = {"in_universe_only", "exclude_ub"}
+
     def _signature(row: dict[str, str]) -> tuple:
         sig = []
         for fn in fieldnames:
@@ -261,6 +269,13 @@ def coalesce_buylist(path: Path) -> list[dict[str, str]]:
                 sig.append(_normalize_name(value))
             elif fn in ("allowed_sets", "tags"):
                 sig.append(tuple(sorted(p.strip().lower() for p in value.split(",") if p.strip())))
+            elif fn == "max_price_usd":
+                try:
+                    sig.append(round(float(value), 2))
+                except ValueError:
+                    sig.append(value.lower())  # unparseable — fall back to raw text
+            elif fn in _BOOLISH_FIELDS:
+                sig.append(value.lower() in {"true", "1", "yes"})
             else:
                 sig.append(value.lower())
         return tuple(sig)
