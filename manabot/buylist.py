@@ -239,9 +239,15 @@ def coalesce_buylist(path: Path) -> list[dict[str, str]]:
 
     The first matching row (in file order) is kept — with its original
     casing/column order intact — and its target_quantity becomes the sum
-    across the group. Later duplicate rows are dropped. Rows with no
-    duplicates are left untouched, and if nothing needs merging the file
-    is not rewritten at all.
+    across the group. Later duplicate rows are dropped.
+
+    After merging, rows are alphabetized by card_name (same normalized-text
+    comparison used for matching duplicates, so punctuation/casing don't
+    affect sort position; ties keep their prior relative order). The file
+    is rewritten whenever a merge happened OR the alphabetized order differs
+    from the file's current order — so a file that's already deduplicated
+    but out of order still gets sorted on the next run. If nothing needs
+    merging and the file is already in order, it is not rewritten at all.
 
     Returns one snapshot per merge group that had more than one row:
     {'card_name', 'target_quantity' (str, the new summed total), 'rows_merged' (str)}.
@@ -314,13 +320,15 @@ def coalesce_buylist(path: Path) -> list[dict[str, str]]:
             "rows_merged": str(len(indices)),
         })
 
-    if not merges:
+    sorted_rows = sorted(new_rows, key=lambda r: _normalize_name(r.get("card_name") or ""))
+
+    if not merges and sorted_rows == new_rows:
         return []
 
     with path.open("w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(new_rows)
+        writer.writerows(sorted_rows)
 
     return merges
 

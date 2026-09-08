@@ -612,3 +612,38 @@ def test_coalesce_empty_file_returns_empty(tmp_path):
     path = tmp_path / "bl.csv"
     path.write_text("card_name,target_quantity,max_price_usd,min_condition\n", encoding="utf-8")
     assert coalesce_buylist(path) == []
+
+
+def test_coalesce_alphabetizes_even_with_no_duplicates(tmp_path):
+    """Regression: an already-deduplicated file that's simply out of order must still
+    get sorted -- alphabetizing can't depend on a merge having happened."""
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", target_quantity=1))
+    append_to_buylist(path, _make_item(card_name="Dark Ritual", target_quantity=1))
+    append_to_buylist(path, _make_item(card_name="Sol Ring", target_quantity=1))
+    merges = coalesce_buylist(path)
+    assert merges == []  # nothing merged...
+    items = load_buylist(path)
+    assert [i.card_name for i in items] == ["Dark Ritual", "Lightning Bolt", "Sol Ring"]  # ...but it's sorted
+
+
+def test_coalesce_alphabetizes_and_merges_together(tmp_path):
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="Sol Ring", target_quantity=1))
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", target_quantity=1))
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", target_quantity=1))
+    append_to_buylist(path, _make_item(card_name="Dark Ritual", target_quantity=1))
+    merges = coalesce_buylist(path)
+    assert len(merges) == 1
+    assert merges[0]["card_name"] == "Lightning Bolt"
+    items = load_buylist(path)
+    assert [i.card_name for i in items] == ["Dark Ritual", "Lightning Bolt", "Sol Ring"]
+
+
+def test_coalesce_already_sorted_with_no_duplicates_does_not_rewrite(tmp_path):
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="Dark Ritual", target_quantity=1))
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", target_quantity=1))
+    before = path.read_bytes()
+    assert coalesce_buylist(path) == []
+    assert path.read_bytes() == before
