@@ -694,7 +694,7 @@ def create_bot(config: Config) -> _ManabotClient:
         max_iterations="Optimizer removal trials — increase for large carts (0 = use config default)",
         arb_riders="Pad cart with arbitrage free-riders from existing sellers",
         exclude_preorder="Exclude pre-order listings (default True)",
-        force_cards="Pipe-separated card names to force into the cart regardless of margin (e.g. Counterspell|Sauron, the Dark Lord)",
+        force_cards="Pipe-separated card names to force into the cart regardless of margin (e.g. Bolt|Sol Ring)",
     )
     async def cmd_optimize(
         interaction: discord.Interaction,
@@ -823,14 +823,10 @@ def create_bot(config: Config) -> _ManabotClient:
         quantity="Number of copies to buy",
         max_price="Maximum price per copy in USD",
         condition="Minimum acceptable condition (default NM)",
-        set_code="Restrict to a specific set code, e.g. LEA (optional; combine with collector_number to "
-                  "pin one exact printing; ignored if scryfall_id is given)",
+        set_code="Restrict to a set code, e.g. LEA (pairs with collector_number to pin one printing)",
         foil="Foil preference: any, nonfoil, or foil (default any)",
-        scryfall_id="Exact Scryfall card id to pin one specific printing (optional, overrides set_code "
-                     "and collector_number) — found via a card's Scryfall API entry",
-        collector_number="Collector number printed on the card, paired with set_code, to pin one exact "
-                          "printing (e.g. set_code=LEA collector_number=233) — more user-accessible than "
-                          "scryfall_id since it's what's actually on the card",
+        scryfall_id="Exact Scryfall id to pin one printing (overrides set_code/collector_number)",
+        collector_number="Collector number on the card; pair with set_code to pin one exact printing",
     )
     @app_commands.choices(
         condition=[app_commands.Choice(name=c, value=c) for c in _VALID_CONDITIONS],
@@ -966,8 +962,7 @@ def create_bot(config: Config) -> _ManabotClient:
 
     @tree.command(
         name="add-cards",
-        description="Add multiple cards to the buy list via a multi-line form: "
-                     "name;qty;price[;condition[;set[;foil[;scryfall_id[;collector_number]]]]]",
+        description="Add multiple cards to the buy list via a multi-line form (see popup for format)",
     )
     async def cmd_add_cards(interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(AddCardsModal())
@@ -1194,13 +1189,10 @@ def create_bot(config: Config) -> _ManabotClient:
         quantity="New quantity (0 = keep current)",
         max_price="New max price in USD (0 = keep current)",
         condition="New minimum condition",
-        set_code="New set restriction (pass 'any' to clear it); combine with collector_number to pin "
-                  "one exact printing",
+        set_code="New set restriction ('any' clears it); pairs with collector_number to pin a printing",
         foil="New foil preference",
-        scryfall_id="New exact Scryfall id to pin one specific printing (pass 'any' to clear it; "
-                     "overrides collector_number)",
-        collector_number="Collector number printed on the card, paired with set_code, to pin one exact "
-                          "printing — more user-accessible than scryfall_id",
+        scryfall_id="New exact Scryfall id to pin one printing ('any' clears it)",
+        collector_number="New collector number; pair with set_code to pin one exact printing",
         force="Edit any matching entry, not just your own",
     )
     @app_commands.choices(
