@@ -48,6 +48,37 @@ def test_lookup_by_name_returns_none_when_not_found(client):
     assert result is None
 
 
+# --- lookup_by_set_number ---
+
+@resp_mock.activate
+def test_lookup_by_set_number_found(client):
+    resp_mock.add(resp_mock.GET, f"{BASE}/cards/lea/233", json=_card())
+    result = client.lookup_by_set_number("LEA", "233")
+    assert result == BOLT_ID
+
+
+@resp_mock.activate
+def test_lookup_by_set_number_lowercases_set_code(client):
+    resp_mock.add(resp_mock.GET, f"{BASE}/cards/lea/233", json=_card())
+    client.lookup_by_set_number("LEA", "233")
+    assert resp_mock.calls[0].request.url.endswith("/cards/lea/233")
+
+
+@resp_mock.activate
+def test_lookup_by_set_number_returns_none_when_not_found(client):
+    resp_mock.add(resp_mock.GET, f"{BASE}/cards/xyz/999", status=404, json={"code": "not_found", "status": 404})
+    result = client.lookup_by_set_number("xyz", "999")
+    assert result is None
+
+
+def test_lookup_by_set_number_returns_none_when_number_missing(client):
+    assert client.lookup_by_set_number("LEA", "") is None
+
+
+def test_lookup_by_set_number_returns_none_when_set_missing(client):
+    assert client.lookup_by_set_number("", "233") is None
+
+
 # --- get_card_metadata ---
 
 @resp_mock.activate

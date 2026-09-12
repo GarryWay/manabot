@@ -52,6 +52,28 @@ class ScryfallClient:
         log.warning("Could not resolve Scryfall ID for %r", name)
         return None
 
+    def lookup_by_set_number(self, set_code: str, collector_number: str) -> Optional[str]:
+        """Return the Scryfall ID for an exact (set_code, collector_number) printing.
+
+        Set code + collector number is what's actually printed on the physical card —
+        the most user-accessible way to pin one exact printing, since nothing on the
+        card itself exposes a scryfall_id. Resolves via GET /cards/:code/:number, which
+        is unambiguous by construction (Scryfall's own primary key for a printing).
+        """
+        code = set_code.strip().lower()
+        number = collector_number.strip()
+        if not code or not number:
+            return None
+        try:
+            data = self._get(f"/cards/{code}/{number}")
+        except ScryfallAPIError as e:
+            if "404" in str(e):
+                log.warning("No Scryfall card found for set=%s number=%s", code, number)
+            else:
+                log.warning("Scryfall set/number lookup failed for %s/%s: %s", code, number, e)
+            return None
+        return data.get("id")
+
     def get_card_metadata(self, scryfall_id: str) -> dict:
         """Fetch full card metadata for a Scryfall ID. Results are cached."""
         if scryfall_id in self._cache:

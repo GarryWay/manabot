@@ -7,6 +7,11 @@ Commands
 /arbitrage        Find listings trading below market value
 /add-card         Add a single card to the buy list (tagged with your username + Discord ID)
 /add-cards        Add multiple cards at once via a multi-line form popup (one per line: name;qty;price)
+                  Both accept an optional exact Scryfall id, or a set code + collector number, to pin
+                  one specific printing instead of a bare set code (which doesn't guarantee a specific
+                  card — e.g. multiple printings/collector numbers within one set). Set + collector
+                  number is what's printed on the card itself, so it's the more user-accessible of the
+                  two; a scryfall_id is still accepted directly for anyone who already has one.
 /buylist          Display the current buy list, with optional tag filter (e.g. user:Garrett)
 /mark-purchased   Remove purchased cards; pings the Discord user who added each card
 /remove-card      Remove a buy list entry you added (force=True to remove any entry)
@@ -28,6 +33,7 @@ import csv
 import io
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -41,6 +47,41 @@ log = logging.getLogger(__name__)
 
 _VALID_CONDITIONS = [c.value for c in Condition]
 _VALID_FINISHES = [f.value for f in Finish]
+
+# Deliberately Scryfall's id, not ManaPool's card_id or mtgjson_id: those are only
+# obtainable by calling ManaPool's authenticated API, so a Discord user has no way
+# to look one up themselves. A Scryfall id IS user-searchable — it's the "id" field
+# on any Scryfall card page/API response — and it already round-trips end-to-end
+# (BuyListItem.scryfall_id, the CSV column, and matcher stage 1); this just wires it
+# into the bot commands. Same UUID-detection pattern as cli.py's `history --card`.
+_SCRYFALL_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _parse_scryfall_id(raw: str) -> str:
+    """Validate and normalize a user-supplied Scryfall id. Raises ValueError if malformed."""
+    value = raw.strip().lower()
+    if not _SCRYFALL_ID_RE.match(value):
+        raise ValueError(
+            f"{raw!r} doesn't look like a Scryfall id (expected a UUID, e.g. "
+            "bd8fa327-dd41-4737-8f19-2cf5eb1f7cdd — find it via a card's Scryfall API entry)"
+        )
+    return value
+
+
+def _resolve_printing_id(scryfall_client, set_code: str, collector_number: str) -> str:
+    """Resolve a (set_code, collector_number) pair — printed right on the card, so
+    more user-accessible than a scryfall_id — to its exact Scryfall id via
+    ScryfallClient.lookup_by_set_number(). Raises ValueError if either field is
+    missing or Scryfall has no matching card.
+    """
+    set_code = set_code.strip()
+    collector_number = collector_number.strip()
+    if not set_code or not collector_number:
+        raise ValueError("collector_number needs set_code too (and vice versa) to pin an exact printing")
+    found = scryfall_client.lookup_by_set_number(set_code, collector_number)
+    if not found:
+        raise ValueError(f"No Scryfall card found for set {set_code.upper()} number {collector_number!r}")
+    return found
 
 _SCRYFALL_REFRESH_INTERVAL = 7 * 24 * 3600  # weekly
 
@@ -385,14 +426,22 @@ def _add_cards_sync(path: Path, cards_text: str, username: str, uid: int) -> tup
     file open/read/write, and looping that directly on the event loop can stall
     other users' interactions long enough to make Discord expire them.
 
-    Fields are semicolon-delimited (name;qty;price[;condition[;set[;foil]]]), not
-    comma-delimited — plenty of real card names contain a comma as part of the name
+    Fields are semicolon-delimited (name;qty;price[;condition[;set[;foil[;scryfall_id[;collector_number]]]]]),
+    not comma-delimited — plenty of real card names contain a comma as part of the name
     itself (e.g. "Muldrotha, the Gravetide"), which would otherwise get shredded into
     extra fields by a plain comma split. Semicolons essentially never appear in a
     card name, so they're unambiguous here.
+
+    scryfall_id and set+collector_number both pin one exact printing (the latter is
+    resolved to a scryfall_id via Scryfall — it's what's actually printed on the card,
+    so it's the more user-accessible of the two); either drops the plain set restriction
+    in favor of itself (see cmd_add_card's docstring note for why). scryfall_id wins if
+    both are given.
     """
+    from manabot.api.scryfall import ScryfallClient
     from manabot.buylist import append_to_buylist
 
+    scryfall_client = ScryfallClient()  # reused across lines so its rate limiter applies batch-wide
     added: list[str] = []
     errors: list[str] = []
 
@@ -429,19 +478,37 @@ def _add_cards_sync(path: Path, cards_text: str, username: str, uid: int) -> tup
             errors.append(f"Line {line_num} ({card_name!r}): invalid foil {foil_str!r}")
             continue
 
+        scryfall_id: str | None = None
+        if len(parts) > 6 and parts[6].strip():
+            try:
+                scryfall_id = _parse_scryfall_id(parts[6])
+            except ValueError as e:
+                errors.append(f"Line {line_num} ({card_name!r}): {e}")
+                continue
+        elif len(parts) > 7 and parts[7].strip():
+            try:
+                scryfall_id = _resolve_printing_id(scryfall_client, set_str, parts[7])
+            except ValueError as e:
+                errors.append(f"Line {line_num} ({card_name!r}): {e}")
+                continue
+
         item = BuyListItem(
             card_name=card_name,
             target_quantity=qty,
             max_price_usd=price,
             min_condition=Condition(cond_str),
+            scryfall_id=scryfall_id,
             foil=Finish(foil_str),
-            allowed_sets=[set_str] if set_str else [],
+            allowed_sets=[] if scryfall_id else ([set_str] if set_str else []),
             tags=[f"user:{username}", f"uid:{uid}"],
         )
         try:
             append_to_buylist(path, item)
-            set_label = f" [{set_str}]" if set_str else ""
-            added.append(f"{qty}x {card_name}{set_label}  max ${price:.2f}  {cond_str}")
+            if scryfall_id:
+                id_label = f" ({scryfall_id})"
+            else:
+                id_label = f" [{set_str}]" if set_str else ""
+            added.append(f"{qty}x {card_name}{id_label}  max ${price:.2f}  {cond_str}")
         except Exception as e:
             errors.append(f"Line {line_num} ({card_name!r}): {e}")
 
@@ -756,8 +823,14 @@ def create_bot(config: Config) -> _ManabotClient:
         quantity="Number of copies to buy",
         max_price="Maximum price per copy in USD",
         condition="Minimum acceptable condition (default NM)",
-        set_code="Restrict to a specific set code, e.g. LEA (optional)",
+        set_code="Restrict to a specific set code, e.g. LEA (optional; combine with collector_number to "
+                  "pin one exact printing; ignored if scryfall_id is given)",
         foil="Foil preference: any, nonfoil, or foil (default any)",
+        scryfall_id="Exact Scryfall card id to pin one specific printing (optional, overrides set_code "
+                     "and collector_number) — found via a card's Scryfall API entry",
+        collector_number="Collector number printed on the card, paired with set_code, to pin one exact "
+                          "printing (e.g. set_code=LEA collector_number=233) — more user-accessible than "
+                          "scryfall_id since it's what's actually on the card",
     )
     @app_commands.choices(
         condition=[app_commands.Choice(name=c, value=c) for c in _VALID_CONDITIONS],
@@ -771,22 +844,56 @@ def create_bot(config: Config) -> _ManabotClient:
         condition: str = "NM",
         set_code: str = "",
         foil: str = "any",
+        scryfall_id: str = "",
+        collector_number: str = "",
     ) -> None:
         from manabot.buylist import append_to_buylist
 
+        explicit_scryfall_id = bool(scryfall_id.strip())
+        parsed_scryfall_id: str | None = None
+        if explicit_scryfall_id:
+            try:
+                parsed_scryfall_id = _parse_scryfall_id(scryfall_id)
+            except ValueError as e:
+                await interaction.response.send_message(str(e), ephemeral=True)
+                return
+        elif collector_number.strip() and not set_code.strip():
+            await interaction.response.send_message(
+                "collector_number needs set_code too, e.g. set_code=LEA collector_number=233 "
+                "— together they pin one exact printing.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+
+        if collector_number.strip() and not explicit_scryfall_id:
+            from manabot.api.scryfall import ScryfallClient
+            try:
+                parsed_scryfall_id = await asyncio.to_thread(
+                    _resolve_printing_id, ScryfallClient(), set_code, collector_number
+                )
+            except ValueError as e:
+                await interaction.followup.send(str(e), ephemeral=True)
+                return
+
         username = interaction.user.display_name
-        allowed_sets = [set_code.strip().upper()] if set_code.strip() else []
+        # A pinned printing (scryfall_id, or set_code+collector_number resolved to one)
+        # already identifies one exact card; a plain set_code alongside it is redundant
+        # at best and, if it names a different set than the printing's own, would zero
+        # out every candidate in the matcher (stage 2 filters on top of stage 1's id
+        # match) — so it's dropped rather than passed through.
+        allowed_sets = [] if parsed_scryfall_id else ([set_code.strip().upper()] if set_code.strip() else [])
         item = BuyListItem(
             card_name=card_name.strip(),
             target_quantity=quantity,
             max_price_usd=max_price,
             min_condition=Condition(condition),
+            scryfall_id=parsed_scryfall_id,
             foil=Finish(foil),
             allowed_sets=allowed_sets,
             tags=[f"user:{username}", f"uid:{interaction.user.id}"],
         )
-
-        await interaction.response.defer()
 
         try:
             await asyncio.to_thread(append_to_buylist, bot.config.buylist_path, item)
@@ -795,10 +902,20 @@ def create_bot(config: Config) -> _ManabotClient:
             await interaction.followup.send(f"Error adding card: {e}", ephemeral=True)
             return
 
-        set_str = f" [{set_code.upper()}]" if set_code.strip() else ""
+        if parsed_scryfall_id:
+            id_str = f" ({parsed_scryfall_id})"
+            ignored = []
+            if explicit_scryfall_id and set_code.strip():
+                ignored.append("set_code")
+            if explicit_scryfall_id and collector_number.strip():
+                ignored.append("collector_number")
+            note = f" — {' and '.join(ignored)} ignored, scryfall_id pins the printing" if ignored else ""
+        else:
+            id_str = f" [{set_code.upper()}]" if set_code.strip() else ""
+            note = ""
         await interaction.followup.send(
-            f"Added **{quantity}x {card_name}{set_str}** to the buy list "
-            f"(max ${max_price:.2f}, {condition}, {foil})."
+            f"Added **{quantity}x {card_name}{id_str}** to the buy list "
+            f"(max ${max_price:.2f}, {condition}, {foil}).{note}"
         )
 
     # ── /add-cards ────────────────────────────────────────────────────────────
@@ -815,7 +932,11 @@ def create_bot(config: Config) -> _ManabotClient:
         cards_input = discord.ui.TextInput(
             label="Cards — one per line (name;qty;price)",
             style=discord.TextStyle.paragraph,
-            placeholder="Lightning Bolt;4;1.50;LP\nMuldrotha, the Gravetide;1;8.00\nSol Ring;1;5.00",
+            placeholder=(
+                "Lightning Bolt;4;1.50;LP\nMuldrotha, the Gravetide;1;8.00\n"
+                "Sol Ring;1;5.00;NM;;any;bd8fa327-dd41-4737-8f19-2cf5eb1f7cdd\n"
+                "Black Lotus;1;50000;NM;LEA;any;;233"
+            ),
             required=True,
             max_length=4000,
         )
@@ -845,7 +966,8 @@ def create_bot(config: Config) -> _ManabotClient:
 
     @tree.command(
         name="add-cards",
-        description="Add multiple cards to the buy list via a multi-line form: name;qty;price[;condition[;set[;foil]]]",
+        description="Add multiple cards to the buy list via a multi-line form: "
+                     "name;qty;price[;condition[;set[;foil[;scryfall_id[;collector_number]]]]]",
     )
     async def cmd_add_cards(interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(AddCardsModal())
@@ -1072,8 +1194,13 @@ def create_bot(config: Config) -> _ManabotClient:
         quantity="New quantity (0 = keep current)",
         max_price="New max price in USD (0 = keep current)",
         condition="New minimum condition",
-        set_code="New set restriction (pass 'any' to clear it)",
+        set_code="New set restriction (pass 'any' to clear it); combine with collector_number to pin "
+                  "one exact printing",
         foil="New foil preference",
+        scryfall_id="New exact Scryfall id to pin one specific printing (pass 'any' to clear it; "
+                     "overrides collector_number)",
+        collector_number="Collector number printed on the card, paired with set_code, to pin one exact "
+                          "printing — more user-accessible than scryfall_id",
         force="Edit any matching entry, not just your own",
     )
     @app_commands.choices(
@@ -1088,13 +1215,34 @@ def create_bot(config: Config) -> _ManabotClient:
         condition: str = "",
         set_code: str = "",
         foil: str = "",
+        scryfall_id: str = "",
+        collector_number: str = "",
         force: bool = False,
     ) -> None:
         from manabot.buylist import edit_buylist_entry
 
-        if not any([quantity, max_price, condition, set_code, foil]):
+        if not any([quantity, max_price, condition, set_code, foil, scryfall_id, collector_number]):
             await interaction.response.send_message(
                 "Nothing to change — provide at least one field to update.",
+                ephemeral=True,
+            )
+            return
+
+        explicit_scryfall_id = bool(scryfall_id.strip())
+        scryfall_id_update: str | None = None
+        if explicit_scryfall_id:
+            if scryfall_id.strip().lower() in ("any", "clear"):
+                scryfall_id_update = ""
+            else:
+                try:
+                    scryfall_id_update = _parse_scryfall_id(scryfall_id)
+                except ValueError as e:
+                    await interaction.response.send_message(str(e), ephemeral=True)
+                    return
+        elif collector_number.strip() and not set_code.strip():
+            await interaction.response.send_message(
+                "collector_number needs set_code too, e.g. set_code=LEA collector_number=233 "
+                "— together they pin one exact printing.",
                 ephemeral=True,
             )
             return
@@ -1102,17 +1250,36 @@ def create_bot(config: Config) -> _ManabotClient:
         caller_uid = str(interaction.user.id)
         uid_filter = None if force else caller_uid
 
+        await interaction.response.defer()
+
+        if collector_number.strip() and not explicit_scryfall_id:
+            from manabot.api.scryfall import ScryfallClient
+            try:
+                scryfall_id_update = await asyncio.to_thread(
+                    _resolve_printing_id, ScryfallClient(), set_code, collector_number
+                )
+            except ValueError as e:
+                await interaction.followup.send(str(e), ephemeral=True)
+                return
+
         # Build CSV-field updates (None = keep current)
+        allowed_sets_update = ("" if set_code.strip().lower() in ("any", "clear", "") and set_code.strip()
+                                else set_code.strip().upper() if set_code.strip() else None)
+        # Pinning a real scryfall_id (directly, or resolved from set_code+collector_number)
+        # always clears any set restriction, even one the caller didn't touch this call —
+        # a leftover allowed_sets naming a different set than the pinned printing would
+        # zero out every candidate (see cmd_add_card's note on why the two are mutually
+        # exclusive).
+        if scryfall_id_update:
+            allowed_sets_update = ""
         updates: dict[str, str | None] = {
             "target_quantity": str(quantity) if quantity > 0 else None,
             "max_price_usd": str(max_price) if max_price > 0 else None,
             "min_condition": condition if condition else None,
-            "allowed_sets": ("" if set_code.strip().lower() in ("any", "clear", "") and set_code.strip()
-                             else set_code.strip().upper() if set_code.strip() else None),
+            "allowed_sets": allowed_sets_update,
             "foil": foil if foil else None,
+            "scryfall_id": scryfall_id_update,
         }
-
-        await interaction.response.defer()
 
         try:
             original = await asyncio.to_thread(
@@ -1138,8 +1305,10 @@ def create_bot(config: Config) -> _ManabotClient:
         def _fmt_row(r: dict[str, str]) -> str:
             sets = r.get("allowed_sets", "")
             set_str = f" [{sets}]" if sets else ""
+            sid = r.get("scryfall_id", "")
+            sid_str = f" ({sid})" if sid else ""
             return (
-                f"{r.get('target_quantity', '?')}x{set_str}"
+                f"{r.get('target_quantity', '?')}x{set_str}{sid_str}"
                 f"  max ${r.get('max_price_usd', '?')}"
                 f"  {r.get('min_condition', '?')}"
                 f"  {r.get('foil', '?')}"
@@ -1159,6 +1328,7 @@ def create_bot(config: Config) -> _ManabotClient:
                 "min_condition": updated_items[0].min_condition.value,
                 "foil": updated_items[0].foil.value,
                 "allowed_sets": ",".join(updated_items[0].allowed_sets),
+                "scryfall_id": updated_items[0].scryfall_id or "",
             } if updated_items else {}
         except Exception:
             log.debug("edit-card: could not re-read updated row for display", exc_info=True)
