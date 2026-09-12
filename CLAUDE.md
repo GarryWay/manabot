@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Git workflow
+
+Commit directly to `main` — don't create a branch first. The user deploys straight from `main`
+themselves; a feature branch just adds a manual merge step they don't want.
+
 ## Commands
 
 ```bash
