@@ -926,7 +926,7 @@ def create_bot(config: Config) -> _ManabotClient:
 
     class AddCardsModal(discord.ui.Modal, title="Add Multiple Cards"):
         cards_input = discord.ui.TextInput(
-            label="Cards — one per line (name;qty;price)",
+            label="1/line: name;qty;price;cond;set;foil;id;num",
             style=discord.TextStyle.paragraph,
             placeholder="Lightning Bolt;4;1.50;LP\nSol Ring;1;5.00;NM;;any;;233",
             required=True,
