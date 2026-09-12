@@ -928,11 +928,7 @@ def create_bot(config: Config) -> _ManabotClient:
         cards_input = discord.ui.TextInput(
             label="Cards — one per line (name;qty;price)",
             style=discord.TextStyle.paragraph,
-            placeholder=(
-                "Lightning Bolt;4;1.50;LP\nMuldrotha, the Gravetide;1;8.00\n"
-                "Sol Ring;1;5.00;NM;;any;bd8fa327-dd41-4737-8f19-2cf5eb1f7cdd\n"
-                "Black Lotus;1;50000;NM;LEA;any;;233"
-            ),
+            placeholder="Lightning Bolt;4;1.50;LP\nSol Ring;1;5.00;NM;;any;;233",
             required=True,
             max_length=4000,
         )
