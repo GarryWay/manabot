@@ -136,16 +136,54 @@ def _mass_entry_kwargs(items: list[dict]) -> dict:
     """Build followup.send kwargs for a plain 'quantity name' list, one card per line
     (e.g. "4 Lightning Bolt") — the exact format ManaPool's own Mass Entry box accepts,
     so the cart can be pasted straight in rather than retyped from the detailed
-    cost/set/margin breakdown. Deliberately omits set code/price/margin: those are
-    useful for reviewing the decision here, but ManaPool's own Mass Entry only wants
-    quantity + name.
+    cost/set/margin breakdown. Deliberately omits price/margin: those are useful for
+    reviewing the decision here, but ManaPool's own Mass Entry only wants quantity +
+    name (+ an optional printing pin — see below).
+
+    When an item carries a `collector_number` (i.e. its buy list entry was pinned to
+    one exact scryfall_id printing, not just a card name — see /add-card's
+    scryfall_id / set_code+collector_number pinning), the line also appends
+    ManaPool's own "{SET} NUM" printing-pin syntax, e.g. "4 Lightning Bolt {2X2} 133",
+    so Mass Entry lands on that exact printing instead of substituting any
+    interchangeable one.
     """
-    lines = [f"{x['quantity']} {x['card_name']}" for x in items]
+    lines = []
+    for x in items:
+        line = f"{x['quantity']} {x['card_name']}"
+        number = x.get("collector_number")
+        if number:
+            line += f" {{{x['set_code']}}} {number}"
+        lines.append(line)
     content, file = _send_as_file_or_text("\n".join(lines), "manapool_mass_entry.txt")
     kw: dict = {"content": "**Paste into ManaPool's Mass Entry:**" + (f"\n{content}" if content else "")}
     if file is not None:
         kw["file"] = file
     return kw
+
+
+def _attach_pinned_printings(items_data: list[dict], cart_items: list, scryfall_client) -> None:
+    """Mutate items_data in place, adding a `collector_number` key to any item whose
+    buy list entry was pinned to one exact scryfall_id printing (not just a card name
+    — see /add-card's scryfall_id / set_code+collector_number pinning). `set_code` is
+    already that printing's own set (matcher stage 1 only returns listings sharing the
+    pinned scryfall_id), so only the collector number needs resolving here, via a live
+    Scryfall lookup — the cached oracle_cards bulk data only carries one "canonical"
+    printing per card, which wouldn't necessarily be the pinned one.
+
+    Best-effort: a lookup failure just leaves that item unpinned in the mass-entry
+    output rather than failing the whole cart.
+    """
+    for data, x in zip(items_data, cart_items):
+        sid = x.buy_list_item.scryfall_id
+        if not sid:
+            continue
+        try:
+            number = scryfall_client.get_card_metadata(sid).get("collector_number")
+        except Exception as e:
+            log.warning("Could not resolve collector number for pinned printing %s: %s", sid, e)
+            continue
+        if number:
+            data["collector_number"] = str(number)
 
 
 def _send_kwargs(
@@ -290,12 +328,13 @@ def _optimize_pipeline(
 
     buy_list = load_buylist(config.buylist_path)
     scryfall_bulk = ScryfallBulk()
+    scryfall_client = ScryfallClient()
     client = ManaPoolClient(email=config.manapool_email, token=config.manapool_token, use_bulk_export=config.use_bulk_export)
     listings = client.get_singles_prices()
 
     with open_db(config.db_path) as conn:
         insert_listings(conn, listings)
-        results = match(buy_list, listings, scryfall_client=ScryfallClient())
+        results = match(buy_list, listings, scryfall_client=scryfall_client)
         results = analyze(results, conn, config.trend_window_days, config.trend_threshold_pct)
 
     matched_count = sum(1 for r in results if r.status == MatchStatus.MATCHED)
@@ -337,6 +376,7 @@ def _optimize_pipeline(
          "max_price": x.buy_list_item.max_price_usd, "margin": x.estimated_margin}
         for x in cart.items
     ]
+    _attach_pinned_printings(items_data, cart.items, scryfall_client)
     return {
         "items": items_data,
         "subtotal": cart.subtotal_usd, "shipping": cart.shipping_usd,
@@ -356,11 +396,13 @@ def _arbitrage_pipeline(
 ) -> dict:
     from manabot.db import open_db, insert_listings
     from manabot.api.manapool import ManaPoolClient
+    from manabot.api.scryfall import ScryfallClient
     from manabot.api.scryfall_bulk import ScryfallBulk
     import manabot.optimizer as opt
     import manabot.arbitrage as arb
 
     scryfall = ScryfallBulk()
+    scryfall_client = ScryfallClient()
     client = ManaPoolClient(email=config.manapool_email, token=config.manapool_token, use_bulk_export=config.use_bulk_export)
     listings = client.get_singles_prices()
 
@@ -413,6 +455,7 @@ def _arbitrage_pipeline(
          "discount_pct": (x.estimated_margin / x.buy_list_item.max_price_usd * 100) if x.buy_list_item.max_price_usd else 0}
         for x in cart.items
     ]
+    _attach_pinned_printings(items_data, cart.items, scryfall_client)
     return {
         "items": items_data, "candidate_count": len(candidates),
         "subtotal": cart.subtotal_usd, "shipping": cart.shipping_usd,

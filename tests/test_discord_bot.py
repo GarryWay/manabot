@@ -4,7 +4,14 @@ import pytest
 import responses as resp_mock
 
 from manabot.buylist import load_buylist
-from manabot.discord_bot import _add_cards_sync, _parse_scryfall_id, _resolve_printing_id
+from manabot.discord_bot import (
+    _add_cards_sync,
+    _attach_pinned_printings,
+    _mass_entry_kwargs,
+    _parse_scryfall_id,
+    _resolve_printing_id,
+)
+from manabot.models import BuyListItem, CartRequestItem, Condition, Finish
 
 VALID_ID = "bd8fa327-dd41-4737-8f19-2cf5eb1f7cdd"
 SCRYFALL_BASE = "https://api.scryfall.com"
@@ -160,3 +167,78 @@ def test_add_cards_sync_collector_number_not_found(tmp_path: Path):
     assert added == []
     assert len(errors) == 1
     assert "No Scryfall card found" in errors[0]
+
+
+def _cart_item(scryfall_id: str | None, set_code: str = "LEA") -> CartRequestItem:
+    return CartRequestItem(
+        buy_list_item=BuyListItem(
+            card_name="Black Lotus", target_quantity=1, max_price_usd=50000.0,
+            min_condition=Condition.NM, scryfall_id=scryfall_id,
+        ),
+        set_code=set_code, estimated_price=40000.0, estimated_margin=10000.0,
+        condition_ids=["NM"], finish_ids=["NF"],
+    )
+
+
+class _StubMetadataClient:
+    """Stand-in for ScryfallClient.get_card_metadata, no network involved."""
+    def __init__(self, by_id: dict[str, dict]):
+        self._by_id = by_id
+
+    def get_card_metadata(self, scryfall_id: str) -> dict:
+        if scryfall_id not in self._by_id:
+            raise KeyError(scryfall_id)
+        return self._by_id[scryfall_id]
+
+
+def test_mass_entry_kwargs_plain_item_has_no_printing_pin():
+    kw = _mass_entry_kwargs([{"quantity": 4, "card_name": "Lightning Bolt", "set_code": "2X2"}])
+    assert kw["content"] == "**Paste into ManaPool's Mass Entry:**\n```\n4 Lightning Bolt\n```"
+
+
+def test_mass_entry_kwargs_pinned_item_appends_set_and_number():
+    kw = _mass_entry_kwargs([
+        {"quantity": 1, "card_name": "Black Lotus", "set_code": "LEA", "collector_number": "232"},
+    ])
+    assert kw["content"] == "**Paste into ManaPool's Mass Entry:**\n```\n1 Black Lotus {LEA} 232\n```"
+
+
+def test_mass_entry_kwargs_mixed_pinned_and_unpinned():
+    kw = _mass_entry_kwargs([
+        {"quantity": 4, "card_name": "Lightning Bolt", "set_code": "2X2"},
+        {"quantity": 1, "card_name": "Black Lotus", "set_code": "LEA", "collector_number": "232"},
+    ])
+    assert kw["content"] == (
+        "**Paste into ManaPool's Mass Entry:**\n```\n"
+        "4 Lightning Bolt\n1 Black Lotus {LEA} 232\n```"
+    )
+
+
+def test_attach_pinned_printings_resolves_collector_number_for_pinned_item():
+    items_data = [{"card_name": "Black Lotus", "quantity": 1, "set_code": "LEA"}]
+    cart_items = [_cart_item(scryfall_id=VALID_ID)]
+    client = _StubMetadataClient({VALID_ID: {"collector_number": "232"}})
+
+    _attach_pinned_printings(items_data, cart_items, client)
+
+    assert items_data[0]["collector_number"] == "232"
+
+
+def test_attach_pinned_printings_skips_unpinned_item():
+    items_data = [{"card_name": "Black Lotus", "quantity": 1, "set_code": "LEA"}]
+    cart_items = [_cart_item(scryfall_id=None)]
+    client = _StubMetadataClient({})
+
+    _attach_pinned_printings(items_data, cart_items, client)
+
+    assert "collector_number" not in items_data[0]
+
+
+def test_attach_pinned_printings_lookup_failure_leaves_item_unpinned():
+    items_data = [{"card_name": "Black Lotus", "quantity": 1, "set_code": "LEA"}]
+    cart_items = [_cart_item(scryfall_id=VALID_ID)]
+    client = _StubMetadataClient({})  # no entry for VALID_ID -> KeyError inside get_card_metadata
+
+    _attach_pinned_printings(items_data, cart_items, client)
+
+    assert "collector_number" not in items_data[0]
