@@ -1,8 +1,13 @@
 """Scheduler for automated manabot tasks.
 
-Currently implements, both on the same daily job (configurable hour + timezone):
+Currently implements, all on the same daily job (configurable hour + timezone):
   - Seller inventory price update
+  - Buy list name validation (correct card_name against Scryfall's own spelling)
   - Buy list coalesce (merge duplicate rows, summing quantities)
+
+Name validation runs before coalesce so that a correction which makes two
+previously-distinct rows identical (e.g. a typo'd duplicate of an already-correct
+row) gets merged the same night rather than waiting for the next run.
 
 Requires: pip install 'apscheduler>=3.10.4'
 """
@@ -26,7 +31,8 @@ def schedule_daily_price_update(config: Config) -> None:
         ) from e
 
     from manabot.api.manapool import ManaPoolClient
-    from manabot.buylist import coalesce_buylist
+    from manabot.api.scryfall import ScryfallClient
+    from manabot.buylist import coalesce_buylist, validate_and_fix_names
     from manabot.db import open_db
     from manabot.pricer import PricingConfig, run_pricing_update
 
@@ -54,6 +60,28 @@ def schedule_daily_price_update(config: Config) -> None:
                 run_pricing_update(client, conn, config, pricing_cfg, dry_run=False)
         except Exception:
             log.exception("Price update job failed")
+
+        try:
+            log.info("Buy list name validation starting (%s)...", config.buylist_path)
+            changes = validate_and_fix_names(config.buylist_path, ScryfallClient())
+            corrected = [c for c in changes if c["action"] == "corrected"]
+            unresolved = [c for c in changes if c["action"] == "unresolved"]
+            if corrected:
+                log.info(
+                    "Buy list name validation: corrected %d name(s): %s",
+                    len(corrected),
+                    ", ".join(f"{c['card_name']!r} -> {c['new_name']!r}" for c in corrected),
+                )
+            if unresolved:
+                log.warning(
+                    "Buy list name validation: %d name(s) could not be resolved on Scryfall: %s",
+                    len(unresolved),
+                    ", ".join(repr(c["card_name"]) for c in unresolved),
+                )
+            if not corrected and not unresolved:
+                log.info("Buy list name validation: all names OK.")
+        except Exception:
+            log.exception("Buy list name validation job failed")
 
         try:
             log.info("Buy list coalesce starting (%s)...", config.buylist_path)

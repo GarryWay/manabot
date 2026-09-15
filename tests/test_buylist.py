@@ -3,7 +3,16 @@ from pathlib import Path
 
 import pytest
 
-from manabot.buylist import BuyListError, load_buylist, append_to_buylist, remove_from_buylist, remove_purchases_fifo, edit_buylist_entry, coalesce_buylist
+from manabot.buylist import (
+    BuyListError,
+    load_buylist,
+    append_to_buylist,
+    remove_from_buylist,
+    remove_purchases_fifo,
+    edit_buylist_entry,
+    coalesce_buylist,
+    validate_and_fix_names,
+)
 from manabot.models import BuyListItem, Condition, Finish
 
 
@@ -646,4 +655,109 @@ def test_coalesce_already_sorted_with_no_duplicates_does_not_rewrite(tmp_path):
     append_to_buylist(path, _make_item(card_name="Lightning Bolt", target_quantity=1))
     before = path.read_bytes()
     assert coalesce_buylist(path) == []
+    assert path.read_bytes() == before
+
+
+# ── validate_and_fix_names ──────────────────────────────────────────────────
+
+class _StubScryfallClient:
+    """Stand-in for ScryfallClient, no network involved."""
+    def __init__(self, by_id: dict[str, str] | None = None, by_name: dict[str, str | None] | None = None):
+        self._by_id = by_id or {}      # scryfall_id -> canonical name
+        self._by_name = by_name or {}  # queried name -> canonical name, or None if unresolved
+
+    def get_card_metadata(self, scryfall_id: str) -> dict:
+        if scryfall_id not in self._by_id:
+            from manabot.api.scryfall import ScryfallAPIError
+            raise ScryfallAPIError(f"not found: {scryfall_id}")
+        return {"name": self._by_id[scryfall_id]}
+
+    def resolve_canonical_name(self, name: str) -> str | None:
+        return self._by_name.get(name)
+
+
+def test_validate_and_fix_names_corrects_pinned_row_from_scryfall_id(tmp_path):
+    """A misspelled card_name on a pinned row is cosmetic-only — matching already uses
+    the id — so it's silently correctable to that id's own Scryfall name."""
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="Hinnata the Dawn Crowned", scryfall_id="abc-123"))
+    client = _StubScryfallClient(by_id={"abc-123": "Hinata, Dawn-Crowned"})
+
+    changes = validate_and_fix_names(path, client)
+
+    assert changes == [{
+        "card_name": "Hinnata the Dawn Crowned", "new_name": "Hinata, Dawn-Crowned",
+        "scryfall_id": "abc-123", "action": "corrected",
+    }]
+    items = load_buylist(path)
+    assert items[0].card_name == "Hinata, Dawn-Crowned"
+    assert items[0].scryfall_id == "abc-123"  # pin itself is untouched
+
+
+def test_validate_and_fix_names_leaves_pinned_row_unchanged_when_name_already_correct(tmp_path):
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", scryfall_id="abc-123"))
+    client = _StubScryfallClient(by_id={"abc-123": "Lightning Bolt"})
+    before = path.read_bytes()
+
+    assert validate_and_fix_names(path, client) == []
+    assert path.read_bytes() == before
+
+
+def test_validate_and_fix_names_corrects_unpinned_row_without_pinning_it(tmp_path):
+    """An unpinned row's name gets corrected via name lookup, but scryfall_id stays
+    blank — matching still falls through to name-based matching, not an id pin."""
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="Hinnata the Dawn Crowned"))
+    client = _StubScryfallClient(by_name={"Hinnata the Dawn Crowned": "Hinata, Dawn-Crowned"})
+
+    changes = validate_and_fix_names(path, client)
+
+    assert changes == [{
+        "card_name": "Hinnata the Dawn Crowned", "new_name": "Hinata, Dawn-Crowned",
+        "scryfall_id": "", "action": "corrected",
+    }]
+    items = load_buylist(path)
+    assert items[0].card_name == "Hinata, Dawn-Crowned"
+    assert items[0].scryfall_id is None
+
+
+def test_validate_and_fix_names_flags_unresolved_name_without_changing_it(tmp_path):
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="zzz not a card zzz"))
+    client = _StubScryfallClient(by_name={"zzz not a card zzz": None})
+    before = path.read_bytes()
+
+    changes = validate_and_fix_names(path, client)
+
+    assert changes == [{
+        "card_name": "zzz not a card zzz", "new_name": "",
+        "scryfall_id": "", "action": "unresolved",
+    }]
+    assert path.read_bytes() == before  # nothing to safely correct it to
+
+
+def test_validate_and_fix_names_pinned_lookup_failure_leaves_row_unchanged(tmp_path):
+    """A stale/deleted scryfall_id shouldn't blow up the whole run — just skip that row."""
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", scryfall_id="deleted-id"))
+    client = _StubScryfallClient()  # no entry for "deleted-id"
+    before = path.read_bytes()
+
+    assert validate_and_fix_names(path, client) == []
+    assert path.read_bytes() == before
+
+
+def test_validate_and_fix_names_missing_file_returns_empty():
+    assert validate_and_fix_names(Path("nonexistent.csv"), _StubScryfallClient()) == []
+
+
+def test_validate_and_fix_names_only_rewrites_when_something_changed(tmp_path):
+    path = tmp_path / "bl.csv"
+    append_to_buylist(path, _make_item(card_name="Lightning Bolt", scryfall_id="aaa"))
+    append_to_buylist(path, _make_item(card_name="Sol Ring", scryfall_id="bbb"))
+    client = _StubScryfallClient(by_id={"aaa": "Lightning Bolt", "bbb": "Sol Ring"})
+    before = path.read_bytes()
+
+    assert validate_and_fix_names(path, client) == []
     assert path.read_bytes() == before

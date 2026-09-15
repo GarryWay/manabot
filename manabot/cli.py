@@ -76,8 +76,8 @@ def run(
     # We intentionally do NOT call enrich_buylist() here: items without a scryfall_id
     # use name-based matching so that all printings remain candidates, and each
     # individual listing is then checked via is_in_universe(listing.scryfall_id).
-    # Use `validate-buylist --suggest-ids` to populate scryfall_ids when you want
-    # to pin a specific printing.
+    # Use `validate-buylist --fix-names` to correct misspelled card_name text, or
+    # /add-card's scryfall_id / set_code+collector_number to pin a specific printing.
     scryfall_client = ScryfallClient()
 
     client = ManaPoolClient(
@@ -172,8 +172,17 @@ def history(ctx: click.Context, card: str, days: int, config_path: Path | None) 
 @cli.command("validate-buylist")
 @click.option("--buylist", "buylist_path_override", type=click.Path(path_type=Path), default=None)
 @click.option("--config", "config_path", type=click.Path(path_type=Path), default=None)
+@click.option(
+    "--fix-names", is_flag=True,
+    help="Check card_name against Scryfall and correct misspellings in place. Pinned rows "
+         "(scryfall_id set) are corrected to that id's own name — cosmetic only, matching "
+         "already used the id. Unpinned rows are corrected via exact/fuzzy name lookup "
+         "without pinning, so name-based matching still considers every printing.",
+)
 @click.pass_context
-def validate_buylist(ctx: click.Context, buylist_path_override: Path | None, config_path: Path | None) -> None:
+def validate_buylist(
+    ctx: click.Context, buylist_path_override: Path | None, config_path: Path | None, fix_names: bool,
+) -> None:
     """Validate the buy list CSV and report any issues."""
     from manabot.config import load_config
     from manabot.buylist import load_buylist, BuyListError
@@ -200,6 +209,26 @@ def validate_buylist(ctx: click.Context, buylist_path_override: Path | None, con
             click.echo(f"\n{len(needs_scryfall)} item(s) require Scryfall (in_universe_only=true):")
             for item in needs_scryfall:
                 click.echo(f"  - {item.card_name}")
+
+        if fix_names:
+            from manabot.api.scryfall import ScryfallClient
+            from manabot.buylist import validate_and_fix_names
+
+            click.echo("\nChecking card names against Scryfall...")
+            changes = validate_and_fix_names(buylist_path, ScryfallClient())
+            corrected = [c for c in changes if c["action"] == "corrected"]
+            unresolved = [c for c in changes if c["action"] == "unresolved"]
+
+            if corrected:
+                click.echo(f"\nCorrected {len(corrected)} name(s):")
+                for c in corrected:
+                    click.echo(f"  {c['card_name']!r} -> {c['new_name']!r}")
+            if unresolved:
+                click.echo(f"\n{len(unresolved)} name(s) could not be resolved on Scryfall:")
+                for c in unresolved:
+                    click.echo(f"  - {c['card_name']}")
+            if not corrected and not unresolved:
+                click.echo("All card names verified against Scryfall — no corrections needed.")
 
     except BuyListError as e:
         click.echo(f"Buy list validation failed:\n{e}", err=True)

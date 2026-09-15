@@ -333,6 +333,86 @@ def coalesce_buylist(path: Path) -> list[dict[str, str]]:
     return merges
 
 
+def validate_and_fix_names(path: Path, scryfall_client: "ScryfallClient") -> list[dict[str, str]]:
+    """Check every buy list row's card_name against Scryfall and correct it in place
+    when it doesn't match Scryfall's own spelling (e.g. a typo like "Hinnata the Dawn
+    Crowned" for "Hinata, Dawn-Crowned").
+
+    Two lookup paths, matching how the row is actually matched against listings:
+      - Pinned rows (scryfall_id set): matcher stage 1 already matches by id, so a
+        wrong card_name here is purely cosmetic — it's corrected to Scryfall's name
+        for that exact scryfall_id. This is why a misspelled pinned row can still work
+        fine end-to-end (optimizer included) despite the typo: matching never looked
+        at the text.
+      - Unpinned rows (name-based matching): resolved via the same exact-then-fuzzy
+        strategy as ScryfallClient.lookup_by_name(), but only the name text is written
+        back — scryfall_id is deliberately left blank, so the row keeps falling
+        through to name-based matching (now against the corrected name) rather than
+        silently pinning a printing the user never chose.
+
+    A name with no exact or fuzzy Scryfall match at all is left untouched and reported
+    as 'unresolved' rather than 'corrected' — it may be for an un-cataloged card
+    rather than a typo, and there's nothing to safely correct it to.
+
+    Returns one entry per row that was changed or flagged, in file order:
+      {'card_name': original text, 'new_name': corrected text (empty for unresolved),
+       'scryfall_id': the row's pinned id or '', 'action': 'corrected' | 'unresolved'}.
+    """
+    from manabot.api.scryfall import ScryfallAPIError
+
+    if not path.exists():
+        return []
+
+    with path.open(encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+
+    if not rows or "card_name" not in fieldnames:
+        return []
+
+    changes: list[dict[str, str]] = []
+    changed = False
+
+    for row in rows:
+        card_name = (row.get("card_name") or "").strip()
+        if not card_name:
+            continue
+        scryfall_id = (row.get("scryfall_id") or "").strip()
+
+        try:
+            if scryfall_id:
+                canonical = scryfall_client.get_card_metadata(scryfall_id).get("name")
+            else:
+                canonical = scryfall_client.resolve_canonical_name(card_name)
+        except ScryfallAPIError as e:
+            log.warning("Could not verify card_name %r: %s", card_name, e)
+            continue
+
+        if not canonical:
+            changes.append({
+                "card_name": card_name, "new_name": "",
+                "scryfall_id": scryfall_id, "action": "unresolved",
+            })
+            continue
+
+        if canonical != card_name:
+            changes.append({
+                "card_name": card_name, "new_name": canonical,
+                "scryfall_id": scryfall_id, "action": "corrected",
+            })
+            row["card_name"] = canonical
+            changed = True
+
+    if changed:
+        with path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    return changes
+
+
 def remove_from_buylist(path: Path, card_names: list[str]) -> int:
     """Remove all rows for the given card names (case-insensitive). Returns row count removed."""
     affected = remove_purchases_fifo(path, [(name, -1) for name in card_names])

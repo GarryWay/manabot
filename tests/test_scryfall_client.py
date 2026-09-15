@@ -48,6 +48,35 @@ def test_lookup_by_name_returns_none_when_not_found(client):
     assert result is None
 
 
+# --- resolve_canonical_name ---
+
+@resp_mock.activate
+def test_resolve_canonical_name_exact(client):
+    resp_mock.add(resp_mock.GET, f"{BASE}/cards/named", json=_card())
+    result = client.resolve_canonical_name("Lightning Bolt")
+    assert result == "Lightning Bolt"
+
+
+@resp_mock.activate
+def test_resolve_canonical_name_falls_back_to_fuzzy_and_fixes_misspelling(client):
+    # Exact fails with 404, fuzzy succeeds — this is how a typo gets corrected
+    resp_mock.add(resp_mock.GET, f"{BASE}/cards/named", status=404, json={"code": "not_found", "status": 404})
+    resp_mock.add(
+        resp_mock.GET, f"{BASE}/cards/named",
+        json=_card(scryfall_id="0e6bf6c9-fa4b-4faf-8a4c-6a5aa20e94c9", name="Hinata, Dawn-Crowned"),
+    )
+    result = client.resolve_canonical_name("Hinnata the Dawn Crowned")
+    assert result == "Hinata, Dawn-Crowned"
+
+
+@resp_mock.activate
+def test_resolve_canonical_name_returns_none_when_not_found(client):
+    resp_mock.add(resp_mock.GET, f"{BASE}/cards/named", status=404, json={"code": "not_found", "status": 404})
+    resp_mock.add(resp_mock.GET, f"{BASE}/cards/named", status=404, json={"code": "not_found", "status": 404})
+    result = client.resolve_canonical_name("zzz not a card zzz")
+    assert result is None
+
+
 # --- lookup_by_set_number ---
 
 @resp_mock.activate

@@ -31,6 +31,7 @@ python -m manabot run --buylist data/buylist.csv --dry-run
 python -m manabot optimize --buylist data/buylist.csv --dry-run
 python -m manabot optimize --over-budget-pct 10 --max-iterations 5
 python -m manabot validate-buylist --buylist data/buylist.csv
+python -m manabot validate-buylist --buylist data/buylist.csv --fix-names
 python -m manabot history --card "Lightning Bolt" --days 30
 ```
 
@@ -50,7 +51,7 @@ All pipeline stages communicate through four dataclasses:
 
 ### Pipeline stages
 
-**`manabot/buylist.py`** — Reads the buy list CSV with `csv.DictReader` using `utf-8-sig` encoding (handles Excel BOM). Required columns: `card_name`, `target_quantity`, `max_price_usd`, `min_condition`. Optional: `scryfall_id`, `foil`, `allowed_sets`, `in_universe_only`, `tags`. Extra columns are silently ignored.
+**`manabot/buylist.py`** — Reads the buy list CSV with `csv.DictReader` using `utf-8-sig` encoding (handles Excel BOM). Required columns: `card_name`, `target_quantity`, `max_price_usd`, `min_condition`. Optional: `scryfall_id`, `foil`, `allowed_sets`, `in_universe_only`, `tags`. Extra columns are silently ignored. `validate_and_fix_names()` corrects `card_name` typos against Scryfall: pinned rows (`scryfall_id` set) are corrected to that id's own name since matcher stage 1 already matches by id and the text is cosmetic; unpinned rows are corrected via exact/fuzzy name lookup (`ScryfallClient.resolve_canonical_name()`) without writing a `scryfall_id`, so name-based matching still considers every printing rather than getting silently pinned. Runs nightly via `scheduler.py`, or on demand via `validate-buylist --fix-names`.
 
 **`manabot/api/manapool.py`** — `ManaPoolClient` authenticates with `Email` + `Access-Token` headers. All API response field mapping lives in `_parse_listing()` (JSON) and `_parse_listing_csv()` (bulk export). These are the only methods to update if ManaPool's response schema changes. The API is v0.27.0 and still in active development — verify field names against a live response before assuming they're correct.
 
@@ -91,9 +92,12 @@ Key design choices:
 
 Config keys: `optimizer_over_budget_pct` (default 0.0), `optimizer_max_iterations` (default 5), `optimizer_destination` (default "US"). All overridable via env vars.
 
+### Scheduler (`manabot/scheduler.py`)
+
+`schedule_daily_price_update()` is the real, implemented scheduler (requires `apscheduler`) — one daily APScheduler cron job (configurable hour + timezone) that runs, in order: seller inventory price update (`pricer.py`), buy list name validation (`validate_and_fix_names()`), then buy list coalesce (`coalesce_buylist()` — merges duplicate rows). Name validation runs before coalesce so a correction that makes two rows identical gets merged the same night. `schedule_run()` is an unrelated legacy stub that still raises `NotImplementedError` — don't confuse the two.
+
 ### Not yet implemented
 
-- `manabot/scheduler.py` — raises `NotImplementedError`; wiring point for APScheduler
 - Auto-ordering — `POST /buyer/orders/pending-orders` stub noted in `manapool.py`
 
 ### Testing

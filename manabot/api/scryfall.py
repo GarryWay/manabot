@@ -52,6 +52,29 @@ class ScryfallClient:
         log.warning("Could not resolve Scryfall ID for %r", name)
         return None
 
+    def resolve_canonical_name(self, name: str) -> Optional[str]:
+        """Return Scryfall's own spelling for a card name query, or None if no match.
+
+        Same exact-then-fuzzy strategy as lookup_by_name(), but returns the card's
+        `name` field instead of its id — for correcting a misspelled buy list entry's
+        display text without pinning it to one specific printing (name-based matching
+        should keep considering every printing, same as before the fix).
+        """
+        for strategy, params in [("exact", {"exact": name}), ("fuzzy", {"fuzzy": name})]:
+            try:
+                data = self._get("/cards/named", params=params)
+                found_name = data.get("name")
+                if found_name:
+                    log.debug("Resolved %r (%s match) → %r", name, strategy, found_name)
+                    return found_name
+            except ScryfallAPIError as e:
+                if "404" in str(e):
+                    continue  # try fuzzy next
+                log.warning("Scryfall name lookup failed for %r: %s", name, e)
+                return None
+        log.warning("Could not resolve a Scryfall name match for %r", name)
+        return None
+
     def lookup_by_set_number(self, set_code: str, collector_number: str) -> Optional[str]:
         """Return the Scryfall ID for an exact (set_code, collector_number) printing.
 
