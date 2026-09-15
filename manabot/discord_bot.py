@@ -143,7 +143,7 @@ def _mass_entry_kwargs(items: list[dict]) -> dict:
     When an item carries a `collector_number` (i.e. its buy list entry was pinned to
     one exact scryfall_id printing, not just a card name — see /add-card's
     scryfall_id / set_code+collector_number pinning), the line also appends
-    ManaPool's own "{SET} NUM" printing-pin syntax, e.g. "4 Lightning Bolt {2X2} 133",
+    ManaPool's own "[SET] NUM" printing-pin syntax, e.g. "4 Lightning Bolt [2X2] 133",
     so Mass Entry lands on that exact printing instead of substituting any
     interchangeable one.
     """
@@ -152,7 +152,7 @@ def _mass_entry_kwargs(items: list[dict]) -> dict:
         line = f"{x['quantity']} {x['card_name']}"
         number = x.get("collector_number")
         if number:
-            line += f" {{{x['set_code']}}} {number}"
+            line += f" [{x['set_code']}] {number}"
         lines.append(line)
     content, file = _send_as_file_or_text("\n".join(lines), "manapool_mass_entry.txt")
     kw: dict = {"content": "**Paste into ManaPool's Mass Entry:**" + (f"\n{content}" if content else "")}

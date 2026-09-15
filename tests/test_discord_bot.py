@@ -200,7 +200,7 @@ def test_mass_entry_kwargs_pinned_item_appends_set_and_number():
     kw = _mass_entry_kwargs([
         {"quantity": 1, "card_name": "Black Lotus", "set_code": "LEA", "collector_number": "232"},
     ])
-    assert kw["content"] == "**Paste into ManaPool's Mass Entry:**\n```\n1 Black Lotus {LEA} 232\n```"
+    assert kw["content"] == "**Paste into ManaPool's Mass Entry:**\n```\n1 Black Lotus [LEA] 232\n```"
 
 
 def test_mass_entry_kwargs_mixed_pinned_and_unpinned():
@@ -210,7 +210,7 @@ def test_mass_entry_kwargs_mixed_pinned_and_unpinned():
     ])
     assert kw["content"] == (
         "**Paste into ManaPool's Mass Entry:**\n```\n"
-        "4 Lightning Bolt\n1 Black Lotus {LEA} 232\n```"
+        "4 Lightning Bolt\n1 Black Lotus [LEA] 232\n```"
     )
 
 
