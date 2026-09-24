@@ -31,6 +31,7 @@ class Config:
     arbitrage_min_liquidity_sales: float = 0.0    # min sales/30d to include in arb (0 = no filter)
     arbitrage_liquidity_lookback_days: int = 60   # days to count sales for liquidity
     pricer_race_to_bottom_threshold: float = 0.20  # low_price < trend × (1 - this) = race to bottom
+    pricer_race_to_bottom_min_gap_usd: float = 0.10  # ...and trend - low_price must be at least this
     pricer_min_margin_pct: float = 0.10       # cost floor = cost_basis * (1 + this)
     pricer_cost_floor_days: int = 30          # days below floor before cost floor is lifted
     pricer_schedule_hour: int = 2             # hour (local time) for daily price update job
@@ -105,6 +106,8 @@ def load_config(config_path: Path | None = None) -> Config:
         pricer = raw.get("pricer", {})
         if "race_to_bottom_threshold" in pricer:
             base["pricer_race_to_bottom_threshold"] = float(pricer["race_to_bottom_threshold"])
+        if "race_to_bottom_min_gap_usd" in pricer:
+            base["pricer_race_to_bottom_min_gap_usd"] = float(pricer["race_to_bottom_min_gap_usd"])
         if "min_margin_pct" in pricer:
             base["pricer_min_margin_pct"] = float(pricer["min_margin_pct"])
         if "cost_floor_days" in pricer:
@@ -159,6 +162,8 @@ def load_config(config_path: Path | None = None) -> Config:
         base["optimizer_destination"] = os.environ["OPTIMIZER_DESTINATION"]
     if os.getenv("PRICER_RACE_TO_BOTTOM_THRESHOLD"):
         base["pricer_race_to_bottom_threshold"] = float(os.environ["PRICER_RACE_TO_BOTTOM_THRESHOLD"])
+    if os.getenv("PRICER_RACE_TO_BOTTOM_MIN_GAP_USD"):
+        base["pricer_race_to_bottom_min_gap_usd"] = float(os.environ["PRICER_RACE_TO_BOTTOM_MIN_GAP_USD"])
     if os.getenv("PRICER_MIN_MARGIN_PCT"):
         base["pricer_min_margin_pct"] = float(os.environ["PRICER_MIN_MARGIN_PCT"])
     if os.getenv("PRICER_COST_FLOOR_DAYS"):
@@ -203,6 +208,7 @@ def load_config(config_path: Path | None = None) -> Config:
         arbitrage_min_liquidity_sales=base.get("arbitrage_min_liquidity_sales", 0.0),
         arbitrage_liquidity_lookback_days=base.get("arbitrage_liquidity_lookback_days", 60),
         pricer_race_to_bottom_threshold=base.get("pricer_race_to_bottom_threshold", 0.20),
+        pricer_race_to_bottom_min_gap_usd=base.get("pricer_race_to_bottom_min_gap_usd", 0.10),
         pricer_min_margin_pct=base.get("pricer_min_margin_pct", 0.10),
         pricer_cost_floor_days=base.get("pricer_cost_floor_days", 30),
         pricer_schedule_hour=base.get("pricer_schedule_hour", 2),

@@ -781,3 +781,35 @@ def test_double_sided_upgrade_malformed_number_falls_back_to_name_index():
     assert len(upgrades) == 1
     # Falls back to whatever build_name_index() picked -- not a crash, not silently dropped.
     assert upgrades[0].upgrade_scryfall_id == "lander-8"
+
+
+# ---------------------------------------------------------------------------
+# Tests: race-to-bottom guard on near-bulk cards
+# ---------------------------------------------------------------------------
+
+def test_race_guard_off_when_low_at_hard_floor():
+    """Low already at $0.15 can't race lower — follow it rather than hold at a
+    projection inflated by scattered above-floor sales."""
+    sales = [_sale(30, days_ago=i * 3) for i in range(10)]
+    v = _variant(low_price_usd=0.15, recent_sales=sales)
+    rec = _compute(v, current_price=0.30, config=DEFAULT_CONFIG)
+    assert rec.new_price_usd == HARD_FLOOR_USD
+    assert rec.reason == "hard_floor"
+
+
+def test_race_guard_off_when_absolute_gap_small():
+    """$0.18 low vs ~$0.25 projection is >20% but only 7¢ — beat the low."""
+    sales = [_sale(25, days_ago=i * 3) for i in range(10)]
+    v = _variant(low_price_usd=0.18, recent_sales=sales)
+    rec = _compute(v, current_price=0.25, config=DEFAULT_CONFIG)
+    assert rec.reason == "trend_beat_low"
+    assert rec.new_price_usd == pytest.approx(0.17, abs=0.001)
+
+
+def test_race_guard_holds_when_absolute_gap_large():
+    """$0.20 low vs ~$0.50 projection clears both thresholds — hold at projection."""
+    sales = [_sale(50, days_ago=i * 3) for i in range(10)]
+    v = _variant(low_price_usd=0.20, recent_sales=sales)
+    rec = _compute(v, current_price=0.50, config=DEFAULT_CONFIG)
+    assert rec.reason == "trend_race_to_bottom"
+    assert rec.new_price_usd == pytest.approx(0.50, abs=0.01)

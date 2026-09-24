@@ -201,7 +201,7 @@ python setup_bot.py upgrade
 Each listing is priced against ManaPool catalog data (sales history + live competing listings) cross-referenced with TCGPlayer market prices via TCGTracking:
 
 1. **Trend projection** — linear regression over recent sales with Tukey IQR outlier removal
-2. **Beat the low** — if competing listings exist, price 1¢ below the lowest (race-to-bottom guard: hold at trend if the low is >20% below projection)
+2. **Beat the low** — if competing listings exist, price 1¢ below the lowest (race-to-bottom guard: hold at trend if the low is >20% and ≥$0.10 below projection, and above the $0.15 floor)
 3. **TCGPlayer anchor** — when no ManaPool competing listings exist, use TCGPlayer market price directly (more transaction volume than sparse ManaPool data)
 4. **Finish pooling** — for cheap cards (<$2) with sparse data, foil and nonfoil sales are pooled together; same logic applied to TCGPlayer finish lookups
 5. **Cost floor** — never price below `cost_basis × (1 + min_margin_pct)` within `cost_floor_days` of purchase
@@ -221,6 +221,7 @@ Each listing is priced against ManaPool catalog data (sales history + live compe
 | `PRICER_SCHEDULE_HOUR` | `2` | Local hour for daily auto-reprice (0–23) |
 | `PRICER_SCHEDULE_TIMEZONE` | `America/Chicago` | IANA timezone string for the scheduler |
 | `PRICER_RACE_TO_BOTTOM_THRESHOLD` | `0.20` | Hold at trend if low price is >20% below projection |
+| `PRICER_RACE_TO_BOTTOM_MIN_GAP_USD` | `0.10` | ...and at least this many dollars below it; never holds when low is at the $0.15 floor |
 | `PRICER_MIN_MARGIN_PCT` | `0.10` | Minimum margin above cost basis (10%) |
 | `PRICER_COST_FLOOR_DAYS` | `30` | Days to enforce cost floor after purchase |
 | `DB_PATH` | `data/manabot.db` | SQLite database path |

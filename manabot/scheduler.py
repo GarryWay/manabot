@@ -47,6 +47,7 @@ def schedule_daily_price_update(config: Config) -> None:
         )
         pricing_cfg = PricingConfig(
             race_to_bottom_threshold=config.pricer_race_to_bottom_threshold,
+            race_to_bottom_min_gap_usd=config.pricer_race_to_bottom_min_gap_usd,
             min_margin_pct=config.pricer_min_margin_pct,
             cost_floor_days=config.pricer_cost_floor_days,
             iqr_fence_factor=config.pricer_iqr_fence_factor,

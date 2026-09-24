@@ -8,6 +8,8 @@ Pricing algorithm per listing
 3. Compare trend projection to low_price (lowest current listing):
      - low_price ≈ projection (within race_to_bottom_threshold): price at low_price - $0.01
      - low_price << projection (race to bottom):                  price at projection (don't chase)
+       — only when the gap is also >= race_to_bottom_min_gap_usd and low_price is
+         above the $0.15 hard floor; otherwise it's beat-low (see _is_race_to_bottom)
      - no low_price (no active listings):                         price at projection
      - no recent_sales, but low_price exists:                     price at low_price - $0.01
      - neither:                                                    leave price unchanged (no_data)
@@ -48,6 +50,7 @@ _FINISH_TO_CATALOG_ID: dict[Finish, str] = {
 @dataclass
 class PricingConfig:
     race_to_bottom_threshold: float = 0.20  # low_price < projection × (1 - this) = race to bottom
+    race_to_bottom_min_gap_usd: float = 0.10  # ...and projection - low_price must be at least this
     min_margin_pct: float = 0.10            # cost floor = cost_basis × (1 + this)
     cost_floor_days: int = 30               # days below floor before constraint lifts
     liquidity_lookback_days: int = 60       # window for sales when computing liquidity
@@ -200,6 +203,23 @@ def _recent_sale_price(recent_sales: list[dict], max_sale_age_days: int) -> Opti
     return int(last["price"]) / 100.0
 
 
+def _is_race_to_bottom(low: float, projected: float, config: PricingConfig) -> bool:
+    """True when low_price is far enough below the projection to hold rather than chase.
+
+    Near-bulk cards need two extra guards, because their sales scatter between the
+    floor and several times it (cart-consolidation buys), which pulls the regression
+    well above where copies actually move while hundreds sit at the low:
+    - A low already at HARD_FLOOR_USD can't race any lower — it IS the market.
+    - The gap must also clear race_to_bottom_min_gap_usd in absolute terms, since a
+      20% relative gap on a $0.20 card is a few cents of sales noise.
+    """
+    if low <= HARD_FLOOR_USD:
+        return False
+    if projected - low < config.race_to_bottom_min_gap_usd:
+        return False
+    return low < projected * (1.0 - config.race_to_bottom_threshold)
+
+
 def _compute_trend_target(
     variant: CatalogVariant,
     config: PricingConfig,
@@ -221,7 +241,7 @@ def _compute_trend_target(
 
     if projected is not None:
         if low is not None:
-            if low < projected * (1.0 - config.race_to_bottom_threshold):
+            if _is_race_to_bottom(low, projected, config):
                 return projected, "trend_race_to_bottom"
             return max(low - 0.01, 0.01), "trend_beat_low"
         # No competing ManaPool listings — TCGPlayer market is a better signal than
@@ -601,6 +621,7 @@ def run_pricing_update(
     if pricing_config is None:
         pricing_config = PricingConfig(
             race_to_bottom_threshold=getattr(config, "pricer_race_to_bottom_threshold", 0.20),
+            race_to_bottom_min_gap_usd=getattr(config, "pricer_race_to_bottom_min_gap_usd", 0.10),
             min_margin_pct=getattr(config, "pricer_min_margin_pct", 0.10),
             cost_floor_days=getattr(config, "pricer_cost_floor_days", 30),
         )
