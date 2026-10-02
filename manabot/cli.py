@@ -1087,7 +1087,7 @@ def price_update(
     from manabot.config import load_config
     from manabot.api.manapool import ManaPoolClient
     from manabot.db import open_db
-    from manabot.pricer import run_pricing_update, PricingConfig
+    from manabot.pricer import bounds_report, format_bounds_line, pricing_config_from, run_pricing_update, write_bounds_report
 
     try:
         config = load_config(config_path)
@@ -1100,17 +1100,7 @@ def price_update(
         token=config.manapool_token,
         use_bulk_export=config.use_bulk_export,
     )
-    pricing_cfg = PricingConfig(
-        race_to_bottom_threshold=config.pricer_race_to_bottom_threshold,
-        race_to_bottom_min_gap_usd=config.pricer_race_to_bottom_min_gap_usd,
-        min_margin_pct=config.pricer_min_margin_pct,
-        cost_floor_days=config.pricer_cost_floor_days,
-        iqr_fence_factor=config.pricer_iqr_fence_factor,
-        min_sales_for_regression=config.pricer_min_sales_for_regression,
-        max_sale_age_days=config.pricer_max_sale_age_days,
-        finish_merge_max_price_usd=getattr(config, "pricer_finish_merge_max_price_usd", 2.0),
-        finish_merge_threshold_usd=getattr(config, "pricer_finish_merge_threshold_usd", 1.0),
-    )
+    pricing_cfg = pricing_config_from(config)
 
     if dry_run:
         click.echo("[dry-run] Simulating price update — no changes will be applied.")
@@ -1143,6 +1133,15 @@ def price_update(
                 f"  ${r.current_price_usd:.2f} -> ${r.new_price_usd:.2f}"
                 f"  ({r.reason}, {trend_str}, {low_str})"
             )
+
+    threshold = pricing_cfg.bounds_report_pct
+    flagged = bounds_report(recommendations, threshold)
+    if flagged:
+        path = write_bounds_report(flagged, config.reports_dir, threshold)
+        click.echo(f"\nSell rules review — {len(flagged)} listing(s) priced >{threshold:.0%} outside their bounds:")
+        for r in flagged:
+            click.echo(f"  {format_bounds_line(r, threshold)}")
+        click.echo(f"  Report written to {path}")
 
 
 @cli.command("margin-report")
@@ -1287,3 +1286,154 @@ def pricer_scheduler(ctx: click.Context, config_path: Path | None) -> None:
         click.echo(f"Config error: {e}", err=True)
         sys.exit(1)
     schedule_daily_price_update(config)
+
+
+# ---------------------------------------------------------------------------
+# sell-rules: per-card pricing strategy + bounds (manabot/sell_rules.py)
+# ---------------------------------------------------------------------------
+
+def _load_config_or_exit(config_path: Path | None):
+    from manabot.config import load_config
+    try:
+        return load_config(config_path)
+    except (ValueError, FileNotFoundError) as e:
+        click.echo(f"Config error: {e}", err=True)
+        sys.exit(1)
+
+
+def _seller_inventory(config) -> list:
+    from manabot.api.manapool import ManaPoolClient
+    client = ManaPoolClient(email=config.manapool_email, token=config.manapool_token)
+    return client.get_seller_inventory()
+
+
+@cli.group("sell-rules")
+def sell_rules_group() -> None:
+    """Manage per-card selling rules (strategy + min/max price) for the pricer.
+
+    Rules live in a CSV (default data/sell_rules.csv, config paths.sell_rules or
+    SELL_RULES_PATH). Edit it by hand, or use these helpers to fill in the ids.
+    """
+
+
+@sell_rules_group.command("add")
+@click.option("--config", "config_path", type=click.Path(path_type=Path), default=None)
+@click.option("--set", "set_code", required=True, help="Set code printed on the card, e.g. M10.")
+@click.option("--number", "collector_number", required=True,
+              help="Collector number, e.g. 146 (double-sided tokens: the compound number, e.g. 2-7).")
+@click.option("--name", "card_name", default="", help="Optional — checked against the resolved card.")
+@click.option("--condition", type=click.Choice(["NM", "LP", "MP", "HP", "DMG"], case_sensitive=False),
+              default=None, help="Only apply to this condition (default: any).")
+@click.option("--finish", type=click.Choice(["nonfoil", "foil"], case_sensitive=False),
+              default=None, help="Only apply to this finish (default: any).")
+@click.option("--strategy", type=click.Choice(["aggressive", "balanced", "hold"], case_sensitive=False),
+              default="balanced", show_default=True)
+@click.option("--min", "min_price", type=float, default=None, help="Never price below this (USD).")
+@click.option("--max", "max_price", type=float, default=None, help="Never price above this (USD).")
+@click.option("--notes", default="")
+@click.option("--verbose", "-v", is_flag=True)
+def sell_rules_add(
+    config_path: Path | None,
+    set_code: str,
+    collector_number: str,
+    card_name: str,
+    condition: str | None,
+    finish: str | None,
+    strategy: str,
+    min_price: float | None,
+    max_price: float | None,
+    notes: str,
+    verbose: bool,
+) -> None:
+    """Resolve a card by set + collector number and append a rule for it."""
+    _configure_logging(verbose)
+    from manabot.api.scryfall import ScryfallClient
+    from manabot.sell_rules import read_rows, resolve_row, write_rows
+
+    if min_price is not None and max_price is not None and min_price > max_price:
+        click.echo("--min must be <= --max", err=True)
+        sys.exit(1)
+    config = _load_config_or_exit(config_path)
+    row = {
+        "card_name": card_name, "set_code": set_code, "collector_number": collector_number,
+        "condition": (condition or "").upper(), "finish": (finish or "").lower(),
+        "strategy": strategy.lower(),
+        "min_price_usd": f"{min_price:.2f}" if min_price is not None else "",
+        "max_price_usd": f"{max_price:.2f}" if max_price is not None else "",
+        "notes": notes,
+    }
+    if resolve_row(row, _seller_inventory(config), ScryfallClient()) != "resolved":
+        click.echo(f"Could not resolve set {set_code.upper()} #{collector_number}.", err=True)
+        sys.exit(1)
+
+    rows = read_rows(config.sell_rules_path)
+    key = lambda r: tuple((r.get(k) or "").strip() for k in ("scryfall_id", "mtgjson_id", "condition", "finish"))  # noqa: E731
+    replaced = any(key(r) == key(row) for r in rows)
+    rows = [r for r in rows if key(r) != key(row)] + [row]
+    write_rows(config.sell_rules_path, rows)
+    click.echo(
+        f"{'Replaced' if replaced else 'Added'} rule: {row['card_name']} [{row['set_code']} #{collector_number}] "
+        f"scryfall_id={row['scryfall_id']} strategy={row['strategy']} "
+        f"min={row['min_price_usd'] or 'none'} max={row['max_price_usd'] or 'none'} -> {config.sell_rules_path}"
+    )
+
+
+@sell_rules_group.command("resolve")
+@click.option("--config", "config_path", type=click.Path(path_type=Path), default=None)
+@click.option("--verbose", "-v", is_flag=True)
+def sell_rules_resolve(config_path: Path | None, verbose: bool) -> None:
+    """Fill in scryfall_id / mtgjson_id / card_name for rows that only have set + number."""
+    _configure_logging(verbose)
+    from manabot.api.scryfall import ScryfallClient
+    from manabot.sell_rules import read_rows, resolve_row, write_rows
+
+    config = _load_config_or_exit(config_path)
+    rows = read_rows(config.sell_rules_path)
+    if not rows:
+        click.echo(f"No rules in {config.sell_rules_path}.")
+        return
+    pending = [r for r in rows if not ((r.get("scryfall_id") or "").strip() or (r.get("mtgjson_id") or "").strip())]
+    if not pending:
+        click.echo("All rows already have ids.")
+        return
+    inventory, scryfall = _seller_inventory(config), ScryfallClient()
+    unresolved = []
+    for r in pending:
+        if resolve_row(r, inventory, scryfall) != "resolved":
+            unresolved.append(r)
+    write_rows(config.sell_rules_path, rows)
+    click.echo(f"Resolved {len(pending) - len(unresolved)} of {len(pending)} row(s) in {config.sell_rules_path}.")
+    for r in unresolved:
+        click.echo(f"  Unresolved: {r.get('card_name') or '?'} set={r.get('set_code') or '?'} #{r.get('collector_number') or '?'}")
+
+
+@sell_rules_group.command("from-inventory")
+@click.option("--config", "config_path", type=click.Path(path_type=Path), default=None)
+@click.option("--min-price", type=float, default=20.0, show_default=True,
+              help="Only add listings currently priced at or above this (USD).")
+@click.option("--strategy", type=click.Choice(["aggressive", "balanced", "hold"], case_sensitive=False),
+              default="balanced", show_default=True)
+@click.option("--verbose", "-v", is_flag=True)
+def sell_rules_from_inventory(config_path: Path | None, min_price: float, strategy: str, verbose: bool) -> None:
+    """Seed the CSV with rows for current listings (ids filled, min/max left blank).
+
+    Listings that already have an exact-match rule are skipped.
+    """
+    _configure_logging(verbose)
+    from manabot.sell_rules import load_sell_rules, read_rows, row_from_listing, write_rows
+
+    config = _load_config_or_exit(config_path)
+    existing = load_sell_rules(config.sell_rules_path)
+    rows = read_rows(config.sell_rules_path)
+    added = []
+    for listing in sorted(_seller_inventory(config), key=lambda l: -l.price_usd):
+        if listing.price_usd < min_price:
+            continue
+        if any(r.matches(listing) for r in existing):
+            continue
+        rows.append(row_from_listing(listing, strategy.lower()))
+        added.append(listing)
+    write_rows(config.sell_rules_path, rows)
+    click.echo(f"Added {len(added)} row(s) to {config.sell_rules_path}:")
+    for l in added:
+        click.echo(f"  {l.card_name} [{l.set_code} #{l.number}] {l.condition.value}/{l.finish.value}  ${l.price_usd:.2f}")

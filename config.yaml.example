@@ -12,12 +12,18 @@ paths:
   buylist: data/buylist.csv
   db: data/manabot.db
   reports_dir: data/reports
+  sell_rules: data/sell_rules.csv  # per-card pricer strategy + min/max
 
 behavior:
   use_bulk_export: false
   max_price_age_days: 1
   trend_window_days: 7
   trend_threshold_pct: 5.0
+
+pricer:
+  cross_market_min_usd: 20.0     # cap at the TCGPlayer target for cards worth at least this...
+  cross_market_max_mp_qty: 4     # ...or with at most this many competing ManaPool copies
+  bounds_report_pct: 0.15        # report sell-rule listings priced this far outside min/max
 
 # Future (not yet active):
 # schedule:

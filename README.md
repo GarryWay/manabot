@@ -74,6 +74,25 @@ python -m manabot import-cost-basis --file purchases.csv
 python -m manabot pricer-scheduler
 ```
 
+### Per-card sell rules
+
+`data/sell_rules.csv` (see `sell_rules.csv.example`) sets a strategy and optional price bounds per printing:
+`aggressive` always undercuts the lowest listing on ManaPool and TCGPlayer, `balanced` is the default pricer,
+and `hold` keeps the current price. `min_price_usd` / `max_price_usd` clamp whatever the strategy picks.
+Listings whose market price lands more than 15% outside their bounds are written to
+`data/reports/sell_rules_review_<date>.csv` (and posted to the Discord webhook by the scheduler) for review.
+
+```bash
+# Add a rule by the set code + collector number printed on the card (ids are looked up for you)
+python -m manabot sell-rules add --set FRA --number 460 --condition NM --finish foil --strategy hold --min 280
+
+# Fill in ids for rows you typed by hand with just set_code + collector_number
+python -m manabot sell-rules resolve
+
+# Seed rows for every current listing priced at or above $20
+python -m manabot sell-rules from-inventory --min-price 20
+```
+
 ### Buylist and cart optimizer
 
 ```bash

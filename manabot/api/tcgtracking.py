@@ -45,6 +45,7 @@ class TCGSKUPricing:
     high: float             # TCGPlayer highest listed price
     listing_count: int      # active TCGPlayer listings
     mp_price: Optional[float]  # ManaPool price when available
+    language: str = "EN"     # each product has one SKU per condition/finish/language
 
 
 class TCGTrackingClient:
@@ -146,6 +147,7 @@ class TCGTrackingClient:
                         high=float(sku.get("hi") or 0),
                         listing_count=int(sku.get("cnt") or 0),
                         mp_price=float(sku["mp"]) if sku.get("mp") else None,
+                        language=sku.get("lng") or "EN",
                     ))
                 except (ValueError, KeyError):
                     continue
@@ -165,6 +167,7 @@ class TCGTrackingClient:
         set_code: str,
         condition: str,    # "NM", "LP", "MP", "HP", "DMG"
         finish: str,       # "nonfoil", "foil", "etched"
+        language: str = "EN",
     ) -> Optional[TCGSKUPricing]:
         """Return per-condition/finish TCGPlayer pricing, or None if not found."""
         self._load_set(set_code)
@@ -176,7 +179,7 @@ class TCGTrackingClient:
             return None
         tcg_finish = _FINISH_TO_TCG.get(finish, "Normal")
         for sku in skus:
-            if sku.condition == condition and sku.finish == tcg_finish:
+            if sku.condition == condition and sku.finish == tcg_finish and sku.language == language:
                 return sku
         return None
 

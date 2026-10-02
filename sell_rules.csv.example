@@ -1,0 +1,3 @@
+card_name,set_code,collector_number,scryfall_id,mtgjson_id,condition,finish,strategy,min_price_usd,max_price_usd,notes
+Simulacrum Shaper,FRA,460,1b3e3d1c-c452-46ef-a41d-6dc14686bc4f,fdc4e39d-fbed-507c-b00d-3ff71e48f8a6,NM,foil,hold,280.00,,hold near TCG; never below 280
+Lightning Bolt,M10,146,,,,,aggressive,,,ids filled in by: python -m manabot sell-rules resolve

@@ -1,7 +1,8 @@
 """Scheduler for automated manabot tasks.
 
 Currently implements, all on the same daily job (configurable hour + timezone):
-  - Seller inventory price update
+  - Seller inventory price update, plus a review report (CSV + Discord webhook) of
+    sell-rule listings whose market price lands well outside their min/max
   - Buy list name validation (correct card_name against Scryfall's own spelling)
   - Buy list coalesce (merge duplicate rows, summing quantities)
 
@@ -34,7 +35,8 @@ def schedule_daily_price_update(config: Config) -> None:
     from manabot.api.scryfall import ScryfallClient
     from manabot.buylist import coalesce_buylist, validate_and_fix_names
     from manabot.db import open_db
-    from manabot.pricer import PricingConfig, run_pricing_update
+    from manabot.pricer import bounds_report, pricing_config_from, run_pricing_update, write_bounds_report
+    from manabot.reporter.discord import send_bounds_report
 
     tz = ZoneInfo(config.pricer_schedule_timezone)
 
@@ -45,20 +47,18 @@ def schedule_daily_price_update(config: Config) -> None:
             token=config.manapool_token,
             use_bulk_export=config.use_bulk_export,
         )
-        pricing_cfg = PricingConfig(
-            race_to_bottom_threshold=config.pricer_race_to_bottom_threshold,
-            race_to_bottom_min_gap_usd=config.pricer_race_to_bottom_min_gap_usd,
-            min_margin_pct=config.pricer_min_margin_pct,
-            cost_floor_days=config.pricer_cost_floor_days,
-            iqr_fence_factor=config.pricer_iqr_fence_factor,
-            min_sales_for_regression=config.pricer_min_sales_for_regression,
-            max_sale_age_days=config.pricer_max_sale_age_days,
-            finish_merge_max_price_usd=config.pricer_finish_merge_max_price_usd,
-            finish_merge_threshold_usd=config.pricer_finish_merge_threshold_usd,
-        )
+        pricing_cfg = pricing_config_from(config)
         try:
             with open_db(config.db_path) as conn:
-                run_pricing_update(client, conn, config, pricing_cfg, dry_run=False)
+                recs = run_pricing_update(client, conn, config, pricing_cfg, dry_run=False)
+            flagged = bounds_report(recs, pricing_cfg.bounds_report_pct)
+            if flagged:
+                path = write_bounds_report(flagged, config.reports_dir, pricing_cfg.bounds_report_pct)
+                log.warning(
+                    "Sell rules review: %d listing(s) priced >%.0f%% outside their min/max — see %s",
+                    len(flagged), pricing_cfg.bounds_report_pct * 100, path,
+                )
+                send_bounds_report(flagged, config.discord_webhook_url, pricing_cfg.bounds_report_pct, str(path))
         except Exception:
             log.exception("Price update job failed")
 

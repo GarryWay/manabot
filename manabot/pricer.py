@@ -13,11 +13,22 @@ Pricing algorithm per listing
      - no low_price (no active listings):                         price at projection
      - no recent_sales, but low_price exists:                     price at low_price - $0.01
      - neither:                                                    leave price unchanged (no_data)
-4. This computed price is stored as trend_target_usd — unmodified for reporting.
-5. Apply cost floor: if cost_basis known and days_below_floor < cost_floor_days:
+4. Cross-market check (TCGPlayer): when the card is worth >= cross_market_min_usd or
+   ManaPool has <= cross_market_max_mp_qty competing copies, buyers are likely to
+   shop around, so the price is capped at a TCGPlayer target decided the same way:
+     - TCG low ≈ TCG market:                   TCG low - $0.01
+     - TCG low << TCG market (race to bottom): TCG market (don't chase)
+5. This computed price is stored as trend_target_usd — unmodified for reporting.
+6. Apply cost floor: if cost_basis known and days_below_floor < cost_floor_days:
        new_price = max(trend_target, cost_basis × (1 + min_margin_pct))
-6. Apply hard floor: new_price = max(new_price, $0.15)
-7. Update only if |new_price - current_price| >= $0.01.
+7. Apply hard floor: new_price = max(new_price, $0.15)
+8. Apply the listing's sell rule, if any (manabot/sell_rules.py):
+     - strategy 'aggressive' skips the race-to-bottom guard in steps 3 and 4 and
+       always runs the cross-market check; 'hold' keeps the current price instead
+     - min/max clamp the price (overriding the cost floor; the hard floor still wins)
+   The pre-clamp price is kept as unclamped_price_usd so listings whose market price
+   lands well outside their bounds can be reported for manual review.
+9. Update only if |new_price - current_price| >= $0.01.
 """
 from __future__ import annotations
 
@@ -35,6 +46,7 @@ from manabot.models import Condition, Finish
 if TYPE_CHECKING:
     from manabot.api.manapool import ManaPoolClient
     from manabot.config import Config
+    from manabot.sell_rules import SellRule
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +71,9 @@ class PricingConfig:
     iqr_fence_factor: float = 1.5           # Tukey fence multiplier for outlier removal (1.5 = standard, 3.0 = extreme only)
     finish_merge_max_price_usd: float = 2.0  # pool foil+nonfoil sales only when market price is below this
     finish_merge_threshold_usd: float = 1.0  # pool foil+nonfoil sales only when their prices are within this
+    cross_market_min_usd: float = 20.0      # cap at the TCGPlayer target for cards worth at least this...
+    cross_market_max_mp_qty: int = 4        # ...or with at most this many competing ManaPool copies
+    bounds_report_pct: float = 0.15         # flag rule listings whose market price is this far outside min/max
 
 
 @dataclass
@@ -77,8 +92,26 @@ class PriceRecommendation:
     tcg_market_usd: Optional[float]     # TCGPlayer market price (from TCGTracking)
     cost_basis_usd: Optional[float]
     reason: str   # 'trend_beat_low', 'trend_race_to_bottom', 'trend_no_listings',
-                  # 'no_sales_beat_low', 'tcg_market', 'no_data', 'cost_floor', 'hard_floor'
+                  # 'no_sales_beat_low', 'tcg_market', 'tcg_beat_low', 'tcg_race_to_bottom',
+                  # 'no_data', 'cost_floor', 'hard_floor', 'rule_hold', 'rule_min', 'rule_max'
     should_update: bool
+    tcg_low_usd: Optional[float] = None       # TCGPlayer lowest listing (exact condition/finish)
+    strategy: str = "balanced"                # from the listing's sell rule
+    rule_min_usd: Optional[float] = None
+    rule_max_usd: Optional[float] = None
+    unclamped_price_usd: Optional[float] = None  # price before the rule's hold/min/max (None = no market data)
+
+    def bounds_miss_pct(self, threshold: float) -> Optional[float]:
+        """How far the unclamped price lands outside min/max, as a fraction of the
+        bound, when that exceeds threshold; else None. Negative = below min."""
+        p = self.unclamped_price_usd
+        if p is None:
+            return None
+        if self.rule_min_usd and p < self.rule_min_usd * (1.0 - threshold):
+            return p / self.rule_min_usd - 1.0
+        if self.rule_max_usd and p > self.rule_max_usd * (1.0 + threshold):
+            return p / self.rule_max_usd - 1.0
+        return None
 
 
 @dataclass
@@ -224,12 +257,14 @@ def _compute_trend_target(
     variant: CatalogVariant,
     config: PricingConfig,
     tcg_market_usd: Optional[float] = None,
+    chase_low: bool = False,
 ) -> tuple[Optional[float], str]:
     """Compute the unflored trend target and reason string.
 
     When ManaPool shows no competing listings (low_price == 0), TCGPlayer market
     price is used as the reference — either alone or to cap an unreliable
-    regression when both signals are available.
+    regression when both signals are available. chase_low (the 'aggressive'
+    strategy) always undercuts the low, skipping the race-to-bottom guard.
     """
     low = variant.low_price_usd if variant.low_price_usd > 0 else None
     projected = _project_price(
@@ -241,7 +276,7 @@ def _compute_trend_target(
 
     if projected is not None:
         if low is not None:
-            if _is_race_to_bottom(low, projected, config):
+            if not chase_low and _is_race_to_bottom(low, projected, config):
                 return projected, "trend_race_to_bottom"
             return max(low - 0.01, 0.01), "trend_beat_low"
         # No competing ManaPool listings — TCGPlayer market is a better signal than
@@ -269,6 +304,46 @@ def _compute_trend_target(
     return None, "no_data"
 
 
+def _tcg_target(
+    tcg_low_usd: Optional[float],
+    tcg_market_usd: Optional[float],
+    config: PricingConfig,
+    chase_low: bool = False,
+) -> tuple[Optional[float], str]:
+    """TCGPlayer counterpart of the ManaPool beat-low / race-to-bottom decision:
+    undercut TCG low, unless it sits far below TCG market (hold at market instead)."""
+    if not tcg_low_usd or tcg_low_usd <= 0:
+        return None, ""
+    if not chase_low and tcg_market_usd and _is_race_to_bottom(tcg_low_usd, tcg_market_usd, config):
+        return tcg_market_usd, "tcg_race_to_bottom"
+    return max(tcg_low_usd - 0.01, 0.01), "tcg_beat_low"
+
+
+def _apply_cross_market(
+    trend_target: float,
+    reason: str,
+    tcg_low_usd: Optional[float],
+    tcg_market_usd: Optional[float],
+    mp_competing_qty: Optional[int],
+    config: PricingConfig,
+    aggressive: bool,
+) -> tuple[float, str]:
+    """Cap trend_target at the TCGPlayer target when buyers are likely to shop around:
+    high-value cards, thin ManaPool supply, or the 'aggressive' strategy. Never raises it."""
+    applies = (
+        aggressive
+        or trend_target >= config.cross_market_min_usd
+        or (tcg_market_usd or 0.0) >= config.cross_market_min_usd
+        or (mp_competing_qty is not None and mp_competing_qty <= config.cross_market_max_mp_qty)
+    )
+    if not applies:
+        return trend_target, reason
+    tcg_target, tcg_reason = _tcg_target(tcg_low_usd, tcg_market_usd, config, chase_low=aggressive)
+    if tcg_target is not None and tcg_target < trend_target:
+        return tcg_target, tcg_reason
+    return trend_target, reason
+
+
 def compute_price(
     listing_scryfall_id: str,
     listing_card_name: str,
@@ -282,85 +357,74 @@ def compute_price(
     days_below_floor: int,
     config: PricingConfig,
     tcg_market_usd: Optional[float] = None,
+    tcg_low_usd: Optional[float] = None,
+    mp_competing_qty: Optional[int] = None,
+    rule: Optional["SellRule"] = None,
 ) -> PriceRecommendation:
     """Compute the optimal price for one of our seller listings."""
-    def _make_rec(
-        trend_target: Optional[float],
-        new_price: float,
-        market: Optional[float],
-        low: Optional[float],
-        reason: str,
-        update: bool,
-    ) -> PriceRecommendation:
-        return PriceRecommendation(
-            scryfall_id=listing_scryfall_id,
-            card_name=listing_card_name,
-            set_code=listing_set_code,
-            condition=listing_condition,
-            finish=listing_finish,
-            language=listing_language,
-            current_price_usd=listing_current_price_usd,
-            trend_target_usd=round(trend_target, 2) if trend_target is not None else None,
-            new_price_usd=new_price,
-            market_price_usd=market,
-            low_price_usd=low,
-            tcg_market_usd=round(tcg_market_usd, 2) if tcg_market_usd is not None else None,
-            cost_basis_usd=cost_basis_usd,
-            reason=reason,
-            should_update=update,
-        )
+    strategy = rule.strategy if rule else "balanced"
+    aggressive = strategy == "aggressive"
+    market = catalog_variant.market_price_usd if catalog_variant else None
+    low = catalog_variant.low_price_usd if catalog_variant and catalog_variant.low_price_usd > 0 else None
 
+    # Market signal. With no ManaPool catalog entry, TCGPlayer market is all we have.
     if catalog_variant is None:
-        if tcg_market_usd is not None:
-            # No ManaPool catalog entry — price from TCGPlayer market with floors
-            trend_target = tcg_market_usd
-            new_price = trend_target
-            reason = "tcg_market"
-            if cost_basis_usd is not None:
-                floor = cost_basis_usd * (1.0 + config.min_margin_pct)
-                if days_below_floor < config.cost_floor_days and new_price < floor:
-                    new_price = floor
-                    reason = "cost_floor"
-            if new_price < HARD_FLOOR_USD:
-                new_price = HARD_FLOOR_USD
-                reason = "hard_floor"
-            new_price = round(new_price, 2)
-            return _make_rec(trend_target, new_price, None, None, reason, abs(new_price - listing_current_price_usd) >= 0.005)
-        return _make_rec(None, listing_current_price_usd, None, None, "no_data", False)
-
-    trend_target, reason = _compute_trend_target(catalog_variant, config, tcg_market_usd)
-
-    if trend_target is None:
-        return _make_rec(
-            None,
-            listing_current_price_usd,
-            catalog_variant.market_price_usd,
-            catalog_variant.low_price_usd if catalog_variant.low_price_usd > 0 else None,
-            "no_data",
-            False,
+        trend_target, reason = (tcg_market_usd, "tcg_market") if tcg_market_usd is not None else (None, "no_data")
+    else:
+        trend_target, reason = _compute_trend_target(catalog_variant, config, tcg_market_usd, chase_low=aggressive)
+    if trend_target is not None:
+        trend_target, reason = _apply_cross_market(
+            trend_target, reason, tcg_low_usd, tcg_market_usd, mp_competing_qty, config, aggressive,
         )
 
-    # Apply floors to get the actual price to set (trend_target stays unmodified)
-    new_price = trend_target
-    if cost_basis_usd is not None:
-        floor_price = cost_basis_usd * (1.0 + config.min_margin_pct)
-        if days_below_floor < config.cost_floor_days and new_price < floor_price:
-            new_price = floor_price
-            reason = "cost_floor"
+    # Apply floors to get the price the strategy would set (trend_target stays unmodified)
+    unclamped: Optional[float] = None
+    if trend_target is not None:
+        unclamped = trend_target
+        if cost_basis_usd is not None:
+            floor_price = cost_basis_usd * (1.0 + config.min_margin_pct)
+            if days_below_floor < config.cost_floor_days and unclamped < floor_price:
+                unclamped = floor_price
+                reason = "cost_floor"
+        if unclamped < HARD_FLOOR_USD:
+            unclamped = HARD_FLOOR_USD
+            reason = "hard_floor"
+        unclamped = round(unclamped, 2)
 
-    if new_price < HARD_FLOOR_USD:
-        new_price = HARD_FLOOR_USD
-        reason = "hard_floor"
+    # Sell rule: 'hold' keeps the current price; min/max override everything but the hard floor
+    new_price = unclamped if unclamped is not None else listing_current_price_usd
+    if rule is not None:
+        if strategy == "hold":
+            new_price, reason = listing_current_price_usd, "rule_hold"
+        if rule.min_price_usd is not None and new_price < rule.min_price_usd:
+            new_price, reason = rule.min_price_usd, "rule_min"
+        if rule.max_price_usd is not None and new_price > rule.max_price_usd:
+            new_price, reason = rule.max_price_usd, "rule_max"
+        if new_price < HARD_FLOOR_USD:
+            new_price, reason = HARD_FLOOR_USD, "hard_floor"
+        new_price = round(new_price, 2)
 
-    new_price = round(new_price, 2)
-
-    return _make_rec(
-        trend_target,
-        new_price,
-        catalog_variant.market_price_usd,
-        catalog_variant.low_price_usd if catalog_variant.low_price_usd > 0 else None,
-        reason,
-        abs(new_price - listing_current_price_usd) >= 0.005,
+    return PriceRecommendation(
+        scryfall_id=listing_scryfall_id,
+        card_name=listing_card_name,
+        set_code=listing_set_code,
+        condition=listing_condition,
+        finish=listing_finish,
+        language=listing_language,
+        current_price_usd=listing_current_price_usd,
+        trend_target_usd=round(trend_target, 2) if trend_target is not None else None,
+        new_price_usd=new_price,
+        market_price_usd=market,
+        low_price_usd=low,
+        tcg_market_usd=round(tcg_market_usd, 2) if tcg_market_usd is not None else None,
+        cost_basis_usd=cost_basis_usd,
+        reason=reason,
+        should_update=abs(new_price - listing_current_price_usd) >= 0.005,
+        tcg_low_usd=round(tcg_low_usd, 2) if tcg_low_usd else None,
+        strategy=strategy,
+        rule_min_usd=rule.min_price_usd if rule else None,
+        rule_max_usd=rule.max_price_usd if rule else None,
+        unclamped_price_usd=unclamped,
     )
 
 
@@ -618,13 +682,15 @@ def run_pricing_update(
         log_price_update, record_sales, update_floor_tracking,
     )
 
+    from manabot.sell_rules import find_rule, load_sell_rules
+
     if pricing_config is None:
-        pricing_config = PricingConfig(
-            race_to_bottom_threshold=getattr(config, "pricer_race_to_bottom_threshold", 0.20),
-            race_to_bottom_min_gap_usd=getattr(config, "pricer_race_to_bottom_min_gap_usd", 0.10),
-            min_margin_pct=getattr(config, "pricer_min_margin_pct", 0.10),
-            cost_floor_days=getattr(config, "pricer_cost_floor_days", 30),
-        )
+        pricing_config = pricing_config_from(config)
+
+    sell_rules_path = Path(getattr(config, "sell_rules_path", "data/sell_rules.csv"))
+    sell_rules = load_sell_rules(sell_rules_path)
+    if sell_rules:
+        log.info("Loaded %d sell rule(s) from %s", len(sell_rules), sell_rules_path)
 
     tcg_cache_dir = Path(getattr(config, "tcg_cache_dir", "data/tcgtracking"))
     tcg = TCGTrackingClient(cache_dir=tcg_cache_dir)
@@ -735,6 +801,16 @@ def run_pricing_update(
             if tcg_market is not None and tcg_market >= pricing_config.finish_merge_max_price_usd:
                 tcg_market = None  # other finish is expensive — not a valid proxy
 
+        # TCG low is only a fair cap for the exact condition/finish, and TCGTracking's
+        # SKUs are English — a foreign-language listing isn't competing with them.
+        tcg_low = None
+        if listing.language == "EN":
+            sku = tcg.get_sku(listing.scryfall_id, listing.set_code, listing.condition.value, listing.finish.value)
+            tcg_low = sku.low if sku and sku.low > 0 else None
+        # The catalog already excludes our own listings (its low_price sits above ours
+        # when we're the cheapest), so available_quantity is competitor stock as-is.
+        mp_competing_qty = catalog_variant.available_quantity if catalog_variant else None
+
         rec = compute_price(
             listing_scryfall_id=listing.scryfall_id,
             listing_card_name=listing.card_name,
@@ -748,6 +824,9 @@ def run_pricing_update(
             days_below_floor=days_below,
             config=pricing_config,
             tcg_market_usd=tcg_market,
+            tcg_low_usd=tcg_low,
+            mp_competing_qty=mp_competing_qty,
+            rule=find_rule(sell_rules, listing),
         )
         recommendations.append(rec)
 
@@ -797,3 +876,72 @@ def run_pricing_update(
         len(recommendations), n_would_update, skipped,
     )
     return recommendations
+
+
+def pricing_config_from(config: "Config") -> PricingConfig:
+    """Build PricingConfig from the app Config (CLI and scheduler share this)."""
+    return PricingConfig(
+        race_to_bottom_threshold=config.pricer_race_to_bottom_threshold,
+        race_to_bottom_min_gap_usd=config.pricer_race_to_bottom_min_gap_usd,
+        min_margin_pct=config.pricer_min_margin_pct,
+        cost_floor_days=config.pricer_cost_floor_days,
+        iqr_fence_factor=config.pricer_iqr_fence_factor,
+        min_sales_for_regression=config.pricer_min_sales_for_regression,
+        max_sale_age_days=config.pricer_max_sale_age_days,
+        finish_merge_max_price_usd=config.pricer_finish_merge_max_price_usd,
+        finish_merge_threshold_usd=config.pricer_finish_merge_threshold_usd,
+        cross_market_min_usd=config.pricer_cross_market_min_usd,
+        cross_market_max_mp_qty=config.pricer_cross_market_max_mp_qty,
+        bounds_report_pct=config.pricer_bounds_report_pct,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sell-rule bounds report
+# ---------------------------------------------------------------------------
+
+_BOUNDS_REPORT_COLUMNS = [
+    "card_name", "set_code", "condition", "finish", "strategy", "min_price_usd", "max_price_usd",
+    "market_view_usd", "miss_pct", "listed_at_usd", "mp_low_usd", "tcg_low_usd", "tcg_market_usd",
+    "cost_basis_usd", "reason",
+]
+
+
+def bounds_report(recs: list[PriceRecommendation], threshold: float) -> list[PriceRecommendation]:
+    """Listings whose market-driven price lands more than `threshold` outside their
+    sell rule's min/max — the rule is pinning them, so a human should take a look."""
+    flagged = [r for r in recs if r.bounds_miss_pct(threshold) is not None]
+    return sorted(flagged, key=lambda r: -abs(r.bounds_miss_pct(threshold) or 0.0))
+
+
+def write_bounds_report(flagged: list[PriceRecommendation], reports_dir: Path, threshold: float) -> Path:
+    """Write the bounds report as CSV under reports_dir; returns the path."""
+    import csv
+
+    reports_dir = Path(reports_dir)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    path = reports_dir / f"sell_rules_review_{datetime.now().strftime('%Y-%m-%d')}.csv"
+    money = lambda v: f"{v:.2f}" if v is not None else ""  # noqa: E731
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(_BOUNDS_REPORT_COLUMNS)
+        for r in flagged:
+            writer.writerow([
+                r.card_name, r.set_code, r.condition.value, r.finish.value, r.strategy,
+                money(r.rule_min_usd), money(r.rule_max_usd), money(r.unclamped_price_usd),
+                f"{(r.bounds_miss_pct(threshold) or 0.0) * 100:+.0f}%", money(r.new_price_usd),
+                money(r.low_price_usd), money(r.tcg_low_usd), money(r.tcg_market_usd),
+                money(r.cost_basis_usd), r.reason,
+            ])
+    return path
+
+
+def format_bounds_line(r: PriceRecommendation, threshold: float) -> str:
+    lo = f"${r.rule_min_usd:.2f}" if r.rule_min_usd is not None else "none"
+    hi = f"${r.rule_max_usd:.2f}" if r.rule_max_usd is not None else "none"
+    bounds = f"{lo} to {hi}"
+    return (
+        f"{r.card_name} [{r.set_code}] {r.condition.value}/{r.finish.value}: "
+        f"market ${r.unclamped_price_usd:.2f} vs bounds {bounds} "
+        f"({(r.bounds_miss_pct(threshold) or 0.0) * 100:+.0f}%), listed at ${r.new_price_usd:.2f}"
+    )

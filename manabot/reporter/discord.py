@@ -71,3 +71,48 @@ def _build_payload(good_buys: list[MatchResult], summary: dict, run_at: datetime
             }
         ]
     }
+
+
+def send_bounds_report(
+    flagged: list,
+    webhook_url: str,
+    threshold: float,
+    report_path: str = "",
+    dry_run: bool = False,
+) -> None:
+    """Post sell-rule listings whose market price is well outside their min/max.
+
+    flagged is a list of pricer.PriceRecommendation (see pricer.bounds_report)."""
+    from manabot.pricer import format_bounds_line
+
+    if not flagged:
+        return
+    if not webhook_url:
+        log.info("Discord webhook not configured — skipping sell rules review notification.")
+        return
+
+    max_lines = 15
+    lines = [f"• {format_bounds_line(r, threshold)}" for r in flagged[:max_lines]]
+    if len(flagged) > max_lines:
+        lines.append(f"…and {len(flagged) - max_lines} more")
+    if report_path:
+        lines.append(f"\nFull report: `{report_path}`")
+    payload = {
+        "embeds": [{
+            "title": f"Sell rules review — {len(flagged)} listing(s) priced >{threshold:.0%} outside bounds",
+            "description": "\n".join(lines)[:4000],
+            "color": 0xF1C40F,
+        }],
+    }
+
+    if dry_run:
+        print("[dry-run] Discord payload:")
+        print(json.dumps(payload, indent=2))
+        return
+
+    try:
+        resp = requests.post(webhook_url, json=payload, timeout=10)
+        resp.raise_for_status()
+        log.info("Discord sell rules review sent.")
+    except requests.RequestException as e:
+        log.warning("Discord sell rules review failed: %s", e)

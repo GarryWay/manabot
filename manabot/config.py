@@ -41,6 +41,10 @@ class Config:
     pricer_max_sale_age_days: int = 90        # ignore sales data if most recent sale is older
     pricer_finish_merge_max_price_usd: float = 2.0   # pool foil+NF sales only when market < this
     pricer_finish_merge_threshold_usd: float = 1.0   # pool foil+NF sales only when prices within this
+    pricer_cross_market_min_usd: float = 20.0   # cap at TCGPlayer target for cards worth at least this
+    pricer_cross_market_max_mp_qty: int = 4     # ...or with at most this many competing ManaPool copies
+    pricer_bounds_report_pct: float = 0.15      # report sell-rule listings this far outside min/max
+    sell_rules_path: Path = Path("data/sell_rules.csv")
     catalog_cache_path: Path = Path("data/manapool_catalog.json.gz")
     tcg_cache_dir: Path = Path("data/tcgtracking")
     # Required for pending order creation/purchase: name, line1, city, state (2-char), postal_code, country
@@ -73,6 +77,8 @@ def load_config(config_path: Path | None = None) -> Config:
             base["db_path"] = Path(paths["db"])
         if "reports_dir" in paths:
             base["reports_dir"] = Path(paths["reports_dir"])
+        if "sell_rules" in paths:
+            base["sell_rules_path"] = Path(paths["sell_rules"])
         behavior = raw.get("behavior", {})
         if "use_bulk_export" in behavior:
             base["use_bulk_export"] = bool(behavior["use_bulk_export"])
@@ -116,6 +122,12 @@ def load_config(config_path: Path | None = None) -> Config:
             base["pricer_schedule_hour"] = int(pricer["schedule_hour"])
         if "schedule_timezone" in pricer:
             base["pricer_schedule_timezone"] = str(pricer["schedule_timezone"])
+        if "cross_market_min_usd" in pricer:
+            base["pricer_cross_market_min_usd"] = float(pricer["cross_market_min_usd"])
+        if "cross_market_max_mp_qty" in pricer:
+            base["pricer_cross_market_max_mp_qty"] = int(pricer["cross_market_max_mp_qty"])
+        if "bounds_report_pct" in pricer:
+            base["pricer_bounds_report_pct"] = float(pricer["bounds_report_pct"])
         catalog_cfg = raw.get("catalog", {})
         if "cache_path" in catalog_cfg:
             base["catalog_cache_path"] = Path(catalog_cfg["cache_path"])
@@ -170,6 +182,14 @@ def load_config(config_path: Path | None = None) -> Config:
         base["pricer_cost_floor_days"] = int(os.environ["PRICER_COST_FLOOR_DAYS"])
     if os.getenv("PRICER_SCHEDULE_TIMEZONE"):
         base["pricer_schedule_timezone"] = os.environ["PRICER_SCHEDULE_TIMEZONE"]
+    if os.getenv("PRICER_CROSS_MARKET_MIN_USD"):
+        base["pricer_cross_market_min_usd"] = float(os.environ["PRICER_CROSS_MARKET_MIN_USD"])
+    if os.getenv("PRICER_CROSS_MARKET_MAX_MP_QTY"):
+        base["pricer_cross_market_max_mp_qty"] = int(os.environ["PRICER_CROSS_MARKET_MAX_MP_QTY"])
+    if os.getenv("PRICER_BOUNDS_REPORT_PCT"):
+        base["pricer_bounds_report_pct"] = float(os.environ["PRICER_BOUNDS_REPORT_PCT"])
+    if os.getenv("SELL_RULES_PATH"):
+        base["sell_rules_path"] = Path(os.environ["SELL_RULES_PATH"])
     if os.getenv("CATALOG_CACHE_PATH"):
         base["catalog_cache_path"] = Path(os.environ["CATALOG_CACHE_PATH"])
     if os.getenv("ARBITRAGE_MIN_LIQUIDITY_SALES"):
@@ -213,6 +233,10 @@ def load_config(config_path: Path | None = None) -> Config:
         pricer_cost_floor_days=base.get("pricer_cost_floor_days", 30),
         pricer_schedule_hour=base.get("pricer_schedule_hour", 2),
         pricer_schedule_timezone=base.get("pricer_schedule_timezone", "America/Chicago"),
+        pricer_cross_market_min_usd=base.get("pricer_cross_market_min_usd", 20.0),
+        pricer_cross_market_max_mp_qty=base.get("pricer_cross_market_max_mp_qty", 4),
+        pricer_bounds_report_pct=base.get("pricer_bounds_report_pct", 0.15),
+        sell_rules_path=base.get("sell_rules_path", Path("data/sell_rules.csv")),
         catalog_cache_path=base.get("catalog_cache_path", Path("data/manapool_catalog.json.gz")),
         shipping_address=base.get("shipping_address", None),
         billing_address=base.get("billing_address", None),

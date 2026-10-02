@@ -17,6 +17,7 @@ CLAUDE.md
 data/manabot.db
 data/reports/
 data/buylist.csv
+data/sell_rules.csv
 data/last_cart.json
 data/manabot.log
 data/scryfall_oracle.json

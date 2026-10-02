@@ -813,3 +813,160 @@ def test_race_guard_holds_when_absolute_gap_large():
     rec = _compute(v, current_price=0.50, config=DEFAULT_CONFIG)
     assert rec.reason == "trend_race_to_bottom"
     assert rec.new_price_usd == pytest.approx(0.50, abs=0.01)
+
+
+
+# ---------------------------------------------------------------------------
+# Cross-market (TCGPlayer low) check
+# ---------------------------------------------------------------------------
+
+def _compute_x(
+    variant: CatalogVariant | None,
+    tcg_low: float | None = None,
+    tcg_market: float | None = None,
+    competing_qty: int | None = 10,
+    current_price: float = 300.00,
+    rule=None,
+    cost_basis: float | None = None,
+) -> PriceRecommendation:
+    return compute_price(
+        listing_scryfall_id="abc-123",
+        listing_card_name="Test Card",
+        listing_set_code="TST",
+        listing_condition=Condition.NM,
+        listing_finish=Finish.NONFOIL,
+        listing_language="EN",
+        listing_current_price_usd=current_price,
+        catalog_variant=variant,
+        cost_basis_usd=cost_basis,
+        days_below_floor=0,
+        config=DEFAULT_CONFIG,
+        tcg_market_usd=tcg_market,
+        tcg_low_usd=tcg_low,
+        mp_competing_qty=competing_qty,
+        rule=rule,
+    )
+
+
+def test_cross_market_caps_high_value_card_at_tcg_low():
+    """Simulacrum Shaper case: beating the ManaPool low still leaves us above TCG low
+    (which sits above TCG market, so it isn't a race to bottom) — undercut TCG low."""
+    v = _variant(low_price_usd=320.00)
+    rec = _compute_x(v, tcg_low=289.00, tcg_market=266.00)
+    assert rec.reason == "tcg_beat_low"
+    assert rec.new_price_usd == pytest.approx(288.99)
+    assert rec.tcg_low_usd == 289.00
+
+
+def test_cross_market_holds_at_tcg_market_when_tcg_low_races_to_bottom():
+    v = _variant(low_price_usd=320.00)
+    rec = _compute_x(v, tcg_low=200.00, tcg_market=280.00)
+    assert rec.reason == "tcg_race_to_bottom"
+    assert rec.new_price_usd == pytest.approx(280.00)
+
+
+def test_cross_market_never_raises_price():
+    v = _variant(low_price_usd=250.00)
+    rec = _compute_x(v, tcg_low=289.00, tcg_market=266.00)
+    assert rec.reason == "no_sales_beat_low"
+    assert rec.new_price_usd == pytest.approx(249.99)
+
+
+def test_cross_market_skipped_for_cheap_card_with_deep_manapool_supply():
+    v = _variant(low_price_usd=5.00)
+    rec = _compute_x(v, tcg_low=4.00, tcg_market=4.20, competing_qty=50, current_price=5.00)
+    assert rec.reason == "no_sales_beat_low"
+    assert rec.new_price_usd == pytest.approx(4.99)
+
+
+def test_cross_market_applies_to_cheap_card_with_thin_manapool_supply():
+    v = _variant(low_price_usd=5.00)
+    rec = _compute_x(v, tcg_low=4.00, tcg_market=4.20, competing_qty=3, current_price=5.00)
+    assert rec.reason == "tcg_beat_low"
+    assert rec.new_price_usd == pytest.approx(3.99)
+
+
+# ---------------------------------------------------------------------------
+# Sell rules: strategy + bounds
+# ---------------------------------------------------------------------------
+
+def _rule(**kw):
+    from manabot.sell_rules import SellRule
+    return SellRule(scryfall_id="abc-123", **kw)
+
+
+def test_aggressive_strategy_chases_manapool_race_to_bottom():
+    sales = [_sale(1000, days_ago=i * 5) for i in range(5)]
+    v = _variant(low_price_usd=6.00, recent_sales=sales)
+    assert _compute_x(v, current_price=10.0, competing_qty=50).reason == "trend_race_to_bottom"
+    rec = _compute_x(v, current_price=10.0, competing_qty=50, rule=_rule(strategy="aggressive"))
+    assert rec.reason == "trend_beat_low"
+    assert rec.new_price_usd == pytest.approx(5.99)
+    assert rec.strategy == "aggressive"
+
+
+def test_aggressive_strategy_always_checks_tcg():
+    v = _variant(low_price_usd=5.00)
+    rec = _compute_x(v, tcg_low=4.00, tcg_market=4.20, competing_qty=50, current_price=5.00,
+                     rule=_rule(strategy="aggressive"))
+    assert rec.reason == "tcg_beat_low"
+    assert rec.new_price_usd == pytest.approx(3.99)
+
+
+def test_hold_strategy_keeps_current_price_but_records_market_view():
+    v = _variant(low_price_usd=250.00)
+    rec = _compute_x(v, current_price=300.00, rule=_rule(strategy="hold"))
+    assert rec.reason == "rule_hold"
+    assert rec.new_price_usd == 300.00
+    assert rec.should_update is False
+    assert rec.unclamped_price_usd == pytest.approx(249.99)
+
+
+def test_hold_strategy_still_clamped_by_bounds():
+    v = _variant(low_price_usd=250.00)
+    rec = _compute_x(v, current_price=300.00, rule=_rule(strategy="hold", max_price_usd=280.00))
+    assert rec.reason == "rule_max"
+    assert rec.new_price_usd == 280.00
+
+
+def test_min_bound_overrides_market():
+    v = _variant(low_price_usd=250.00)
+    rec = _compute_x(v, current_price=300.00, rule=_rule(min_price_usd=275.00), cost_basis=100.0)
+    assert rec.reason == "rule_min"
+    assert rec.new_price_usd == 275.00
+
+
+def test_max_bound_overrides_cost_floor():
+    v = _variant(low_price_usd=10.00)
+    rec = _compute_x(v, current_price=10.0, competing_qty=50, rule=_rule(max_price_usd=12.00), cost_basis=20.0)
+    assert rec.unclamped_price_usd == pytest.approx(22.00)  # cost floor
+    assert rec.reason == "rule_max"
+    assert rec.new_price_usd == 12.00
+
+
+def test_bounds_applied_with_no_market_data():
+    rec = _compute_x(None, current_price=5.00, rule=_rule(min_price_usd=8.00))
+    assert rec.reason == "rule_min"
+    assert rec.new_price_usd == 8.00
+    assert rec.unclamped_price_usd is None
+
+
+def test_bounds_miss_and_report():
+    from manabot.pricer import bounds_report
+    v = _variant(low_price_usd=200.00)
+    far = _compute_x(v, rule=_rule(min_price_usd=260.00))     # 199.99 vs 260 -> -23%
+    near = _compute_x(v, rule=_rule(min_price_usd=220.00))    # 199.99 vs 220 -> -9%
+    above = _compute_x(v, rule=_rule(max_price_usd=150.00))   # 199.99 vs 150 -> +33%
+    no_rule = _compute_x(v)
+    assert far.bounds_miss_pct(0.15) == pytest.approx(199.99 / 260 - 1)
+    assert near.bounds_miss_pct(0.15) is None
+    assert bounds_report([far, near, above, no_rule], 0.15) == [above, far]
+
+
+def test_write_bounds_report(tmp_path):
+    from manabot.pricer import bounds_report, write_bounds_report
+    v = _variant(low_price_usd=200.00)
+    flagged = bounds_report([_compute_x(v, rule=_rule(min_price_usd=260.00))], 0.15)
+    path = write_bounds_report(flagged, tmp_path, 0.15)
+    text = path.read_text(encoding="utf-8")
+    assert "Test Card" in text and "260.00" in text and "-23%" in text

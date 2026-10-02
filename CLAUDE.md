@@ -33,6 +33,10 @@ python -m manabot optimize --over-budget-pct 10 --max-iterations 5
 python -m manabot validate-buylist --buylist data/buylist.csv
 python -m manabot validate-buylist --buylist data/buylist.csv --fix-names
 python -m manabot history --card "Lightning Bolt" --days 30
+python -m manabot price-update --dry-run
+python -m manabot sell-rules add --set FRA --number 460 --strategy hold --min 280
+python -m manabot sell-rules resolve
+python -m manabot sell-rules from-inventory --min-price 20
 ```
 
 ## Architecture
@@ -93,9 +97,17 @@ Key design choices:
 
 Config keys: `optimizer_over_budget_pct` (default 0.0), `optimizer_max_iterations` (default 5), `optimizer_destination` (default "US"). All overridable via env vars.
 
+### Seller pricer (`manabot/pricer.py`, `manabot/sell_rules.py`)
+
+`compute_price()` decides each listing's price; the module docstring has the full algorithm. In order: a ManaPool signal (beat the low, or hold at the sales-regression projection when the low is a race to the bottom), then a **TCGPlayer cap**, then the cost floor and $0.15 hard floor, then the listing's **sell rule**.
+- **TCGPlayer cap**: applies when the price is ≥ `pricer_cross_market_min_usd` ($20) or ManaPool has ≤ `pricer_cross_market_max_mp_qty` (4) competing copies. It caps the price at TCG low − $0.01, or at TCG market when TCG low is a race to the bottom (same `_is_race_to_bottom` guard). It only ever lowers the price, and only for English listings. Data comes from TCGTracking (`get_sku()` matches the SKU's `lng`; each product has one SKU per condition/finish/language).
+- The ManaPool catalog's `low_price` / `available_quantity` **exclude our own listings** (verified 2026-10-02: our $300 listing sat under a catalog low of $429), so `available_quantity` is competitor stock as-is.
+- **Sell rules**: one CSV row per printing (`data/sell_rules.csv`, gitignored like the buy list; see `sell_rules.csv.example`). Rows are matched by `mtgjson_id` (unique per double-sided token pairing) or else `scryfall_id`, with optional condition/finish; the most specific row wins. `aggressive` skips both race-to-bottom guards and always applies the TCG cap; `hold` keeps the current price. `min`/`max` override the cost floor; only the hard floor beats them. `unclamped_price_usd` keeps what the strategy would have set (for `hold`, the balanced price), and `bounds_report()` flags listings whose unclamped price is more than `pricer_bounds_report_pct` (15%) outside min/max. The scheduler writes those to `reports_dir/sell_rules_review_<date>.csv` and posts them to the Discord webhook; `price-update` prints them and writes the CSV.
+- `sell-rules add|resolve|from-inventory` fill in the ids from set code + collector number. Our own seller inventory is checked first, because it carries ManaPool's `mtgjson_id` and handles compound DFT numbers like `2-7`; otherwise Scryfall's `/cards/:set/:number` lookup is used.
+
 ### Scheduler (`manabot/scheduler.py`)
 
-`schedule_daily_price_update()` is the real, implemented scheduler (requires `apscheduler`) — one daily APScheduler cron job (configurable hour + timezone) that runs, in order: seller inventory price update (`pricer.py`), buy list name validation (`validate_and_fix_names()`), then buy list coalesce (`coalesce_buylist()` — merges duplicate rows). Name validation runs before coalesce so a correction that makes two rows identical gets merged the same night. `schedule_run()` is an unrelated legacy stub that still raises `NotImplementedError` — don't confuse the two.
+`schedule_daily_price_update()` is the real, implemented scheduler (requires `apscheduler`) — one daily APScheduler cron job (configurable hour + timezone) that runs, in order: seller inventory price update (`pricer.py`, plus the sell-rules bounds report), buy list name validation (`validate_and_fix_names()`), then buy list coalesce (`coalesce_buylist()` — merges duplicate rows). Name validation runs before coalesce so a correction that makes two rows identical gets merged the same night. `schedule_run()` is an unrelated legacy stub that still raises `NotImplementedError` — don't confuse the two.
 
 ### Not yet implemented
 
