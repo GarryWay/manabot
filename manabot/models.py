@@ -125,6 +125,8 @@ class CartRequestItem:
                              # looked up via one specific printing, the optimizer treats it as card-level:
                              # verified live that it can substitute any interchangeable printing to fill
                              # quantity, not just the one scryfall_id was resolved from.
+    collector_number: str = ""  # set only for buy list rows pinned by scryfall_id: sent with set_code
+                                 # instead of card_id, which pins the optimizer to that exact printing
 
 
 @dataclass

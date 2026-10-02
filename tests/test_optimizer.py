@@ -367,10 +367,11 @@ class _FakeCardIdClient:
         self.requested: list[str] | None = None
         self._unresolvable = unresolvable or set()
 
-    def get_card_ids_by_scryfall_id(self, scryfall_ids: list[str]) -> dict[str, str]:
+    def get_singles_by_scryfall_id(self, scryfall_ids: list[str]) -> dict[str, dict]:
         self.requested = list(scryfall_ids)
         return {
-            sid: f"card-{sid}" for sid in scryfall_ids
+            sid: {"scryfall_id": sid, "card_id": f"card-{sid}", "set_code": "m10", "number": f"n-{sid}"}
+            for sid in scryfall_ids
             if sid not in self._unresolvable
         }
 
@@ -428,6 +429,48 @@ def test_resolve_card_ids_mixed_resolved_and_unresolved():
     result = _resolve_card_ids([resolved_ci, unresolved_ci], client)
     assert len(result) == 1
     assert result[0].buy_list_item.card_name == "Lightning Bolt"
+
+
+def test_resolve_card_ids_pinned_row_gets_set_and_collector_number():
+    """A buy list row pinned by scryfall_id resolves to set_code + collector_number,
+    the identifier that holds the optimizer to that exact printing."""
+    ci = _cart_item("Lightning Bolt", est_price=1.00, margin=1.00, set_code="2XM")
+    ci.buy_list_item.scryfall_id = "bolt-sf"
+    ci.scryfall_id = "bolt-sf"
+    resolved = _resolve_card_ids([ci], _FakeCardIdClient())
+    assert resolved[0].set_code == "M10"
+    assert resolved[0].collector_number == "n-bolt-sf"
+
+
+def test_resolve_card_ids_unpinned_row_gets_no_collector_number():
+    ci = _cart_item("Lightning Bolt", est_price=1.00, margin=1.00)
+    ci.card_id = ""
+    ci.scryfall_id = "bolt-sf"
+    resolved = _resolve_card_ids([ci], _FakeCardIdClient())
+    assert resolved[0].card_id == "card-bolt-sf"
+    assert resolved[0].collector_number == ""
+
+
+def test_resolve_card_ids_pinned_row_with_presupplied_card_id_still_looks_up_number():
+    ci = _cart_item("Lightning Bolt", est_price=1.00, margin=1.00)
+    ci.buy_list_item.scryfall_id = "bolt-sf"
+    ci.scryfall_id = "bolt-sf"
+    ci.card_id = "already-set"
+    client = _FakeCardIdClient()
+    resolved = _resolve_card_ids([ci], client)
+    assert client.requested == ["bolt-sf"]
+    assert resolved[0].card_id == "already-set"
+    assert resolved[0].collector_number == "n-bolt-sf"
+
+
+def test_build_optimizer_payload_pinned_item_sends_set_and_number_not_card_id():
+    ci = _cart_item("Lightning Bolt", est_price=1.00, margin=1.00)
+    ci.card_id = "card-1"
+    ci.collector_number = "146"
+    payload = _build_optimizer_payload([ci])
+    assert payload[0]["set_code"] == "M10"
+    assert payload[0]["collector_number"] == "146"
+    assert "card_id" not in payload[0]
 
 
 # ---------------------------------------------------------------------------

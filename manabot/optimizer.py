@@ -127,23 +127,35 @@ def build_request_items(
 
 
 def _resolve_card_ids(items: list[CartRequestItem], client: ManaPoolClient) -> list[CartRequestItem]:
-    """Resolve card_id (ManaPool's required optimizer identifier) via scryfall_id, batched
-    in one call, for any item that doesn't already have one. Callers may pre-supply
-    card_id directly (e.g. arbitrage candidates already resolved elsewhere) to skip the
-    lookup for those items. Items that end up with no card_id are dropped (logged as a
-    warning) rather than sent unidentified, since one bad item 400s the whole request.
+    """Resolve each item's optimizer identifier via scryfall_id, batched in one call.
+
+    Unpinned items get card_id (ManaPool's card-level id — any printing may fill them).
+    Items whose buy list row is pinned by scryfall_id get set_code + collector_number
+    instead, the only identifier that holds the optimizer to that exact printing (see
+    ManaPoolClient.get_singles_by_scryfall_id). Callers may pre-supply card_id directly
+    (e.g. arbitrage candidates already resolved elsewhere) to skip the lookup for those
+    items. Items left with no identifier are dropped (logged as a warning) rather than
+    sent unidentified, since one bad item 400s the whole request.
     """
     if not items:
         return items
-    need_lookup = [x for x in items if not x.card_id and x.scryfall_id]
+    need_lookup = [
+        x for x in items
+        if x.scryfall_id and (not x.card_id or (x.buy_list_item.scryfall_id and not x.collector_number))
+    ]
     if need_lookup:
-        card_ids = client.get_card_ids_by_scryfall_id([x.scryfall_id for x in need_lookup])
+        singles = client.get_singles_by_scryfall_id([x.scryfall_id for x in need_lookup])
         for item in need_lookup:
-            item.card_id = card_ids.get(item.scryfall_id, "")
+            entry = singles.get(item.scryfall_id, {})
+            if not item.card_id:
+                item.card_id = entry.get("card_id") or ""
+            if item.buy_list_item.scryfall_id and entry.get("set_code") and entry.get("number"):
+                item.set_code = str(entry["set_code"]).upper()
+                item.collector_number = str(entry["number"])
 
     resolved: list[CartRequestItem] = []
     for item in items:
-        if not item.card_id:
+        if not (item.card_id or item.collector_number):
             log.warning(
                 "No ManaPool card_id for %r (scryfall_id=%r) — skipping (optimizer requires an identifier per item)",
                 item.buy_list_item.card_name, item.scryfall_id,
@@ -238,14 +250,19 @@ def _build_optimizer_payload(items: list[CartRequestItem]) -> list[dict]:
             "finish_ids": item.finish_ids,
             "quantity_requested": item.buy_list_item.target_quantity,
         }
-        # card_id is now a required identifier (see _resolve_card_ids) — sourced from
-        # ManaPool's own catalog via GET /products/singles, not derived/guessed.
-        if item.card_id:
-            entry["card_id"] = item.card_id
-        # Only constrain set_code when the user explicitly specified allowed_sets,
-        # so the optimizer can still find the cheapest printing across all sanctioned sets.
-        if item.buy_list_item.allowed_sets:
+        # Every item needs an identifier (see _resolve_card_ids). A row pinned by
+        # scryfall_id sends set_code + collector_number, which holds the optimizer to that
+        # exact printing; card_id alone lets it substitute any printing of the card.
+        if item.collector_number:
             entry["set_code"] = item.set_code
+            entry["collector_number"] = item.collector_number
+        else:
+            if item.card_id:
+                entry["card_id"] = item.card_id
+            # Only constrain set_code when the user explicitly specified allowed_sets,
+            # so the optimizer can still find the cheapest printing across all sanctioned sets.
+            if item.buy_list_item.allowed_sets:
+                entry["set_code"] = item.set_code
         payload.append(entry)
     return payload
 

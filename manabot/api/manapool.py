@@ -286,18 +286,34 @@ class ManaPoolClient:
         Batches at 100 IDs per call (API max). Returns {scryfall_id: card_id}; IDs with
         no match are simply absent from the result rather than raising.
         """
+        return {
+            sid: entry["card_id"]
+            for sid, entry in self.get_singles_by_scryfall_id(scryfall_ids).items()
+            if entry.get("card_id")
+        }
+
+    def get_singles_by_scryfall_id(self, scryfall_ids: list[str]) -> dict[str, dict]:
+        """GET /products/singles?scryfall_ids=... — raw catalog entry per Scryfall ID.
+
+        Each entry carries card_id plus the printing's own set_code and number, which
+        the optimizer accepts as a set_code+collector_number identifier. Unlike card_id,
+        that pair pins one exact printing — verified live: 50x M10 #146 Lightning Bolt
+        came back entirely from M10 #146 listings, and 600x (M10 had 373 in stock)
+        409'd instead of substituting other printings the way card_id does.
+
+        Batches at 100 IDs per call (API max). IDs with no match are absent.
+        """
         if not scryfall_ids:
             return {}
-        result: dict[str, str] = {}
+        result: dict[str, dict] = {}
         unique_ids = list(dict.fromkeys(scryfall_ids))  # de-dup, keep order
         for i in range(0, len(unique_ids), 100):
             batch = unique_ids[i:i + 100]
             data = self._get("/products/singles", params={"scryfall_ids": batch})
             for entry in data.get("data", []):
                 sid = entry.get("scryfall_id")
-                cid = entry.get("card_id")
-                if sid and cid:
-                    result[sid] = cid
+                if sid:
+                    result[sid] = entry
         return result
 
     def run_optimizer(
