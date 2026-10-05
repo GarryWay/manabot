@@ -2,7 +2,10 @@
 Check whether buy list cards are already held in our own ManaPool seller inventory.
 
 Matching mirrors manabot.matcher: scryfall_id when the buy list item has one
-pinned, otherwise normalized card-name matching. Condition/finish are ignored —
+pinned, otherwise normalized card-name matching. A multi-face name also matches on
+its front face alone when no exact-name listing exists ("Diviner of Victory" vs
+"Diviner of Victory // Unwind History", in either direction), since buy lists and
+ManaPool don't agree on which form to use. Condition/finish are ignored —
 any copy of the card already in inventory counts as an overlap, since the goal
 is to avoid re-buying a card already being sold.
 """
@@ -18,6 +21,11 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from manabot.api.manapool import ManaPoolClient
+
+
+def _front_face_key(name: str) -> str:
+    """Normalized name of the front face — the part before '//' (whole name if none)."""
+    return _normalize_name(name.split("//", 1)[0])
 
 
 @dataclass
@@ -46,17 +54,22 @@ def find_overlap(
     """
     by_scryfall_id: dict[str, list[SellerListing]] = {}
     by_name: dict[str, list[SellerListing]] = {}
+    by_front_face: dict[str, list[SellerListing]] = {}
     for listing in seller_inventory:
         if listing.scryfall_id:
             by_scryfall_id.setdefault(listing.scryfall_id, []).append(listing)
         by_name.setdefault(_normalize_name(listing.card_name), []).append(listing)
+        by_front_face.setdefault(_front_face_key(listing.card_name), []).append(listing)
 
     overlaps: list[InventoryOverlap] = []
     for item in buy_list:
         if item.scryfall_id:
             matches = by_scryfall_id.get(item.scryfall_id, [])
         else:
-            matches = by_name.get(_normalize_name(item.card_name), [])
+            matches = (
+                by_name.get(_normalize_name(item.card_name))
+                or by_front_face.get(_front_face_key(item.card_name), [])
+            )
         if matches:
             overlaps.append(InventoryOverlap(buy_list_item=item, matches=matches))
     return overlaps

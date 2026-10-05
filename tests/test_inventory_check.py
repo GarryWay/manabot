@@ -218,3 +218,52 @@ def test_force_remove_skips_buylist_decrement_when_inventory_removal_fails(tmp_p
     remaining = load_buylist(path)
     assert len(remaining) == 1
     assert remaining[0].target_quantity == 4
+
+
+# ---------------------------------------------------------------------------
+# Multi-face names: front face alone matches the full "A // B" name
+# ---------------------------------------------------------------------------
+
+DIVINER_ID = "11111111-2222-3333-4444-555555555555"
+
+
+def test_front_face_buylist_name_matches_full_multiface_listing():
+    buy_list = [make_item(card_name="Diviner of Victory")]
+    inventory = [make_seller_listing(scryfall_id=DIVINER_ID, card_name="Diviner of Victory // Unwind History")]
+    overlaps = find_overlap(buy_list, inventory)
+    assert len(overlaps) == 1
+    assert overlaps[0].matches[0].card_name == "Diviner of Victory // Unwind History"
+
+
+def test_full_multiface_buylist_name_matches_front_face_listing():
+    buy_list = [make_item(card_name="Diviner of Victory // Unwind History")]
+    inventory = [make_seller_listing(scryfall_id=DIVINER_ID, card_name="Diviner of Victory")]
+    assert len(find_overlap(buy_list, inventory)) == 1
+
+
+def test_back_face_name_alone_does_not_match():
+    buy_list = [make_item(card_name="Unwind History")]
+    inventory = [make_seller_listing(scryfall_id=DIVINER_ID, card_name="Diviner of Victory // Unwind History")]
+    assert find_overlap(buy_list, inventory) == []
+
+
+def test_exact_name_match_preferred_over_front_face_match():
+    """When a listing matches the buy list name exactly, front-face matches aren't added on top."""
+    exact = make_seller_listing(scryfall_id=BOLT_ID, card_name="Fire")
+    multiface = make_seller_listing(scryfall_id=DIVINER_ID, card_name="Fire // Ice")
+    overlaps = find_overlap([make_item(card_name="Fire")], [exact, multiface])
+    assert overlaps[0].matches == [exact]
+
+
+def test_force_remove_delists_multiface_listing_matched_by_front_face(tmp_path):
+    item = make_item(card_name="Diviner of Victory", target_quantity=1)
+    path = _buylist_with(tmp_path, item)
+    listing = make_seller_listing(scryfall_id=DIVINER_ID, card_name="Diviner of Victory // Unwind History", quantity=1)
+    overlaps = find_overlap([item], [listing])
+
+    client = MagicMock()
+    result = apply_force_remove(overlaps, client, path)
+
+    client.delete_seller_listing.assert_called_once_with(listing)
+    assert result.inventory_qty_removed == 1
+    assert load_buylist(path) == []
