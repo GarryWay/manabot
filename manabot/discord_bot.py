@@ -316,6 +316,7 @@ def _optimize_pipeline(
     target_cart_usd: float | None = None,
     max_iterations: int | None = None,
     forced_quantities: dict[str, int] | None = None,
+    force_off_list: bool = False,
 ) -> dict:
     from manabot.buylist import load_buylist
     from manabot.db import open_db, insert_listings
@@ -330,6 +331,26 @@ def _optimize_pipeline(
     buy_list = load_buylist(config.buylist_path)
     scryfall_bulk = ScryfallBulk()
     scryfall_client = ScryfallClient()
+
+    # Check forced cards before the (slow) listings fetch so a typo fails fast.
+    if forced_card_names:
+        forced = opt.resolve_forced_cards(
+            buy_list, forced_card_names, forced_quantities or {},
+            allow_off_list=force_off_list, scryfall_client=scryfall_client,
+        )
+        if forced.not_on_buylist:
+            return {"blocked": (
+                "Forced card(s) not on the buy list: " + ", ".join(f"**{n}**" for n in forced.not_on_buylist)
+                + "\nCheck the spelling, or re-run with `force_off_list: True` to buy them anyway "
+                "(any printing, any finish, NM)."
+            )}
+        if forced.unresolved:
+            return {"blocked": (
+                "Couldn't find these forced card(s) on Scryfall: "
+                + ", ".join(f"**{n}**" for n in forced.unresolved)
+            )}
+        buy_list, forced_card_names, forced_quantities = forced.buy_list, forced.names, forced.quantities
+
     client = ManaPoolClient(email=config.manapool_email, token=config.manapool_token, use_bulk_export=config.use_bulk_export)
     listings = client.get_singles_prices()
 
@@ -375,7 +396,8 @@ def _optimize_pipeline(
     items_data = [
         {"card_name": x.buy_list_item.card_name, "quantity": x.buy_list_item.target_quantity,
          "set_code": x.set_code, "price": x.estimated_price,
-         "max_price": x.buy_list_item.max_price_usd, "margin": x.estimated_margin}
+         "max_price": x.buy_list_item.max_price_usd, "margin": x.estimated_margin,
+         "off_list": opt.OFF_LIST_TAG in x.buy_list_item.tags}
         for x in cart.items
     ]
     _attach_pinned_printings(items_data, cart.items, scryfall_client)
@@ -740,6 +762,7 @@ def create_bot(config: Config) -> _ManabotClient:
         arb_riders="Pad cart with arbitrage free-riders from existing sellers",
         exclude_preorder="Exclude pre-order listings (default True)",
         force_cards="Pipe-separated cards to force in; prefix a qty to override the buy list (e.g. 2 Bolt|Sol Ring)",
+        force_off_list="Allow forced cards that aren't on the buy list (bought NM, any printing/finish)",
     )
     async def cmd_optimize(
         interaction: discord.Interaction,
@@ -750,6 +773,7 @@ def create_bot(config: Config) -> _ManabotClient:
         arb_riders: bool = False,
         exclude_preorder: bool = True,
         force_cards: str = "",
+        force_off_list: bool = False,
     ) -> None:
         await interaction.response.defer(thinking=True)
         started_at = datetime.now(timezone.utc)
@@ -763,13 +787,16 @@ def create_bot(config: Config) -> _ManabotClient:
         try:
             data = await asyncio.to_thread(
                 _optimize_pipeline, bot.config, over_budget_pct, max_cart, arb_riders, exclude_preorder,
-                forced_names or None, target_cart, max_iter, forced_qty or None,
+                forced_names or None, target_cart, max_iter, forced_qty or None, force_off_list,
             )
         except Exception as e:
             log.exception("optimize pipeline error")
             await _reply(interaction, started_at, content=f"Optimizer error: {e}")
             return
 
+        if "blocked" in data:
+            await _reply(interaction, started_at, content=data["blocked"])
+            return
         if "error" in data:
             await _reply(interaction, started_at, content=f"No results: {data['error']}")
             return
@@ -794,7 +821,8 @@ def create_bot(config: Config) -> _ManabotClient:
         lines = []
         for x in items:
             sign = "+" if x["margin"] >= 0 else "-"
-            lines.append(f"{x['quantity']}x {x['card_name']} [{x['set_code']}]  ${x['price']:.2f}/ea  ({sign}${abs(x['margin']):.2f})")
+            off_list = "  · not on buy list" if x.get("off_list") else ""
+            lines.append(f"{x['quantity']}x {x['card_name']} [{x['set_code']}]  ${x['price']:.2f}/ea  ({sign}${abs(x['margin']):.2f}){off_list}")
         content, file = _send_as_file_or_text("\n".join(lines), "cart.txt")
         await _reply(interaction, started_at, **_send_kwargs(embed, content, file))
         await _reply(interaction, started_at, **_mass_entry_kwargs(items))

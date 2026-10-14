@@ -43,9 +43,11 @@ import re
 from typing import Callable, Iterable, TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from manabot.api.scryfall import ScryfallClient
     from manabot.api.scryfall_bulk import ScryfallBulk
 
 from manabot.models import (
+    BuyListItem,
     CartRequestItem,
     CartResult,
     Condition,
@@ -95,6 +97,71 @@ def parse_forced_cards(entries: Iterable[str]) -> tuple[frozenset[str], dict[str
     return frozenset(names), quantities
 
 
+
+OFF_LIST_TAG = "forced-off-list"
+
+
+@dataclasses.dataclass
+class ForcedCards:
+    """Forced cards checked against the buy list — see resolve_forced_cards()."""
+    buy_list: list[BuyListItem]
+    names: frozenset[str]
+    quantities: dict[str, int]
+    not_on_buylist: list[str] = dataclasses.field(default_factory=list)
+    unresolved: list[str] = dataclasses.field(default_factory=list)
+
+
+def resolve_forced_cards(
+    buy_list: list[BuyListItem],
+    names: frozenset[str],
+    quantities: dict[str, int],
+    allow_off_list: bool = False,
+    scryfall_client: "ScryfallClient | None" = None,
+) -> ForcedCards:
+    """Check forced card names against the buy list (exact card_name, as find_best_cart keys on).
+
+    Without allow_off_list, names not on the buy list are only reported in
+    not_on_buylist — the caller should stop and tell the user. With allow_off_list,
+    each one is resolved to Scryfall's spelling (front face for multi-face cards, the
+    way the buy list stores them) and appended to the returned buy_list as a temporary
+    row: any printing, any finish, NM, max price $0 so it contributes nothing to net
+    value. If the corrected name is already on the buy list, that row is used instead.
+    Names Scryfall can't match are reported in unresolved. The buy list file is never
+    touched.
+    """
+    on_list = {i.card_name for i in buy_list}
+    missing = sorted(n for n in names if n not in on_list)
+    if not missing:
+        return ForcedCards(list(buy_list), names, dict(quantities))
+    if not allow_off_list:
+        return ForcedCards(list(buy_list), names, dict(quantities), not_on_buylist=missing)
+
+    out_list = list(buy_list)
+    out_names = set(names) - set(missing)
+    out_qty = {n: q for n, q in quantities.items() if n not in missing}
+    unresolved: list[str] = []
+    for name in missing:
+        canonical = scryfall_client.resolve_canonical_name(name) if scryfall_client else None
+        if not canonical:
+            unresolved.append(name)
+            continue
+        canonical = canonical.split(" // ")[0]
+        out_names.add(canonical)
+        if name in quantities:
+            out_qty[canonical] = quantities[name]
+        if canonical in on_list:
+            continue
+        log.info("Forcing off-list card %r (requested as %r)", canonical, name)
+        out_list.append(BuyListItem(
+            card_name=canonical,
+            target_quantity=quantities.get(name, 1),
+            max_price_usd=0.0,
+            min_condition=Condition.NM,
+            tags=[OFF_LIST_TAG],
+        ))
+        on_list.add(canonical)
+    return ForcedCards(out_list, frozenset(out_names), out_qty, unresolved=unresolved)
+
 def _acceptable_conditions(min_condition: Condition) -> list[str]:
     """Return ManaPool condition IDs at or better than min_condition."""
     return [
@@ -107,13 +174,15 @@ def build_request_items(
     match_results: list[MatchResult],
     over_budget_pct: float = 0.0,
     scryfall: "ScryfallBulk | None" = None,
+    ignore_price_cap: bool = False,
 ) -> list[CartRequestItem]:
     """Convert match results into optimizer request items.
 
     Only MATCHED results are included. When scryfall is provided, listings from
     non-playable sets (memorabilia, funny, token) are excluded so the estimated
     price reflects a sanctioned printing. Items whose estimated price exceeds
-    max_price × (1 + over_budget_pct/100) are excluded.
+    max_price × (1 + over_budget_pct/100) are excluded unless ignore_price_cap
+    is set (forced cards).
     """
     items: list[CartRequestItem] = []
     for result in match_results:
@@ -133,7 +202,7 @@ def build_request_items(
         best_price = best_listing.price_usd
 
         threshold = item.max_price_usd * (1.0 + over_budget_pct / 100.0)
-        if best_price > threshold:
+        if best_price > threshold and not ignore_price_cap:
             log.debug(
                 "Excluding %r: best playable-set price $%.2f exceeds threshold $%.2f",
                 item.card_name, best_price, threshold,
@@ -577,7 +646,7 @@ def find_best_cart(
             forced_results = [r for r in match_results if r.buy_list_item.card_name in forced_names]
             if forced_results:
                 already_forced = {x.buy_list_item.card_name for x in all_eligible if x.buy_list_item.card_name in forced_names}
-                extra_forced = build_request_items(forced_results, over_budget_pct=99999.0, scryfall=scryfall)
+                extra_forced = build_request_items(forced_results, scryfall=scryfall, ignore_price_cap=True)
                 all_eligible = all_eligible + [x for x in extra_forced if x.buy_list_item.card_name not in already_forced]
 
         if not all_eligible:

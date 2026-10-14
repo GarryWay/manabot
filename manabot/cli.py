@@ -295,6 +295,8 @@ def coalesce_buylist_cmd(ctx: click.Context, buylist_path_override: Path | None,
               help="Force a card from the buy list into the cart regardless of margin (repeatable). "
                    "Prefix a quantity to buy fewer/more than the buy list's target, e.g. '2 Mystic Gate'. "
                    "The card's cost counts toward budget but it cannot be removed by the optimizer.")
+@click.option("--force-off-list", is_flag=True, default=False,
+              help="Allow --force-card names that aren't on the buy list (bought NM, any printing/finish).")
 @click.option("--exclude-preorder/--no-exclude-preorder", default=True, show_default=True,
               help="Exclude pre-order listings from optimizer results.")
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging.")
@@ -312,6 +314,7 @@ def optimize(
     submit_cart: bool,
     arb_riders: bool,
     force_cards: tuple[str, ...],
+    force_off_list: bool,
     exclude_preorder: bool,
     verbose: bool,
 ) -> None:
@@ -357,6 +360,26 @@ def optimize(
 
     scryfall_client = ScryfallClient()
     scryfall_bulk = ScryfallBulk()
+
+    # Check forced cards before the (slow) listings fetch so a typo fails fast.
+    forced_names, forced_qty = opt.parse_forced_cards(force_cards)
+    if forced_names:
+        forced = opt.resolve_forced_cards(
+            buy_list, forced_names, forced_qty,
+            allow_off_list=force_off_list, scryfall_client=scryfall_client,
+        )
+        if forced.not_on_buylist:
+            click.echo(
+                f"Forced card(s) not on the buy list: {', '.join(forced.not_on_buylist)}\n"
+                "Check the spelling, or re-run with --force-off-list to buy them anyway.",
+                err=True,
+            )
+            sys.exit(1)
+        if forced.unresolved:
+            click.echo(f"Couldn't find forced card(s) on Scryfall: {', '.join(forced.unresolved)}", err=True)
+            sys.exit(1)
+        buy_list, forced_names, forced_qty = forced.buy_list, forced.names, forced.quantities
+
     client = ManaPoolClient(
         email=config.manapool_email,
         token=config.manapool_token,
@@ -428,7 +451,6 @@ def optimize(
                 f"\nArbitrage expansion pool: {len(arb_expansion)} candidate(s) for free-rider/new-seller fill."
             )
 
-    forced_names, forced_qty = opt.parse_forced_cards(force_cards)
     effective_forced = forced_names or None
     if effective_forced:
         labels = [f"{forced_qty[n]}x {n}" if n in forced_qty else n for n in sorted(effective_forced)]

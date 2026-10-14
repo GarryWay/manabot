@@ -21,8 +21,10 @@ from manabot.optimizer import (
     _select_within_budget,
     _try_batch,
     build_request_items,
+    OFF_LIST_TAG,
     find_best_cart,
     parse_forced_cards,
+    resolve_forced_cards,
     try_add_items,
 )
 
@@ -1644,3 +1646,61 @@ def test_bisect_batch_removal_treats_api_failure_as_rejection():
     # The only trial possible (removing Flaky) always fails -> treated as rejected, kept.
     assert removed == []
     assert {x.buy_list_item.card_name for x in current} == {"Good Card", "Flaky Card"}
+
+
+# ---------------------------------------------------------------------------
+# resolve_forced_cards
+# ---------------------------------------------------------------------------
+
+class _StubNameResolver:
+    def __init__(self, names: dict[str, str]):
+        self._names = names
+
+    def resolve_canonical_name(self, name: str) -> str | None:
+        return self._names.get(name)
+
+
+def test_resolve_forced_cards_reports_off_list_names_without_override():
+    buy_list = [_item(name="Mystic Gate", qty=2)]
+    forced = resolve_forced_cards(buy_list, frozenset({"Mystic Gate", "Sol Ring"}), {})
+    assert forced.not_on_buylist == ["Sol Ring"]
+    assert forced.buy_list == buy_list
+
+
+def test_resolve_forced_cards_adds_off_list_rows_with_override():
+    buy_list = [_item(name="Mystic Gate", qty=2)]
+    scryfall = _StubNameResolver({
+        "sol ring": "Sol Ring",
+        "Hengegate": "Hengegate Pathway // Mistgate Pathway",
+        "mystic gate": "Mystic Gate",
+    })
+    forced = resolve_forced_cards(
+        buy_list, frozenset({"sol ring", "Hengegate", "mystic gate", "Nonsense"}),
+        {"sol ring": 3},
+        allow_off_list=True, scryfall_client=scryfall,
+    )
+    assert forced.not_on_buylist == []
+    assert forced.unresolved == ["Nonsense"]
+    assert forced.names == {"Sol Ring", "Hengegate Pathway", "Mystic Gate"}
+    assert forced.quantities == {"Sol Ring": 3}
+    added = {i.card_name: i for i in forced.buy_list[1:]}
+    # "mystic gate" corrected onto the existing row rather than duplicated.
+    assert set(added) == {"Sol Ring", "Hengegate Pathway"}
+    assert added["Sol Ring"].target_quantity == 3
+    assert added["Hengegate Pathway"].target_quantity == 1
+    assert added["Sol Ring"].max_price_usd == 0.0
+    assert added["Sol Ring"].min_condition == Condition.NM
+    assert OFF_LIST_TAG in added["Sol Ring"].tags
+    assert len(buy_list) == 1  # caller's list untouched
+
+
+def test_build_request_items_ignore_price_cap_keeps_zero_max_price_item():
+    result = _matched(
+        _item(name="Sol Ring", max_price=0.0, qty=1),
+        _listing(name="Sol Ring", set_code="C21", price=1.50, qty=1),
+    )
+    result.best_price = 1.50
+    assert build_request_items([result]) == []
+    items = build_request_items([result], ignore_price_cap=True)
+    assert len(items) == 1
+    assert items[0].estimated_margin == pytest.approx(-1.50)

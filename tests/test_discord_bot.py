@@ -242,3 +242,24 @@ def test_attach_pinned_printings_lookup_failure_leaves_item_unpinned():
     _attach_pinned_printings(items_data, cart_items, client)
 
     assert "collector_number" not in items_data[0]
+
+
+def test_optimize_pipeline_blocks_forced_card_not_on_buylist(tmp_path: Path):
+    """An off-list forced card stops the run (before any ManaPool call) with a hint to
+    re-run with force_off_list."""
+    from types import SimpleNamespace
+    from manabot.discord_bot import _optimize_pipeline
+
+    buylist = tmp_path / "buylist.csv"
+    buylist.write_text(
+        "card_name,target_quantity,max_price_usd,min_condition\nMystic Gate,2,5,MP\n",
+        encoding="utf-8",
+    )
+    config = SimpleNamespace(buylist_path=buylist)
+    data = _optimize_pipeline(
+        config, 0.0, None, False, True,
+        forced_card_names=frozenset({"Mystic Gate", "Sol Ring"}),
+    )
+    assert "Sol Ring" in data["blocked"]
+    assert "Mystic Gate" not in data["blocked"]
+    assert "force_off_list" in data["blocked"]
