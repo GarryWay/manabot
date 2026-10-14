@@ -1689,9 +1689,18 @@ def test_resolve_forced_cards_adds_off_list_rows_with_override():
     assert added["Sol Ring"].target_quantity == 3
     assert added["Hengegate Pathway"].target_quantity == 1
     assert added["Sol Ring"].max_price_usd == 0.0
-    assert added["Sol Ring"].min_condition == Condition.NM
+    assert added["Sol Ring"].min_condition == Condition.MP  # default
     assert OFF_LIST_TAG in added["Sol Ring"].tags
     assert len(buy_list) == 1  # caller's list untouched
+
+
+def test_resolve_forced_cards_off_list_condition_override():
+    forced = resolve_forced_cards(
+        [], frozenset({"Sol Ring"}), {},
+        allow_off_list=True, scryfall_client=_StubNameResolver({"Sol Ring": "Sol Ring"}),
+        off_list_condition=Condition.LP,
+    )
+    assert forced.buy_list[0].min_condition == Condition.LP
 
 
 def test_build_request_items_ignore_price_cap_keeps_zero_max_price_item():

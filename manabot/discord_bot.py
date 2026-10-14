@@ -317,6 +317,7 @@ def _optimize_pipeline(
     max_iterations: int | None = None,
     forced_quantities: dict[str, int] | None = None,
     force_off_list: bool = False,
+    force_condition: str = "MP",
 ) -> dict:
     from manabot.buylist import load_buylist
     from manabot.db import open_db, insert_listings
@@ -337,12 +338,13 @@ def _optimize_pipeline(
         forced = opt.resolve_forced_cards(
             buy_list, forced_card_names, forced_quantities or {},
             allow_off_list=force_off_list, scryfall_client=scryfall_client,
+            off_list_condition=Condition(force_condition),
         )
         if forced.not_on_buylist:
             return {"blocked": (
                 "Forced card(s) not on the buy list: " + ", ".join(f"**{n}**" for n in forced.not_on_buylist)
                 + "\nCheck the spelling, or re-run with `force_off_list: True` to buy them anyway "
-                "(any printing, any finish, NM)."
+                "(any printing, any finish, `force_condition` or better — default MP)."
             )}
         if forced.unresolved:
             return {"blocked": (
@@ -535,7 +537,7 @@ def _add_cards_sync(path: Path, cards_text: str, username: str, uid: int) -> tup
             errors.append(f"Line {line_num} ({card_name!r}): qty must be int, price must be float")
             continue
 
-        cond_str = parts[3].strip().upper() if len(parts) > 3 and parts[3].strip() else "NM"
+        cond_str = parts[3].strip().upper() if len(parts) > 3 and parts[3].strip() else "MP"
         if cond_str not in {c.value for c in Condition}:
             errors.append(f"Line {line_num} ({card_name!r}): invalid condition {cond_str!r}")
             continue
@@ -762,7 +764,11 @@ def create_bot(config: Config) -> _ManabotClient:
         arb_riders="Pad cart with arbitrage free-riders from existing sellers",
         exclude_preorder="Exclude pre-order listings (default True)",
         force_cards="Pipe-separated cards to force in; prefix a qty to override the buy list (e.g. 2 Bolt|Sol Ring)",
-        force_off_list="Allow forced cards that aren't on the buy list (bought NM, any printing/finish)",
+        force_off_list="Allow forced cards that aren't on the buy list (any printing/finish)",
+        force_condition="Minimum condition for off-list forced cards (default MP)",
+    )
+    @app_commands.choices(
+        force_condition=[app_commands.Choice(name=c, value=c) for c in _VALID_CONDITIONS],
     )
     async def cmd_optimize(
         interaction: discord.Interaction,
@@ -774,6 +780,7 @@ def create_bot(config: Config) -> _ManabotClient:
         exclude_preorder: bool = True,
         force_cards: str = "",
         force_off_list: bool = False,
+        force_condition: str = "MP",
     ) -> None:
         await interaction.response.defer(thinking=True)
         started_at = datetime.now(timezone.utc)
@@ -787,7 +794,7 @@ def create_bot(config: Config) -> _ManabotClient:
         try:
             data = await asyncio.to_thread(
                 _optimize_pipeline, bot.config, over_budget_pct, max_cart, arb_riders, exclude_preorder,
-                forced_names or None, target_cart, max_iter, forced_qty or None, force_off_list,
+                forced_names or None, target_cart, max_iter, forced_qty or None, force_off_list, force_condition,
             )
         except Exception as e:
             log.exception("optimize pipeline error")
@@ -896,7 +903,7 @@ def create_bot(config: Config) -> _ManabotClient:
         card_name="Card name, e.g. Lightning Bolt",
         quantity="Number of copies to buy",
         max_price="Maximum price per copy in USD",
-        condition="Minimum acceptable condition (default NM)",
+        condition="Minimum acceptable condition (default MP)",
         set_code="Restrict to a set code, e.g. LEA (pairs with collector_number to pin one printing)",
         foil="Foil preference: any, nonfoil, or foil (default any)",
         scryfall_id="Exact Scryfall id to pin one printing (overrides set_code/collector_number)",
@@ -911,7 +918,7 @@ def create_bot(config: Config) -> _ManabotClient:
         card_name: str,
         quantity: int,
         max_price: float,
-        condition: str = "NM",
+        condition: str = "MP",
         set_code: str = "",
         foil: str = "any",
         scryfall_id: str = "",

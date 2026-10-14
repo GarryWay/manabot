@@ -117,6 +117,7 @@ def resolve_forced_cards(
     quantities: dict[str, int],
     allow_off_list: bool = False,
     scryfall_client: "ScryfallClient | None" = None,
+    off_list_condition: Condition = Condition.MP,
 ) -> ForcedCards:
     """Check forced card names against the buy list (exact card_name, as find_best_cart keys on).
 
@@ -124,7 +125,7 @@ def resolve_forced_cards(
     not_on_buylist — the caller should stop and tell the user. With allow_off_list,
     each one is resolved to Scryfall's spelling (front face for multi-face cards, the
     way the buy list stores them) and appended to the returned buy_list as a temporary
-    row: any printing, any finish, NM, max price $0 so it contributes nothing to net
+    row: any printing, any finish, off_list_condition or better, max price $0 so it contributes nothing to net
     value. If the corrected name is already on the buy list, that row is used instead.
     Names Scryfall can't match are reported in unresolved. The buy list file is never
     touched.
@@ -156,7 +157,7 @@ def resolve_forced_cards(
             card_name=canonical,
             target_quantity=quantities.get(name, 1),
             max_price_usd=0.0,
-            min_condition=Condition.NM,
+            min_condition=off_list_condition,
             tags=[OFF_LIST_TAG],
         ))
         on_list.add(canonical)

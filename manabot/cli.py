@@ -296,7 +296,10 @@ def coalesce_buylist_cmd(ctx: click.Context, buylist_path_override: Path | None,
                    "Prefix a quantity to buy fewer/more than the buy list's target, e.g. '2 Mystic Gate'. "
                    "The card's cost counts toward budget but it cannot be removed by the optimizer.")
 @click.option("--force-off-list", is_flag=True, default=False,
-              help="Allow --force-card names that aren't on the buy list (bought NM, any printing/finish).")
+              help="Allow --force-card names that aren't on the buy list (any printing/finish).")
+@click.option("--force-condition", type=click.Choice(["NM", "LP", "MP", "HP", "DMG"], case_sensitive=False),
+              default="MP", show_default=True,
+              help="Minimum condition for off-list forced cards (with --force-off-list).")
 @click.option("--exclude-preorder/--no-exclude-preorder", default=True, show_default=True,
               help="Exclude pre-order listings from optimizer results.")
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging.")
@@ -315,6 +318,7 @@ def optimize(
     arb_riders: bool,
     force_cards: tuple[str, ...],
     force_off_list: bool,
+    force_condition: str,
     exclude_preorder: bool,
     verbose: bool,
 ) -> None:
@@ -367,6 +371,7 @@ def optimize(
         forced = opt.resolve_forced_cards(
             buy_list, forced_names, forced_qty,
             allow_off_list=force_off_list, scryfall_client=scryfall_client,
+            off_list_condition=opt.Condition(force_condition.upper()),
         )
         if forced.not_on_buylist:
             click.echo(
