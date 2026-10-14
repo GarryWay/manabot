@@ -291,8 +291,9 @@ def coalesce_buylist_cmd(ctx: click.Context, buylist_path_override: Path | None,
               help="After optimizing, add the result to your ManaPool cart for review.")
 @click.option("--arb-riders", is_flag=True, default=False,
               help="After optimizing, try adding arbitrage free-riders from sellers already in the cart.")
-@click.option("--force-card", "force_cards", multiple=True, metavar="NAME",
+@click.option("--force-card", "force_cards", multiple=True, metavar="[QTY] NAME",
               help="Force a card from the buy list into the cart regardless of margin (repeatable). "
+                   "Prefix a quantity to buy fewer/more than the buy list's target, e.g. '2 Mystic Gate'. "
                    "The card's cost counts toward budget but it cannot be removed by the optimizer.")
 @click.option("--exclude-preorder/--no-exclude-preorder", default=True, show_default=True,
               help="Exclude pre-order listings from optimizer results.")
@@ -427,9 +428,11 @@ def optimize(
                 f"\nArbitrage expansion pool: {len(arb_expansion)} candidate(s) for free-rider/new-seller fill."
             )
 
-    effective_forced = frozenset(force_cards) if force_cards else None
+    forced_names, forced_qty = opt.parse_forced_cards(force_cards)
+    effective_forced = forced_names or None
     if effective_forced:
-        click.echo(f"\nForced cards: {', '.join(sorted(effective_forced))}")
+        labels = [f"{forced_qty[n]}x {n}" if n in forced_qty else n for n in sorted(effective_forced)]
+        click.echo(f"\nForced cards: {', '.join(labels)}")
 
     try:
         cart = opt.find_best_cart(
@@ -444,6 +447,7 @@ def optimize(
             exclude_preorder=exclude_preorder,
             expansion_pool=arb_expansion,
             forced_card_names=effective_forced,
+            forced_quantities=forced_qty or None,
         )
     except Exception as e:
         click.echo(f"Optimizer error: {e}", err=True)

@@ -37,8 +37,10 @@ Total API calls: 1 (card_id resolution, batched at 100/call) + 1 (baseline)
 from __future__ import annotations
 
 import concurrent.futures
+import dataclasses
 import logging
-from typing import Callable, TYPE_CHECKING
+import re
+from typing import Callable, Iterable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from manabot.api.scryfall_bulk import ScryfallBulk
@@ -65,6 +67,32 @@ _FINISH_IDS: dict[Finish, list[str]] = {
     Finish.FOIL: ["FO"],
     Finish.ANY: ["NF", "FO"],
 }
+
+
+_FORCED_QTY_RE = re.compile(r"^(\d+)x?\s+(.+)$", re.IGNORECASE)
+
+
+def parse_forced_cards(entries: Iterable[str]) -> tuple[frozenset[str], dict[str, int]]:
+    """Parse forced-card entries into (names, quantity overrides).
+
+    Each entry is a card name, optionally prefixed decklist-style with a quantity:
+    "Sol Ring", "2 Mystic Gate", or "2x Mystic Gate". Entries without a quantity
+    buy the buy list row's full target_quantity.
+    """
+    names: set[str] = set()
+    quantities: dict[str, int] = {}
+    for raw in entries:
+        entry = raw.strip()
+        if not entry:
+            continue
+        m = _FORCED_QTY_RE.match(entry)
+        if m and int(m.group(1)) > 0:
+            name = m.group(2).strip()
+            quantities[name] = int(m.group(1))
+        else:
+            name = entry
+        names.add(name)
+    return frozenset(names), quantities
 
 
 def _acceptable_conditions(min_condition: Condition) -> list[str]:
@@ -461,6 +489,7 @@ def find_best_cart(
     expansion_pool: list[CartRequestItem] | None = None,
     forced_card_names: frozenset[str] | None = None,
     max_parallel: int = _DEFAULT_MAX_PARALLEL_TRIALS,
+    forced_quantities: dict[str, int] | None = None,
 ) -> CartResult | None:
     """Find the cart configuration that maximizes net value.
 
@@ -478,6 +507,10 @@ def find_best_cart(
                            Phase 2, and are re-added if their seller's package is
                            dropped in Phase 1 (the optimizer sources them elsewhere).
                            Their cost still counts toward max_cart_usd.
+        forced_quantities: Per-card quantity overrides for forced cards (see
+                           parse_forced_cards); replaces the buy list row's
+                           target_quantity for this run only. Forced cards
+                           without an entry buy their full target_quantity.
         max_parallel:      Phase 2's group size knob (see _bisect_batch_removal) —
                            higher means smaller, more numerous groups per round (each
                            validated standalone before merging) at the cost of more
@@ -511,6 +544,25 @@ def find_best_cart(
     """
     _run_expansion = target_cart_usd is not None or expansion_pool is not None
     forced_names: frozenset[str] = frozenset(forced_card_names or ())
+
+    if forced_names:
+        on_buylist = {r.buy_list_item.card_name for r in match_results}
+        for name in sorted(forced_names - on_buylist):
+            log.warning("Forced card %r is not on the buy list — ignoring", name)
+    if forced_quantities:
+        # Copy rather than mutate: the override only applies to this optimize run.
+        match_results = [
+            dataclasses.replace(
+                r,
+                buy_list_item=dataclasses.replace(
+                    r.buy_list_item,
+                    target_quantity=forced_quantities[r.buy_list_item.card_name],
+                ),
+            )
+            if r.buy_list_item.card_name in forced_quantities and r.buy_list_item.card_name in forced_names
+            else r
+            for r in match_results
+        ]
 
     if preselected is not None:
         eligible = list(preselected)

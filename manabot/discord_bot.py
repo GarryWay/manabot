@@ -315,6 +315,7 @@ def _optimize_pipeline(
     forced_card_names: frozenset[str] | None = None,
     target_cart_usd: float | None = None,
     max_iterations: int | None = None,
+    forced_quantities: dict[str, int] | None = None,
 ) -> dict:
     from manabot.buylist import load_buylist
     from manabot.db import open_db, insert_listings
@@ -365,6 +366,7 @@ def _optimize_pipeline(
         scryfall=scryfall_bulk if scryfall_bulk.available else None,
         exclude_preorder=exclude_preorder,
         forced_card_names=forced_card_names,
+        forced_quantities=forced_quantities,
         expansion_pool=arb_expansion,
     )
     if cart is None:
@@ -737,7 +739,7 @@ def create_bot(config: Config) -> _ManabotClient:
         max_iterations="Optimizer removal trials — increase for large carts (0 = use config default)",
         arb_riders="Pad cart with arbitrage free-riders from existing sellers",
         exclude_preorder="Exclude pre-order listings (default True)",
-        force_cards="Pipe-separated card names to force into the cart regardless of margin (e.g. Bolt|Sol Ring)",
+        force_cards="Pipe-separated cards to force in; prefix a qty to override the buy list (e.g. 2 Bolt|Sol Ring)",
     )
     async def cmd_optimize(
         interaction: discord.Interaction,
@@ -756,11 +758,12 @@ def create_bot(config: Config) -> _ManabotClient:
         max_cart = max_cart_usd if max_cart_usd > 0 else None
         target_cart = target_cart_usd if target_cart_usd > 0 else None
         max_iter = max_iterations if max_iterations > 0 else None
-        forced = frozenset(c.strip() for c in force_cards.split("|") if c.strip()) if force_cards else None
+        from manabot.optimizer import parse_forced_cards
+        forced_names, forced_qty = parse_forced_cards(force_cards.split("|"))
         try:
             data = await asyncio.to_thread(
                 _optimize_pipeline, bot.config, over_budget_pct, max_cart, arb_riders, exclude_preorder,
-                forced, target_cart, max_iter,
+                forced_names or None, target_cart, max_iter, forced_qty or None,
             )
         except Exception as e:
             log.exception("optimize pipeline error")

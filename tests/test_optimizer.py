@@ -22,6 +22,7 @@ from manabot.optimizer import (
     _try_batch,
     build_request_items,
     find_best_cart,
+    parse_forced_cards,
     try_add_items,
 )
 
@@ -1391,6 +1392,49 @@ def test_forced_card_cost_deducted_from_optional_budget(mp_client):
     # The cart contains at minimum the forced Dual Land.
     names = {x.buy_list_item.card_name for x in cart.items}
     assert "Dual Land" in names
+
+
+def test_parse_forced_cards_quantity_prefix():
+    names, qty = parse_forced_cards(["2 Mystic Gate", "3x Sol Ring", "Lightning Bolt", "  ", "Lord Skitter, Sewer King"])
+    assert names == {"Mystic Gate", "Sol Ring", "Lightning Bolt", "Lord Skitter, Sewer King"}
+    assert qty == {"Mystic Gate": 2, "Sol Ring": 3}
+
+
+def test_parse_forced_cards_zero_quantity_is_not_an_override():
+    names, qty = parse_forced_cards(["0 Sol Ring"])
+    assert names == {"0 Sol Ring"}
+    assert qty == {}
+
+
+@resp_mock.activate
+def test_forced_quantity_overrides_buylist_target(mp_client):
+    """A forced quantity replaces target_quantity in the optimizer request, without
+    mutating the caller's buy list item."""
+    _mock_card_ids()
+    resp_mock.add(
+        resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer",
+        body=_optimizer_ndjson(subtotal_cents=150, shipping_cents=100, fee_cents=0),
+        content_type="application/x-ndjson",
+    )
+
+    gate = _matched(
+        _item(name="Mystic Gate", max_price=5.00, qty=3),
+        _listing(name="Mystic Gate", set_code="M3C", price=1.00, qty=4),
+    )
+    gate.best_price = 1.00
+
+    cart = find_best_cart(
+        [gate], mp_client,
+        max_cart_usd=20.00,
+        forced_card_names=frozenset({"Mystic Gate"}),
+        forced_quantities={"Mystic Gate": 1},
+    )
+    assert cart is not None
+    post = next(c for c in resp_mock.calls if c.request.method == "POST")
+    payload = json.loads(post.request.body)
+    assert [i["quantity_requested"] for i in payload["cart"]] == [1]
+    assert cart.items[0].buy_list_item.target_quantity == 1
+    assert gate.buy_list_item.target_quantity == 3
 
 
 # ---------------------------------------------------------------------------
