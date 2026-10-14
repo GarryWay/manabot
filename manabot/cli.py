@@ -509,22 +509,32 @@ def optimize(
     click.echo(f"  Total    : ${cart.total_usd:.2f}")
     click.echo(f"  Budget   : ${cart.value_budget_usd:.2f}")
     click.echo(f"  Net value: ${cart.net_value_usd:+.2f}")
+    forced_cost, net_value = opt.split_forced_value(cart, effective_forced or frozenset())
+    if effective_forced:
+        click.echo(f"  Forced cards (est.)     : ${forced_cost:.2f}")
+        click.echo(f"  Net value (excl. forced): ${net_value:+.2f}")
 
     if effective_max_cart is not None and cart.total_usd > effective_max_cart:
         click.echo(f"\n  Warning: cart total ${cart.total_usd:.2f} exceeds spending cap ${effective_max_cart:.2f}.")
-    elif cart.is_profitable:
+    elif net_value > 0:
         click.echo("\n  Cart is profitable relative to your buy list values.")
     else:
         click.echo("\n  Warning: cart total exceeds buy list value budget.")
 
     if submit_cart:
-        _submit_pending_order(cart, client, config, effective_max_cart)
+        _submit_pending_order(cart, client, config, effective_max_cart, net_value)
     else:
         click.echo("\nRun with --submit-cart to create a pending order on ManaPool for review.")
 
 
-def _submit_pending_order(cart, client, config, max_cart_usd):
-    """Validate and submit a CartResult as a pending order on ManaPool."""
+def _submit_pending_order(cart, client, config, max_cart_usd, net_value_usd=None):
+    """Validate and submit a CartResult as a pending order on ManaPool.
+
+    net_value_usd overrides the cart's own net value for the negative-value guard
+    (optimize passes the figure excluding forced cards).
+    """
+    if net_value_usd is None:
+        net_value_usd = cart.net_value_usd
     if not cart.raw_cart:
         click.echo("\nNo inventory IDs in optimizer result — cannot create order.", err=True)
         sys.exit(1)
@@ -534,9 +544,9 @@ def _submit_pending_order(cart, client, config, max_cart_usd):
             err=True,
         )
         sys.exit(1)
-    if cart.net_value_usd < 0:
+    if net_value_usd < 0:
         click.echo(
-            f"\nRefusing to submit: cart net value is ${cart.net_value_usd:.2f} (negative).",
+            f"\nRefusing to submit: cart net value is ${net_value_usd:.2f} (negative).",
             err=True,
         )
         sys.exit(1)

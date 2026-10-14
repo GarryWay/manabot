@@ -399,16 +399,21 @@ def _optimize_pipeline(
         {"card_name": x.buy_list_item.card_name, "quantity": x.buy_list_item.target_quantity,
          "set_code": x.set_code, "price": x.estimated_price,
          "max_price": x.buy_list_item.max_price_usd, "margin": x.estimated_margin,
-         "off_list": opt.OFF_LIST_TAG in x.buy_list_item.tags}
+         "off_list": opt.OFF_LIST_TAG in x.buy_list_item.tags,
+         "forced": x.buy_list_item.card_name in (forced_card_names or ())}
         for x in cart.items
     ]
     _attach_pinned_printings(items_data, cart.items, scryfall_client)
+    # With forced cards, judge the cart on the cards the optimizer chose: forced cards'
+    # value and estimated cost are reported separately (see split_forced_value).
+    forced_cost, net_value = opt.split_forced_value(cart, forced_card_names or frozenset())
     return {
         "items": items_data,
         "subtotal": cart.subtotal_usd, "shipping": cart.shipping_usd,
         "fees": cart.fees_usd, "total": cart.total_usd,
-        "value_budget": cart.value_budget_usd, "net_value": cart.net_value_usd,
-        "is_profitable": cart.is_profitable, "matched_count": matched_count,
+        "value_budget": cart.value_budget_usd, "net_value": net_value,
+        "forced_cost": forced_cost,
+        "is_profitable": net_value > 0, "matched_count": matched_count,
     }
 
 
@@ -818,8 +823,13 @@ def create_bot(config: Config) -> _ManabotClient:
         embed.add_field(name="Fees", value=f"${data['fees']:.2f}", inline=True)
         embed.add_field(name="Total", value=f"${data['total']:.2f}", inline=True)
         embed.add_field(name="Budget", value=f"${data['value_budget']:.2f}", inline=True)
+        n_forced = sum(1 for x in items if x.get("forced"))
+        if n_forced:
+            embed.add_field(
+                name="Forced cards (est.)", value=f"${data['forced_cost']:.2f} · {n_forced} card(s)", inline=True,
+            )
         embed.add_field(
-            name="Net value",
+            name="Net value (excl. forced)" if n_forced else "Net value",
             value=f"${data['net_value']:+.2f}  {'✓ profitable' if data['is_profitable'] else '⚠ over budget'}",
             inline=True,
         )
@@ -828,7 +838,7 @@ def create_bot(config: Config) -> _ManabotClient:
         lines = []
         for x in items:
             sign = "+" if x["margin"] >= 0 else "-"
-            off_list = "  · not on buy list" if x.get("off_list") else ""
+            off_list = "  · not on buy list" if x.get("off_list") else ("  · forced" if x.get("forced") else "")
             lines.append(f"{x['quantity']}x {x['card_name']} [{x['set_code']}]  ${x['price']:.2f}/ea  ({sign}${abs(x['margin']):.2f}){off_list}")
         content, file = _send_as_file_or_text("\n".join(lines), "cart.txt")
         await _reply(interaction, started_at, **_send_kwargs(embed, content, file))

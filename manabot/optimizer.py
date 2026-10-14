@@ -330,6 +330,21 @@ def _is_better(
     return new.total_usd < current_best.total_usd  # both over budget: prefer cheaper
 
 
+def split_forced_value(cart: CartResult, forced_names: frozenset[str]) -> tuple[float, float]:
+    """Return (forced_cost_usd, optional_net_value_usd) for a cart with forced cards.
+
+    forced_cost_usd is the forced cards' estimated cost (pre-fetch price × qty; the
+    optimizer's totals aren't broken down per card). optional_net_value_usd is net value
+    with the forced cards' value and estimated cost taken out — i.e. what the cards the
+    optimizer chose are worth on their own. Shipping and fees stay on the optional side,
+    so it is a conservative figure.
+    """
+    forced = [x for x in cart.items if x.buy_list_item.card_name in forced_names]
+    forced_cost = sum(x.estimated_price * x.buy_list_item.target_quantity for x in forced)
+    forced_value = sum(x.buy_list_item.max_price_usd * x.buy_list_item.target_quantity for x in forced)
+    return forced_cost, cart.net_value_usd - (forced_value - forced_cost)
+
+
 def _sellers_in_cart(result: CartResult) -> set[str]:
     """Return seller IDs from the items currently in a CartResult."""
     return {item.seller_id for item in result.items if item.seller_id}
@@ -920,6 +935,7 @@ def find_best_cart(
                 optimizer_model=optimizer_model,
                 destination_country=destination_country,
                 exclude_preorder=exclude_preorder,
+                exclude_universes_beyond=exclude_ub,
             )
 
     # Phase 4: New-seller exploration — try adding the best-margin card from each
@@ -934,6 +950,7 @@ def find_best_cart(
             optimizer_model=optimizer_model,
             destination_country=destination_country,
             exclude_preorder=exclude_preorder,
+            exclude_universes_beyond=exclude_ub,
         )
 
     return best
@@ -947,6 +964,7 @@ def try_add_items(
     optimizer_model: str = "lowest_price",
     destination_country: str = "US",
     exclude_preorder: bool = False,
+    exclude_universes_beyond: bool = False,
 ) -> CartResult:
     """Try adding overflow items to an existing cart, keeping improvements.
 
@@ -957,6 +975,9 @@ def try_add_items(
 
     Candidates should be pre-filtered and pre-sorted by the caller (e.g. seller already
     in cart, ordered by discount% descending). Returns at least current.
+
+    exclude_universes_beyond applies to the whole re-optimized cart, so find_best_cart
+    passes the same value its baseline used; standalone arbitrage callers leave it False.
     """
     best = current
     for candidate in candidates:
@@ -966,7 +987,7 @@ def try_add_items(
                 trial_items, client,
                 model=optimizer_model,
                 destination=destination_country,
-                exclude_universes_beyond=False,  # arb additions allow UB by default
+                exclude_universes_beyond=exclude_universes_beyond,
                 exclude_preorder=exclude_preorder,
             )
         except ManaPool409Error:
@@ -1014,6 +1035,7 @@ def try_expand_with_new_sellers(
     optimizer_model: str = "lowest_price",
     destination_country: str = "US",
     exclude_preorder: bool = False,
+    exclude_universes_beyond: bool = False,
 ) -> CartResult:
     """Try adding best-margin cards from sellers not yet in the cart.
 
@@ -1030,7 +1052,7 @@ def try_expand_with_new_sellers(
     _run_kwargs = dict(
         model=optimizer_model,
         destination=destination_country,
-        exclude_universes_beyond=False,
+        exclude_universes_beyond=exclude_universes_beyond,
         exclude_preorder=exclude_preorder,
     )
 
@@ -1086,6 +1108,7 @@ def try_expand_with_new_sellers(
                     optimizer_model=optimizer_model,
                     destination_country=destination_country,
                     exclude_preorder=exclude_preorder,
+                    exclude_universes_beyond=exclude_universes_beyond,
                 )
 
         if _is_better(trial, best, max_cart_usd):

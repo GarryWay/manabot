@@ -25,6 +25,7 @@ from manabot.optimizer import (
     find_best_cart,
     parse_forced_cards,
     resolve_forced_cards,
+    split_forced_value,
     try_add_items,
 )
 
@@ -1713,3 +1714,57 @@ def test_build_request_items_ignore_price_cap_keeps_zero_max_price_item():
     items = build_request_items([result], ignore_price_cap=True)
     assert len(items) == 1
     assert items[0].estimated_margin == pytest.approx(-1.50)
+
+
+# ---------------------------------------------------------------------------
+# split_forced_value / UB exclusion in expansion phases
+# ---------------------------------------------------------------------------
+
+def test_split_forced_value_excludes_forced_cards_from_net_value():
+    forced = CartRequestItem(
+        buy_list_item=_item(name="Sol Ring", max_price=0.0, qty=1),
+        set_code="C21", estimated_price=3.00, estimated_margin=-3.00,
+        condition_ids=["NM"], finish_ids=["NF"],
+    )
+    optional = CartRequestItem(
+        buy_list_item=_item(name="Lightning Bolt", max_price=2.00, qty=2),
+        set_code="M10", estimated_price=1.00, estimated_margin=1.00,
+        condition_ids=["NM"], finish_ids=["NF"],
+    )
+    # value budget $4 (bolts only), total $6.50 → raw net -$2.50
+    cart = CartResult(
+        items=[forced, optional], raw_cart=[],
+        subtotal_usd=5.00, shipping_usd=1.50, fees_usd=0.0, total_usd=6.50,
+        value_budget_usd=4.00, net_value_usd=-2.50,
+    )
+    forced_cost, net = split_forced_value(cart, frozenset({"Sol Ring"}))
+    assert forced_cost == pytest.approx(3.00)
+    assert net == pytest.approx(0.50)  # $4 value − ($6.50 − $3 forced)
+    assert split_forced_value(cart, frozenset()) == (0.0, pytest.approx(-2.50))
+
+
+@resp_mock.activate
+def test_free_rider_phase_keeps_universes_beyond_exclusion(mp_client):
+    """Phase 3/4 re-optimizations must send the same UB exclusion as the baseline."""
+    _mock_card_ids()
+    for _ in range(6):
+        resp_mock.add(
+            resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer",
+            body=_optimizer_ndjson(subtotal_cents=200, shipping_cents=100, fee_cents=0),
+            content_type="application/x-ndjson",
+        )
+    bolt_item = _item(name="Lightning Bolt", max_price=5.00, qty=1)
+    bolt_item.exclude_ub = True
+    bolt = _matched(bolt_item, _listing(scryfall_id="bolt", name="Lightning Bolt", price=1.00, qty=1))
+    ring = _matched(
+        _item(name="Sol Ring", max_price=5.00, qty=1),
+        _listing(scryfall_id="ring", name="Sol Ring", set_code="C21", price=1.00, qty=1),
+    )
+    # target_cart_usd fits one card, so the other overflows into the free-rider pool
+    # (same seller1 → Phase 3 candidate).
+    find_best_cart([bolt, ring], mp_client, max_cart_usd=20.00, target_cart_usd=1.50)
+
+    posts = [json.loads(c.request.body) for c in resp_mock.calls if c.request.method == "POST"]
+    assert len(posts) >= 2  # baseline + at least one free-rider trial
+    for body in posts:
+        assert body["filters"]["productFilters"]["singleFilters"]["excludeUniversesBeyond"] is True
