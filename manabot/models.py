@@ -127,6 +127,9 @@ class CartRequestItem:
                              # quantity, not just the one scryfall_id was resolved from.
     collector_number: str = ""  # set only for buy list rows pinned by scryfall_id: sent with set_code
                                  # instead of card_id, which pins the optimizer to that exact printing
+    seller_listings: dict[str, "PriceListing"] = field(default_factory=dict)
+                                 # cheapest listing per seller priced below max_price (and any
+                                 # margin_pct requirement) — the sellers this card can free-ride with
 
 
 @dataclass

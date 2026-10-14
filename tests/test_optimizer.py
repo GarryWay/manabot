@@ -15,6 +15,7 @@ from manabot.optimizer import (
     _build_optimizer_payload,
     _acceptable_conditions,
     _chunk,
+    _free_riders,
     _group_by_seller,
     _is_better,
     _resolve_card_ids,
@@ -1768,3 +1769,79 @@ def test_free_rider_phase_keeps_universes_beyond_exclusion(mp_client):
     assert len(posts) >= 2  # baseline + at least one free-rider trial
     for body in posts:
         assert body["filters"]["productFilters"]["singleFilters"]["excludeUniversesBeyond"] is True
+
+
+# ---------------------------------------------------------------------------
+# Free riders: any profitable listing from a seller already in the cart
+# ---------------------------------------------------------------------------
+
+def _seller_listing(seller: str, price: float, set_code: str = "M10", name: str = "Lightning Bolt") -> PriceListing:
+    l = _listing(name=name, set_code=set_code, price=price, qty=1)
+    l.seller_id = seller
+    return l
+
+
+def test_build_request_items_keeps_cheapest_profitable_listing_per_seller():
+    result = _matched(_item(max_price=2.00, qty=1), _seller_listing("a", 0.50))
+    result.listings = [
+        _seller_listing("a", 0.50),
+        _seller_listing("b", 1.20),
+        _seller_listing("b", 0.90),
+        _seller_listing("c", 2.00),   # at max price — no margin, not a free-rider option
+        _seller_listing("d", 2.50),
+    ]
+    [item] = build_request_items([result], over_budget_pct=50.0)
+    assert {s: l.price_usd for s, l in item.seller_listings.items()} == {"a": 0.50, "b": 0.90}
+
+    # margin_pct=10 (over_budget_pct=-10): listings must also be under $1.80
+    [item] = build_request_items([result], over_budget_pct=-10.0)
+    assert set(item.seller_listings) == {"a", "b"}
+
+
+def test_free_riders_rebase_onto_cart_sellers_listing():
+    result = _matched(_item(max_price=2.00, qty=1, allowed_sets=["M10", "M11"]), _seller_listing("cheap", 0.50))
+    result.listings = [_seller_listing("cheap", 0.50, "M10"), _seller_listing("cart", 1.25, "M11")]
+    [item] = build_request_items([result])
+    assert item.seller_id == "cheap"
+
+    [rider] = _free_riders([item], sellers={"cart"}, exclude_names=set())
+    assert rider.seller_id == "cart"
+    assert rider.estimated_price == pytest.approx(1.25)
+    assert rider.estimated_margin == pytest.approx(0.75)
+    assert rider.set_code == "M11"
+    assert item.seller_id == "cheap"  # pool item untouched
+
+    assert _free_riders([item], sellers={"other"}, exclude_names=set()) == []
+    assert _free_riders([item], sellers={"cart"}, exclude_names={"Lightning Bolt"}) == []
+
+
+@resp_mock.activate
+def test_phase3_tries_card_whose_cheapest_listing_is_from_another_seller(mp_client):
+    """A cart seller's profitable-but-not-cheapest listing still makes the card a free rider."""
+    _mock_card_ids()
+    resp_mock.add(  # baseline: Sol Ring only
+        resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer",
+        body=_optimizer_ndjson(subtotal_cents=100, shipping_cents=100, fee_cents=0),
+        content_type="application/x-ndjson",
+    )
+    resp_mock.add(  # free-rider trial: Sol Ring + Bolt, same shipping
+        resp_mock.POST, f"{MANAPOOL_BASE}/buyer/optimizer",
+        body=_optimizer_ndjson(subtotal_cents=225, shipping_cents=100, fee_cents=0),
+        content_type="application/x-ndjson",
+    )
+    ring = _matched(
+        _item(name="Sol Ring", max_price=5.00, qty=1),
+        _seller_listing("cart", 1.00, "C21", name="Sol Ring"),
+    )
+    bolt = _matched(_item(name="Lightning Bolt", max_price=3.00, qty=1), _seller_listing("elsewhere", 1.00))
+    bolt.listings = [_seller_listing("elsewhere", 1.00), _seller_listing("cart", 1.25)]
+
+    # target_cart_usd fits Sol Ring only (selected first: better margin ratio); Bolt overflows.
+    # Its cheapest seller isn't in the cart, so the old rule never tried it.
+    cart = find_best_cart(
+        [ring, bolt], mp_client, max_cart_usd=20.00, target_cart_usd=1.50, max_iterations=0,
+    )
+    names = {x.buy_list_item.card_name for x in cart.items}
+    assert names == {"Sol Ring", "Lightning Bolt"}
+    bolt_item = next(x for x in cart.items if x.buy_list_item.card_name == "Lightning Bolt")
+    assert bolt_item.seller_id == "cart"

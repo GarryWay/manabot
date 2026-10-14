@@ -54,6 +54,7 @@ from manabot.models import (
     Finish,
     MatchResult,
     MatchStatus,
+    PriceListing,
     _CONDITION_RANK,
 )
 from manabot.api.manapool import ManaPool409Error, ManaPoolAPIError, ManaPoolClient
@@ -210,6 +211,16 @@ def build_request_items(
             )
             continue
 
+        # Free riders only need *a* profitable listing from a seller already in the cart,
+        # not the cheapest one overall — keep every seller's cheapest such listing.
+        # Never above max_price, even when over_budget_pct allows overage elsewhere.
+        rider_cap = item.max_price_usd * (1.0 + min(over_budget_pct, 0.0) / 100.0)
+        seller_listings: dict[str, PriceListing] = {}
+        for l in listings:
+            if l.seller_id and l.price_usd < rider_cap:
+                if l.seller_id not in seller_listings or l.price_usd < seller_listings[l.seller_id].price_usd:
+                    seller_listings[l.seller_id] = l
+
         items.append(CartRequestItem(
             buy_list_item=item,
             set_code=best_listing.set_code,
@@ -219,9 +230,41 @@ def build_request_items(
             finish_ids=_FINISH_IDS[item.foil],
             seller_id=best_listing.seller_id,
             scryfall_id=best_listing.scryfall_id,
+            seller_listings=seller_listings,
         ))
 
     return items
+
+
+def _free_riders(
+    pool: list[CartRequestItem],
+    sellers: set[str],
+    exclude_names: set[str],
+) -> list[CartRequestItem]:
+    """Pool items with a profitable listing from one of sellers, re-based onto that listing.
+
+    Each candidate's estimated price/margin/seller (and set_code, for unpinned rows) are
+    replaced with its cheapest listing among those sellers, so ranking and the seller
+    estimate reflect the free ride rather than the card's cheapest listing on ManaPool.
+    Items with no seller_listings fall back to matching on their own seller_id.
+    """
+    riders: list[CartRequestItem] = []
+    for x in pool:
+        if x.buy_list_item.card_name in exclude_names:
+            continue
+        options = [l for s, l in x.seller_listings.items() if s in sellers]
+        if options:
+            l = min(options, key=lambda l: l.price_usd)
+            riders.append(dataclasses.replace(
+                x,
+                seller_id=l.seller_id,
+                estimated_price=l.price_usd,
+                estimated_margin=x.buy_list_item.max_price_usd - l.price_usd,
+                set_code=x.set_code if x.collector_number else l.set_code,
+            ))
+        elif not x.seller_listings and x.seller_id in sellers and x.estimated_margin > 0:
+            riders.append(x)
+    return riders
 
 
 def _resolve_card_ids(items: list[CartRequestItem], client: ManaPoolClient) -> list[CartRequestItem]:
@@ -918,9 +961,7 @@ def find_best_cart(
         existing_sellers = _sellers_in_cart(best)
         in_cart_names = {item.buy_list_item.card_name for item in best.items}
         free_riders = sorted(
-            [x for x in _extra_pool
-             if x.buy_list_item.card_name not in in_cart_names
-             and x.seller_id in existing_sellers],
+            _free_riders(_extra_pool, existing_sellers, in_cart_names),
             key=lambda x: x.estimated_margin / x.estimated_price,
             reverse=True,
         )
@@ -1095,9 +1136,7 @@ def try_expand_with_new_sellers(
         if new_sellers:
             trial_in_cart = {x.buy_list_item.card_name for x in trial_items}
             new_seller_riders = sorted(
-                [x for x in pool
-                 if x.buy_list_item.card_name not in trial_in_cart
-                 and x.seller_id in new_sellers],
+                _free_riders(pool, new_sellers, trial_in_cart),
                 key=lambda x: x.estimated_margin,
                 reverse=True,
             )
