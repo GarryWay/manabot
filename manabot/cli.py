@@ -916,6 +916,44 @@ def bot(ctx: click.Context, config_path: Path | None, guild_id: int | None) -> N
     run_bot(config)
 
 
+@cli.command("history-ingest")
+@click.option("--config", "config_path", type=click.Path(path_type=Path), default=None)
+@click.option("--source", "sources", multiple=True, type=click.Choice(["scryfall", "manapool"]),
+              help="Archive only this source (repeatable). Default: both.")
+@click.option("--force", is_flag=True, help="Re-archive a date that was already ingested.")
+@click.option("--verbose", "-v", is_flag=True, help="Enable debug logging.")
+@click.pass_context
+def history_ingest(ctx: click.Context, config_path: Path | None, sources: tuple[str, ...],
+                   force: bool, verbose: bool) -> None:
+    """Archive today's Scryfall prices and ManaPool catalog into the price history DB.
+
+    Runs nightly as part of pricer-scheduler; use this for a manual run or to
+    check archive coverage. Downloads each source only if a newer snapshot exists.
+    """
+    from manabot.config import load_config
+    from manabot.forecast.history import history_summary, open_history_db, run_history_ingest
+
+    _configure_logging(verbose)
+    try:
+        config = load_config(config_path)
+    except (ValueError, FileNotFoundError) as e:
+        click.echo(f"Config error: {e}", err=True)
+        sys.exit(1)
+
+    run_history_ingest(config, sources or ("scryfall", "manapool"), force=force)
+    with open_history_db(config.history_db_path) as conn:
+        summary = history_summary(conn)
+    click.echo(f"Price history archive: {config.history_db_path}")
+    for row in summary:
+        sales = f", {row['sales']:,} sales" if row["sales"] is not None else ""
+        click.echo(
+            f"  {row['source']:<9} {row['days']} day(s) {row['first']} .. {row['last']}"
+            f" — {row['daily_rows']:,} daily rows{sales}"
+        )
+    if not summary:
+        click.echo("  (empty)")
+
+
 @cli.command()
 @click.pass_context
 def scheduled(ctx: click.Context) -> None:

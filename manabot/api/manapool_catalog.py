@@ -55,17 +55,22 @@ def load_catalog(
     Both filters are OR'd together.
     """
     cache_path = Path(cache_path)
+    refresh_catalog(cache_path, max_age_hours, url)
+    return _parse_catalog(cache_path, scryfall_ids, name_set_filter)
+
+
+def refresh_catalog(cache_path: Path, max_age_hours: float = 23.0, url: str = CATALOG_URL) -> None:
+    """Download the catalog to cache_path unless the cached copy is fresh enough."""
+    cache_path = Path(cache_path)
     if not cache_path.exists():
         _download_catalog(cache_path, url)
+        return
+    age_hours = (datetime.now(timezone.utc).timestamp() - cache_path.stat().st_mtime) / 3600
+    if age_hours >= max_age_hours:
+        log.info("Catalog cache is %.1fh old, downloading fresh copy...", age_hours)
+        _download_catalog(cache_path, url)
     else:
-        age_hours = (datetime.now(timezone.utc).timestamp() - cache_path.stat().st_mtime) / 3600
-        if age_hours >= max_age_hours:
-            log.info("Catalog cache is %.1fh old, downloading fresh copy...", age_hours)
-            _download_catalog(cache_path, url)
-        else:
-            log.info("Loading catalog from cache (%s, %.1fh old)", cache_path, age_hours)
-
-    return _parse_catalog(cache_path, scryfall_ids, name_set_filter)
+        log.info("Using cached catalog (%s, %.1fh old)", cache_path, age_hours)
 
 
 def _download_catalog(cache_path: Path, url: str) -> None:

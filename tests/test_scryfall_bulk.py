@@ -332,3 +332,57 @@ def test_is_playable_set_case_insensitive():
         bulk = ScryfallBulk(_write_bulk([_card_with_set_type("WC04", "memorabilia")], d))
         assert bulk.is_playable_set("wc04") is False
         assert bulk.is_playable_set("WC04") is False
+
+
+# Scryfall's bulk index now lists only gzipped JSONL (no plain-JSON download_uri).
+_JSONL_URL = "https://data.scryfall.io/oracle-cards/oracle-cards-20261026.jsonl.gz"
+_DEFAULT_JSONL_URL = "https://data.scryfall.io/default-cards/default-cards-20261026.jsonl.gz"
+_JSONL_BULK_RESPONSE = {
+    "data": [
+        {"type": "oracle_cards", "updated_at": "2026-10-26T09:01:56+00:00",
+         "jsonl_download_uri": _JSONL_URL},
+        {"type": "default_cards", "updated_at": "2026-10-26T09:05:45+00:00",
+         "jsonl_download_uri": _DEFAULT_JSONL_URL},
+    ]
+}
+
+
+def _jsonl_gz(cards: list[dict]) -> bytes:
+    import gzip
+    return gzip.compress("\n".join(json.dumps(c) for c in cards).encode() + b"\n")
+
+
+@resp_lib.activate
+def test_download_oracle_cards_converts_jsonl_to_json_array():
+    cards = [{"id": "a", "name": "Lightning Bolt"}, {"id": "b", "name": "Counterspell"}]
+    resp_lib.add(resp_lib.GET, _BULK_META_URL, json=_JSONL_BULK_RESPONSE)
+    resp_lib.add(resp_lib.GET, _JSONL_URL, body=_jsonl_gz(cards), content_type="application/gzip")
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "oracle.json"
+        assert download_oracle_cards(path) is True
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        meta = json.loads(path.with_name("oracle.meta.json").read_text(encoding="utf-8"))
+        leftovers = sorted(p.name for p in Path(d).iterdir())
+
+    assert [c["name"] for c in loaded] == ["Lightning Bolt", "Counterspell"]
+    assert meta["updated_at"] == "2026-10-26T09:01:56+00:00"
+    assert leftovers == ["oracle.json", "oracle.meta.json"]  # temp .jsonl.gz cleaned up
+
+
+@resp_lib.activate
+def test_download_default_cards_keeps_gzipped_jsonl():
+    from manabot.api.scryfall_bulk import download_default_cards, iter_bulk_jsonl, read_bulk_meta
+
+    cards = [{"id": "a", "name": "Lightning Bolt"}]
+    resp_lib.add(resp_lib.GET, _BULK_META_URL, json=_JSONL_BULK_RESPONSE)
+    resp_lib.add(resp_lib.GET, _DEFAULT_JSONL_URL, body=_jsonl_gz(cards), content_type="application/gzip")
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "default_cards.jsonl.gz"
+        assert download_default_cards(path) is True
+        assert list(iter_bulk_jsonl(path)) == cards
+        assert read_bulk_meta(path)["updated_at"] == "2026-10-26T09:05:45+00:00"
+        # Second call: index says the same updated_at, so no re-download.
+        assert download_default_cards(path) is False
+    assert len(resp_lib.calls) == 3

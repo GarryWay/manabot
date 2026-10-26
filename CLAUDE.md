@@ -37,6 +37,7 @@ python -m manabot price-update --dry-run
 python -m manabot sell-rules add --set FRA --number 460 --strategy hold --min 280
 python -m manabot sell-rules resolve
 python -m manabot sell-rules from-inventory --min-price 20
+python -m manabot history-ingest            # archive today's prices (also runs nightly)
 ```
 
 ## Architecture
@@ -107,9 +108,15 @@ Config keys: `optimizer_over_budget_pct` (default 0.0), `optimizer_max_iteration
 - **Sell rules**: one CSV row per printing (`data/sell_rules.csv`, gitignored like the buy list; see `sell_rules.csv.example`). Rows are matched by `mtgjson_id` (unique per double-sided token pairing) or else `scryfall_id`, with optional condition/finish; the most specific row wins. `aggressive` skips both race-to-bottom guards and always applies the TCG cap; `hold` keeps the current price. `min`/`max` override the cost floor; only the hard floor beats them. `unclamped_price_usd` keeps what the strategy would have set (for `hold`, the balanced price), and `bounds_report()` flags listings whose unclamped price is more than `pricer_bounds_report_pct` (15%) outside min/max. The scheduler writes those to `reports_dir/sell_rules_review_<date>.csv` and posts them to the Discord webhook; `price-update` prints them and writes the CSV.
 - `sell-rules add|resolve|from-inventory` fill in the ids from set code + collector number. Our own seller inventory is checked first, because it carries ManaPool's `mtgjson_id` and handles compound DFT numbers like `2-7`; otherwise Scryfall's `/cards/:set/:number` lookup is used.
 
+### Price history archive (`manabot/forecast/history.py`)
+
+Training data for price forecasts — roadmap in `docs/forecasting_plan.md` (Phase 0 done; models not built yet). Its own SQLite file, `history_db_path` (`data/price_history.db`), not manabot.db. Nightly it archives Scryfall `default_cards` (gzipped JSONL, kept at `scryfall_default_cards_path`; `as_of` = the bulk file's `updated_at` date) into `printings` + `scryfall_daily`, and the ManaPool catalog (`as_of` = file download date, UTC) into `manapool_daily` + `manapool_sales`. Prices are integer cents; printings below `history_min_price_usd` in every finish get no daily rows. `ingest_runs` makes each (source, as_of) idempotent (`--force` re-ingests). The catalog's `recent_sales` is capped at the 20 most recent per variant, so `manapool_sales` (deduped via its composite primary key) is only complete from the first archive date onward. ManaPool's `price_market` is null for many high-end printings — use Scryfall's `usd` for market.
+
+Scryfall's bulk index lists only `jsonl_download_uri` now (plain `download_uri` vanished ~2026-10); `download_oracle_cards()` converts the JSONL to the JSON array `ScryfallBulk` loads.
+
 ### Scheduler (`manabot/scheduler.py`)
 
-`schedule_daily_price_update()` is the real, implemented scheduler (requires `apscheduler`) — one daily APScheduler cron job (configurable hour + timezone) that runs, in order: seller inventory price update (`pricer.py`, plus the sell-rules bounds report), buy list name validation (`validate_and_fix_names()`), then buy list coalesce (`coalesce_buylist()` — merges duplicate rows). Name validation runs before coalesce so a correction that makes two rows identical gets merged the same night. `schedule_run()` is an unrelated legacy stub that still raises `NotImplementedError` — don't confuse the two.
+`schedule_daily_price_update()` is the real, implemented scheduler (requires `apscheduler`) — one daily APScheduler cron job (configurable hour + timezone) that runs, in order: seller inventory price update (`pricer.py`, plus the sell-rules bounds report), price history archive (reuses the catalog the price update just downloaded), buy list name validation (`validate_and_fix_names()`), then buy list coalesce (`coalesce_buylist()` — merges duplicate rows). Name validation runs before coalesce so a correction that makes two rows identical gets merged the same night. `schedule_run()` is an unrelated legacy stub that still raises `NotImplementedError` — don't confuse the two.
 
 ### Not yet implemented
 

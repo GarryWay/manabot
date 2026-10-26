@@ -18,6 +18,9 @@ class Config:
     buylist_path: Path = Path("data/buylist.csv")
     db_path: Path = Path("data/manabot.db")
     reports_dir: Path = Path("data/reports")
+    history_db_path: Path = Path("data/price_history.db")   # daily price archive for forecasting
+    history_min_price_usd: float = 0.50   # skip archiving printings priced below this (all finishes)
+    scryfall_default_cards_path: Path = Path("data/scryfall_default_cards.jsonl.gz")
     use_bulk_export: bool = False
     max_price_age_days: int = 1
     trend_window_days: int = 7
@@ -77,6 +80,13 @@ def load_config(config_path: Path | None = None) -> Config:
             base["db_path"] = Path(paths["db"])
         if "reports_dir" in paths:
             base["reports_dir"] = Path(paths["reports_dir"])
+        if "history_db" in paths:
+            base["history_db_path"] = Path(paths["history_db"])
+        if "scryfall_default_cards" in paths:
+            base["scryfall_default_cards_path"] = Path(paths["scryfall_default_cards"])
+        history = raw.get("history", {})
+        if "min_price_usd" in history:
+            base["history_min_price_usd"] = float(history["min_price_usd"])
         if "sell_rules" in paths:
             base["sell_rules_path"] = Path(paths["sell_rules"])
         behavior = raw.get("behavior", {})
@@ -154,6 +164,12 @@ def load_config(config_path: Path | None = None) -> Config:
         base["db_path"] = Path(os.environ["DB_PATH"])
     if os.getenv("REPORTS_DIR"):
         base["reports_dir"] = Path(os.environ["REPORTS_DIR"])
+    if os.getenv("HISTORY_DB_PATH"):
+        base["history_db_path"] = Path(os.environ["HISTORY_DB_PATH"])
+    if os.getenv("HISTORY_MIN_PRICE_USD"):
+        base["history_min_price_usd"] = float(os.environ["HISTORY_MIN_PRICE_USD"])
+    if os.getenv("SCRYFALL_DEFAULT_CARDS_PATH"):
+        base["scryfall_default_cards_path"] = Path(os.environ["SCRYFALL_DEFAULT_CARDS_PATH"])
     if os.getenv("USE_BULK_EXPORT"):
         base["use_bulk_export"] = os.environ["USE_BULK_EXPORT"].lower() == "true"
     if os.getenv("MAX_PRICE_AGE_DAYS"):
@@ -215,6 +231,11 @@ def load_config(config_path: Path | None = None) -> Config:
         buylist_path=base.get("buylist_path", Path("data/buylist.csv")),
         db_path=base.get("db_path", Path("data/manabot.db")),
         reports_dir=base.get("reports_dir", Path("data/reports")),
+        history_db_path=base.get("history_db_path", Path("data/price_history.db")),
+        history_min_price_usd=base.get("history_min_price_usd", 0.50),
+        scryfall_default_cards_path=base.get(
+            "scryfall_default_cards_path", Path("data/scryfall_default_cards.jsonl.gz")
+        ),
         use_bulk_export=base.get("use_bulk_export", False),
         max_price_age_days=base.get("max_price_age_days", 1),
         trend_window_days=base.get("trend_window_days", 7),

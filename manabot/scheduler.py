@@ -3,6 +3,9 @@
 Currently implements, all on the same daily job (configurable hour + timezone):
   - Seller inventory price update, plus a review report (CSV + Discord webhook) of
     sell-rule listings whose market price lands well outside their min/max
+  - Price history archive (Scryfall daily prices + ManaPool catalog snapshot and
+    sales) — the training data for price forecasts; runs right after the price
+    update so it reuses the catalog that job just downloaded
   - Buy list name validation (correct card_name against Scryfall's own spelling)
   - Buy list coalesce (merge duplicate rows, summing quantities)
 
@@ -35,6 +38,7 @@ def schedule_daily_price_update(config: Config) -> None:
     from manabot.api.scryfall import ScryfallClient
     from manabot.buylist import coalesce_buylist, validate_and_fix_names
     from manabot.db import open_db
+    from manabot.forecast.history import run_history_ingest
     from manabot.pricer import bounds_report, pricing_config_from, run_pricing_update, write_bounds_report
     from manabot.reporter.discord import send_bounds_report
 
@@ -61,6 +65,12 @@ def schedule_daily_price_update(config: Config) -> None:
                 send_bounds_report(flagged, config.discord_webhook_url, pricing_cfg.bounds_report_pct, str(path))
         except Exception:
             log.exception("Price update job failed")
+
+        try:
+            log.info("Price history archive starting (%s)...", config.history_db_path)
+            run_history_ingest(config)
+        except Exception:
+            log.exception("Price history archive job failed")
 
         try:
             log.info("Buy list name validation starting (%s)...", config.buylist_path)

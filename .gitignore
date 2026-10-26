@@ -24,6 +24,9 @@ data/scryfall_oracle.json
 data/scryfall_oracle.meta.json
 data/manapool_catalog.json.gz
 data/tcgtracking/
+data/price_history.db
+data/scryfall_default_cards.jsonl.gz
+data/scryfall_default_cards.meta.json
 
 # Pytest
 .pytest_cache/

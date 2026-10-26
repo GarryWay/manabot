@@ -13,6 +13,11 @@ paths:
   db: data/manabot.db
   reports_dir: data/reports
   sell_rules: data/sell_rules.csv  # per-card pricer strategy + min/max
+  history_db: data/price_history.db  # daily price archive for forecasting (grows ~daily)
+  scryfall_default_cards: data/scryfall_default_cards.jsonl.gz
+
+history:
+  min_price_usd: 0.50  # don't archive printings priced below this in every finish
 
 behavior:
   use_bulk_export: false
