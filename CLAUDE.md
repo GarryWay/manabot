@@ -112,7 +112,7 @@ Config keys: `optimizer_over_budget_pct` (default 0.0), `optimizer_max_iteration
 
 Training data for price forecasts — roadmap in `docs/forecasting_plan.md` (Phase 0 done; models not built yet). Its own SQLite file, `history_db_path` (`data/price_history.db`), not manabot.db. Nightly it archives Scryfall `default_cards` (gzipped JSONL, kept at `scryfall_default_cards_path`; `as_of` = the bulk file's `updated_at` date) into `printings` + `scryfall_daily`, and the ManaPool catalog (`as_of` = file download date, UTC) into `manapool_daily` + `manapool_sales`. Prices are integer cents; printings below `history_min_price_usd` in every finish get no daily rows. `ingest_runs` makes each (source, as_of) idempotent (`--force` re-ingests). The catalog's `recent_sales` is capped at the 20 most recent per variant, so `manapool_sales` (deduped via its composite primary key) is only complete from the first archive date onward. ManaPool's `price_market` is null for many high-end printings — use Scryfall's `usd` for market.
 
-Scryfall's bulk index lists only `jsonl_download_uri` now (plain `download_uri` vanished ~2026-10); `download_oracle_cards()` converts the JSONL to the JSON array `ScryfallBulk` loads.
+Scryfall's bulk index lists only `jsonl_download_uri` now (plain `download_uri` vanished after 2026-07-27, the last successful download; production ran on the stale file until 2026-11-04); `download_oracle_cards()` converts the JSONL to the JSON array `ScryfallBulk` loads.
 
 ### Scheduler (`manabot/scheduler.py`)
 

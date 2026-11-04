@@ -94,7 +94,8 @@ def download_oracle_cards(path: Path = DEFAULT_PATH, force: bool = False) -> boo
     ``<path>.meta.json``, or when the file is absent.
 
     Scryfall now publishes bulk files only as gzipped JSONL (``jsonl_download_uri``;
-    the plain-JSON ``download_uri`` disappeared from the index around 2026-10), so
+    the plain-JSON ``download_uri`` disappeared from the index some time after the
+    last successful download on 2026-07-27), so
     the JSONL is converted to the JSON array that ScryfallBulk and the buylist
     scripts load. A plain ``download_uri`` is still used if Scryfall lists one.
 
