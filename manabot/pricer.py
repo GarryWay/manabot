@@ -36,7 +36,7 @@ import logging
 import sqlite3
 import statistics
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -49,6 +49,8 @@ if TYPE_CHECKING:
     from manabot.sell_rules import SellRule
 
 log = logging.getLogger(__name__)
+
+_SALES_SYNC_LOOKBACK_DAYS = 14
 
 HARD_FLOOR_USD: float = 0.15
 
@@ -733,7 +735,12 @@ def run_pricing_update(
         relisted_ids = {u.listing.inventory_id for u in upgrades}
         our_inventory = [l for l in our_inventory if l.inventory_id not in relisted_ids]
 
+    # Only fulfilled orders come back, filtered on creation time, so look back far
+    # enough to catch orders placed before the last recorded sale but fulfilled
+    # since. Re-fetched sales are deduplicated by sales_history's UNIQUE key.
     since = get_last_sales_sync(conn)
+    if since is not None:
+        since -= timedelta(days=_SALES_SYNC_LOOKBACK_DAYS)
     try:
         sales = client.get_completed_sales(since=since)
         if sales:

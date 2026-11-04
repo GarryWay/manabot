@@ -289,3 +289,55 @@ def test_get_seller_inventory_defaults_number_when_absent(client):
     listings = client.get_seller_inventory()
     assert listings[0].number == ""
     assert listings[0].mtgjson_id == ""
+
+
+# Shapes from a live GET /seller/orders and /seller/orders/{id} (2026-11-04).
+_ORDER_SUMMARY = {"id": "ord-1", "created_at": "2026-02-10T21:29:01.331087+00:00",
+                  "label": "195030-717878", "total_cents": 1292,
+                  "latest_fulfillment_status": "delivered"}
+_ORDER_DETAIL = {"order": {**_ORDER_SUMMARY, "items": [
+    {"product": {"type": "mtg_single", "single": {
+        "scryfall_id": "4b546bcf", "name": "Hullbreaker Horror", "set": "VOW", "number": "63",
+        "language_id": "EN", "condition_id": "LP", "finish_id": "NF"}},
+     "quantity": 1, "price_cents": 532},
+    {"product": {"type": "mtg_sealed", "single": None}, "quantity": 1, "price_cents": 999},
+]}}
+
+
+@resp_mock.activate
+def test_get_completed_sales_reads_items_under_order_key(client):
+    resp_mock.add(resp_mock.GET, f"{BASE}/seller/orders",
+                  json={"orders": [_ORDER_SUMMARY], "pagination": {"next_cursor": None}})
+    resp_mock.add(resp_mock.GET, f"{BASE}/seller/orders/ord-1", json=_ORDER_DETAIL)
+
+    sales = client.get_completed_sales()
+
+    assert len(sales) == 1  # the sealed item is skipped
+    sale = sales[0]
+    assert (sale.order_id, sale.scryfall_id, sale.card_name, sale.set_code) == (
+        "ord-1", "4b546bcf", "Hullbreaker Horror", "VOW")
+    assert sale.condition == Condition.LP
+    assert sale.finish == Finish.NONFOIL
+    assert sale.sold_price_usd == 5.32
+    assert sale.sold_at.isoformat() == "2026-02-10T21:29:01.331087+00:00"
+
+
+@resp_mock.activate
+def test_get_completed_sales_follows_cursor_and_passes_since(client):
+    from datetime import datetime, timezone
+
+    page2 = {**_ORDER_SUMMARY, "id": "ord-2"}
+    resp_mock.add(resp_mock.GET, f"{BASE}/seller/orders",
+                  json={"orders": [_ORDER_SUMMARY], "pagination": {"next_cursor": "c1"}})
+    resp_mock.add(resp_mock.GET, f"{BASE}/seller/orders",
+                  json={"orders": [page2], "pagination": {"next_cursor": None}})
+    resp_mock.add(resp_mock.GET, f"{BASE}/seller/orders/ord-1", json=_ORDER_DETAIL)
+    resp_mock.add(resp_mock.GET, f"{BASE}/seller/orders/ord-2",
+                  json={"order": {**_ORDER_DETAIL["order"], "id": "ord-2"}})
+
+    sales = client.get_completed_sales(since=datetime(2026, 1, 1, tzinfo=timezone.utc))
+
+    assert [s.order_id for s in sales] == ["ord-1", "ord-2"]
+    first, second = resp_mock.calls[0].request, resp_mock.calls[2].request
+    assert "since=2026-01-01" in first.url and "is_fulfilled=true" in first.url
+    assert "cursor=c1" in second.url

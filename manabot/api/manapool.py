@@ -621,8 +621,14 @@ class ManaPoolClient:
         self,
         since: Optional[datetime] = None,
     ) -> list[CompletedSale]:
-        """GET /seller/orders (fulfilled) with per-order detail calls for items."""
+        """GET /seller/orders (fulfilled) with per-order detail calls for items.
+
+        ``since`` filters on order creation time. The detail response wraps the
+        order in an ``order`` key (verified live 2026-11-04 — reading ``items`` at
+        the top level silently found nothing, so no sale had ever been recorded).
+        """
         sales: list[CompletedSale] = []
+        n_orders = 0
         cursor: str | None = None
         while True:
             params: dict = {"limit": 50, "is_fulfilled": "true"}
@@ -632,9 +638,11 @@ class ManaPoolClient:
                 params["since"] = since.isoformat()
             data = self._get("/seller/orders", params=params)
             for summary in data.get("orders", []):
+                n_orders += 1
                 try:
                     details = self._get(f"/seller/orders/{summary['id']}")
-                    for item in details.get("items", []):
+                    order = details.get("order", details)
+                    for item in order.get("items", []):
                         single = item.get("product", {}).get("single")
                         if not single:
                             continue
@@ -661,6 +669,7 @@ class ManaPoolClient:
             cursor = data.get("pagination", {}).get("next_cursor")
             if not cursor:
                 break
+        log.info("Fetched %d fulfilled order(s) with %d single item(s)", n_orders, len(sales))
         return sales
 
     def _get_raw(self, path: str, headers: Optional[dict] = None) -> bytes:
