@@ -19,16 +19,14 @@ Pricing algorithm per listing
      - TCG low ≈ TCG market:                   TCG low - $0.01
      - TCG low << TCG market (race to bottom): TCG market (don't chase)
 5. This computed price is stored as trend_target_usd — unmodified for reporting.
-6. Apply cost floor: if cost_basis known and days_below_floor < cost_floor_days:
-       new_price = max(trend_target, cost_basis × (1 + min_margin_pct))
-7. Apply hard floor: new_price = max(new_price, $0.15)
-8. Apply the listing's sell rule, if any (manabot/sell_rules.py):
+6. Apply hard floor: new_price = max(new_price, $0.15)
+7. Apply the listing's sell rule, if any (manabot/sell_rules.py):
      - strategy 'aggressive' skips the race-to-bottom guard in steps 3 and 4 and
        always runs the cross-market check; 'hold' keeps the current price instead
-     - min/max clamp the price (overriding the cost floor; the hard floor still wins)
+     - min/max clamp the price (the hard floor still wins)
    The pre-clamp price is kept as unclamped_price_usd so listings whose market price
    lands well outside their bounds can be reported for manual review.
-9. Update only if |new_price - current_price| >= $0.01.
+8. Update only if |new_price - current_price| >= $0.01.
 """
 from __future__ import annotations
 
@@ -65,8 +63,6 @@ _FINISH_TO_CATALOG_ID: dict[Finish, str] = {
 class PricingConfig:
     race_to_bottom_threshold: float = 0.20  # low_price < projection × (1 - this) = race to bottom
     race_to_bottom_min_gap_usd: float = 0.10  # ...and projection - low_price must be at least this
-    min_margin_pct: float = 0.10            # cost floor = cost_basis × (1 + this)
-    cost_floor_days: int = 30               # days below floor before constraint lifts
     liquidity_lookback_days: int = 60       # window for sales when computing liquidity
     max_sale_age_days: int = 90             # ignore sales data if most recent sale is older than this
     min_sales_for_regression: int = 3       # minimum sales needed to run regression
@@ -88,14 +84,13 @@ class PriceRecommendation:
     language: str
     current_price_usd: float
     trend_target_usd: Optional[float]   # raw market signal — no floors applied
-    new_price_usd: float                # final price after cost floor + hard floor
+    new_price_usd: float                # final price after hard floor + sell rule
     market_price_usd: Optional[float]
     low_price_usd: Optional[float]
     tcg_market_usd: Optional[float]     # TCGPlayer market price (from TCGTracking)
-    cost_basis_usd: Optional[float]
     reason: str   # 'trend_beat_low', 'trend_race_to_bottom', 'trend_no_listings',
                   # 'no_sales_beat_low', 'tcg_market', 'tcg_beat_low', 'tcg_race_to_bottom',
-                  # 'no_data', 'cost_floor', 'hard_floor', 'rule_hold', 'rule_min', 'rule_max'
+                  # 'no_data', 'hard_floor', 'rule_hold', 'rule_min', 'rule_max'
     should_update: bool
     tcg_low_usd: Optional[float] = None       # TCGPlayer lowest listing (exact condition/finish)
     strategy: str = "balanced"                # from the listing's sell rule
@@ -355,8 +350,6 @@ def compute_price(
     listing_language: str,
     listing_current_price_usd: float,
     catalog_variant: Optional[CatalogVariant],
-    cost_basis_usd: Optional[float],
-    days_below_floor: int,
     config: PricingConfig,
     tcg_market_usd: Optional[float] = None,
     tcg_low_usd: Optional[float] = None,
@@ -379,15 +372,10 @@ def compute_price(
             trend_target, reason, tcg_low_usd, tcg_market_usd, mp_competing_qty, config, aggressive,
         )
 
-    # Apply floors to get the price the strategy would set (trend_target stays unmodified)
+    # Apply the hard floor to get the price the strategy would set (trend_target stays unmodified)
     unclamped: Optional[float] = None
     if trend_target is not None:
         unclamped = trend_target
-        if cost_basis_usd is not None:
-            floor_price = cost_basis_usd * (1.0 + config.min_margin_pct)
-            if days_below_floor < config.cost_floor_days and unclamped < floor_price:
-                unclamped = floor_price
-                reason = "cost_floor"
         if unclamped < HARD_FLOOR_USD:
             unclamped = HARD_FLOOR_USD
             reason = "hard_floor"
@@ -419,7 +407,6 @@ def compute_price(
         market_price_usd=market,
         low_price_usd=low,
         tcg_market_usd=round(tcg_market_usd, 2) if tcg_market_usd is not None else None,
-        cost_basis_usd=cost_basis_usd,
         reason=reason,
         should_update=abs(new_price - listing_current_price_usd) >= 0.005,
         tcg_low_usd=round(tcg_low_usd, 2) if tcg_low_usd else None,
@@ -488,8 +475,6 @@ def apply_double_sided_upgrades(
             listing_language=listing.language,
             listing_current_price_usd=current_price,
             catalog_variant=variant,
-            cost_basis_usd=None,
-            days_below_floor=0,
             config=pricing_config,
         )
         return rec.new_price_usd
@@ -680,8 +665,7 @@ def run_pricing_update(
     from manabot.api.manapool_catalog import build_name_index, build_number_index, build_variant_index, load_catalog
     from manabot.api.tcgtracking import TCGTrackingClient
     from manabot.db import (
-        get_cost_basis, get_days_below_floor, get_last_sales_sync,
-        log_price_update, record_sales, update_floor_tracking,
+        get_last_sales_sync, log_price_update, record_sales,
     )
 
     from manabot.sell_rules import find_rule, load_sell_rules
@@ -785,10 +769,6 @@ def run_pricing_update(
                     merged = list(catalog_variant.recent_sales) + list(other_variant.recent_sales)
                     catalog_variant = dc_replace(catalog_variant, recent_sales=merged)
 
-        cost_row = get_cost_basis(conn, listing.scryfall_id, listing.condition, listing.finish)
-        cost_basis_usd = cost_row["cost_usd"] if cost_row else None
-        days_below = get_days_below_floor(conn, listing.scryfall_id, listing.condition, listing.finish)
-
         tcg_market = tcg.get_market_price(
             listing.scryfall_id,
             listing.set_code,
@@ -827,8 +807,6 @@ def run_pricing_update(
             listing_language=listing.language,
             listing_current_price_usd=listing.price_usd,
             catalog_variant=catalog_variant,
-            cost_basis_usd=cost_basis_usd,
-            days_below_floor=days_below,
             config=pricing_config,
             tcg_market_usd=tcg_market,
             tcg_low_usd=tcg_low,
@@ -836,9 +814,6 @@ def run_pricing_update(
             rule=find_rule(sell_rules, listing),
         )
         recommendations.append(rec)
-
-        cost_floor = (cost_basis_usd * (1.0 + pricing_config.min_margin_pct)) if cost_basis_usd else None
-        update_floor_tracking(conn, listing.scryfall_id, listing.condition, listing.finish, rec.new_price_usd, cost_floor)
 
         if rec.should_update:
             n_would_update += 1
@@ -890,8 +865,6 @@ def pricing_config_from(config: "Config") -> PricingConfig:
     return PricingConfig(
         race_to_bottom_threshold=config.pricer_race_to_bottom_threshold,
         race_to_bottom_min_gap_usd=config.pricer_race_to_bottom_min_gap_usd,
-        min_margin_pct=config.pricer_min_margin_pct,
-        cost_floor_days=config.pricer_cost_floor_days,
         iqr_fence_factor=config.pricer_iqr_fence_factor,
         min_sales_for_regression=config.pricer_min_sales_for_regression,
         max_sale_age_days=config.pricer_max_sale_age_days,
@@ -910,7 +883,7 @@ def pricing_config_from(config: "Config") -> PricingConfig:
 _BOUNDS_REPORT_COLUMNS = [
     "card_name", "set_code", "condition", "finish", "strategy", "min_price_usd", "max_price_usd",
     "market_view_usd", "miss_pct", "listed_at_usd", "mp_low_usd", "tcg_low_usd", "tcg_market_usd",
-    "cost_basis_usd", "reason",
+    "reason",
 ]
 
 
@@ -938,7 +911,7 @@ def write_bounds_report(flagged: list[PriceRecommendation], reports_dir: Path, t
                 money(r.rule_min_usd), money(r.rule_max_usd), money(r.unclamped_price_usd),
                 f"{(r.bounds_miss_pct(threshold) or 0.0) * 100:+.0f}%", money(r.new_price_usd),
                 money(r.low_price_usd), money(r.tcg_low_usd), money(r.tcg_market_usd),
-                money(r.cost_basis_usd), r.reason,
+                r.reason,
             ])
     return path
 

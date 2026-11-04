@@ -1159,8 +1159,8 @@ def price_update(
     """Update seller inventory prices based on market and competitor analysis.
 
     Fetches current ManaPool prices, computes optimal sell prices using
-    the configured strategy, and applies updates. Uses cost basis from DB
-    to enforce minimum margin, with automatic floor expiry after configured days.
+    the configured strategy, and applies updates. Per-card min/max and
+    strategy come from the sell rules file.
     """
     _configure_logging(verbose)
     from manabot.config import load_config
@@ -1221,128 +1221,6 @@ def price_update(
         for r in flagged:
             click.echo(f"  {format_bounds_line(r, threshold)}")
         click.echo(f"  Report written to {path}")
-
-
-@cli.command("margin-report")
-@click.option("--config", "config_path", type=click.Path(path_type=Path), default=None)
-@click.option("--days", type=int, default=None,
-              help="Restrict to sales in the last N days.")
-@click.option("--card", "card_filter", type=str, default=None,
-              help="Filter by card name (substring match).")
-@click.option("--verbose", "-v", is_flag=True)
-@click.pass_context
-def margin_report(
-    ctx: click.Context,
-    config_path: Path | None,
-    days: int | None,
-    card_filter: str | None,
-    verbose: bool,
-) -> None:
-    """Show P&L report from completed sales tracked in the DB."""
-    _configure_logging(verbose)
-    from manabot.config import load_config
-    from manabot.db import open_db, get_margin_report
-
-    try:
-        config = load_config(config_path)
-    except (ValueError, FileNotFoundError) as e:
-        click.echo(f"Config error: {e}", err=True)
-        sys.exit(1)
-
-    with open_db(config.db_path) as conn:
-        rows = get_margin_report(conn, days=days, card_name_filter=card_filter)
-
-    if not rows:
-        period = f" (last {days} days)" if days else ""
-        click.echo(f"No sales recorded{period}.")
-        return
-
-    total_margin = sum(r["total_margin"] or 0 for r in rows)
-    total_sold = sum(r["total_sold"] or 0 for r in rows)
-
-    header = f"{'Card':<42} {'Sold':>6} {'Avg Sell':>9} {'Avg Cost':>9} {'Total Margin':>13} {'Win%':>6}"
-    click.echo(header)
-    click.echo("-" * len(header))
-    for r in rows:
-        avg_cost = f"${r['avg_cost']:.2f}" if r["avg_cost"] is not None else "    N/A"
-        win_pct = (r["profitable_count"] / r["sale_count"] * 100) if r["sale_count"] else 0.0
-        margin_str = f"${r['total_margin']:+.2f}" if r["total_margin"] is not None else "    N/A"
-        click.echo(
-            f"{r['card_name'][:41]:<42} {r['total_sold']:>6} "
-            f"${r['avg_sell_price']:>8.2f} {avg_cost:>9} {margin_str:>13} {win_pct:>5.0f}%"
-        )
-    click.echo("-" * len(header))
-    click.echo(f"{'TOTAL':<42} {total_sold:>6} {'':>9} {'':>9} ${total_margin:>+12.2f}")
-
-
-@cli.command("import-cost-basis")
-@click.option("--config", "config_path", type=click.Path(path_type=Path), default=None)
-@click.option("--file", "csv_path", required=True, type=click.Path(path_type=Path),
-              help="CSV file with cost basis data.")
-@click.option("--verbose", "-v", is_flag=True)
-@click.pass_context
-def import_cost_basis(
-    ctx: click.Context,
-    config_path: Path | None,
-    csv_path: Path,
-    verbose: bool,
-) -> None:
-    """Import purchase prices into the cost basis DB from a CSV file.
-
-    CSV columns (header required):
-      scryfall_id, card_name, set_code, condition, finish, cost_usd, quantity, acquired_at
-
-    condition: NM, LP, MP, HP, DMG
-    finish:    nonfoil, foil
-    acquired_at: ISO date or datetime (e.g. 2025-01-15)
-    """
-    _configure_logging(verbose)
-    import csv as _csv
-    from manabot.config import load_config
-    from manabot.db import open_db, set_cost_basis
-    from manabot.models import Condition, Finish
-
-    try:
-        config = load_config(config_path)
-    except (ValueError, FileNotFoundError) as e:
-        click.echo(f"Config error: {e}", err=True)
-        sys.exit(1)
-
-    required_cols = {"scryfall_id", "card_name", "set_code", "condition", "finish", "cost_usd", "quantity", "acquired_at"}
-    inserted = 0
-    errors = 0
-
-    with open_db(config.db_path) as conn:
-        with open(csv_path, encoding="utf-8-sig") as f:
-            reader = _csv.DictReader(f)
-            if not reader.fieldnames or not required_cols.issubset(set(reader.fieldnames)):
-                missing = required_cols - set(reader.fieldnames or [])
-                click.echo(f"CSV missing required columns: {missing}", err=True)
-                sys.exit(1)
-            for i, row in enumerate(reader, start=2):
-                try:
-                    cond = Condition(row["condition"].strip().upper())
-                    finish_str = row["finish"].strip().lower()
-                    finish = Finish.FOIL if finish_str == "foil" else Finish.NONFOIL
-                    acq = datetime.fromisoformat(row["acquired_at"].strip())
-                    set_cost_basis(
-                        conn,
-                        scryfall_id=row["scryfall_id"].strip(),
-                        card_name=row["card_name"].strip(),
-                        set_code=row["set_code"].strip().upper(),
-                        condition=cond,
-                        finish=finish,
-                        cost_usd=float(row["cost_usd"]),
-                        quantity=int(row["quantity"]),
-                        acquired_at=acq,
-                        source="import",
-                    )
-                    inserted += 1
-                except (ValueError, KeyError) as e:
-                    click.echo(f"Row {i}: {e}", err=True)
-                    errors += 1
-
-    click.echo(f"Imported {inserted} cost basis record(s). {errors} error(s).")
 
 
 @cli.command("pricer-scheduler")

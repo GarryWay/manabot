@@ -51,8 +51,6 @@ def _sale(price_cents: int, days_ago: float) -> dict:
 def _compute(
     variant: CatalogVariant | None,
     current_price: float = 5.00,
-    cost_basis: float | None = None,
-    days_below: int = 0,
     config: PricingConfig | None = None,
 ) -> PriceRecommendation:
     return compute_price(
@@ -64,17 +62,11 @@ def _compute(
         listing_language="EN",
         listing_current_price_usd=current_price,
         catalog_variant=variant,
-        cost_basis_usd=cost_basis,
-        days_below_floor=days_below,
         config=config or PricingConfig(),
     )
 
 
-DEFAULT_CONFIG = PricingConfig(
-    race_to_bottom_threshold=0.20,
-    min_margin_pct=0.10,
-    cost_floor_days=30,
-)
+DEFAULT_CONFIG = PricingConfig(race_to_bottom_threshold=0.20)
 
 
 # ---------------------------------------------------------------------------
@@ -150,29 +142,6 @@ def test_downward_trend_projected_to_today():
     rec = _compute(v, current_price=7.00, config=DEFAULT_CONFIG)
     assert rec.trend_target_usd is not None
     assert rec.trend_target_usd < 4.00
-
-
-# ---------------------------------------------------------------------------
-# Tests: cost floor (trend_target preserved, new_price floored)
-# ---------------------------------------------------------------------------
-
-def test_cost_floor_applied_and_trend_target_preserved():
-    """trend_target=$2.00, cost=$3.00, margin=10% → new_price=$3.30, trend_target stays $2.00."""
-    sales = [_sale(200, days_ago=i * 5) for i in range(5)]
-    v = _variant(low_price_usd=0.0, recent_sales=sales)
-    rec = _compute(v, current_price=4.00, cost_basis=3.00, config=DEFAULT_CONFIG)
-    assert rec.reason == "cost_floor"
-    assert rec.new_price_usd == pytest.approx(3.30, abs=0.01)
-    assert rec.trend_target_usd == pytest.approx(2.00, abs=0.10)
-
-
-def test_cost_floor_lifted_after_days_exceeded():
-    """days_below=31 > cost_floor_days=30 — floor does not apply, uses trend target."""
-    sales = [_sale(200, days_ago=i * 5) for i in range(5)]
-    v = _variant(low_price_usd=0.0, recent_sales=sales)
-    rec = _compute(v, current_price=4.00, cost_basis=3.00, days_below=31, config=DEFAULT_CONFIG)
-    assert rec.reason != "cost_floor"
-    assert rec.new_price_usd == pytest.approx(rec.trend_target_usd or 0, abs=0.01)
 
 
 # ---------------------------------------------------------------------------
@@ -274,8 +243,6 @@ def _compute_tcg(
         listing_language="EN",
         listing_current_price_usd=current_price,
         catalog_variant=variant,
-        cost_basis_usd=None,
-        days_below_floor=0,
         config=config or DEFAULT_CONFIG,
         tcg_market_usd=tcg_market,
     )
@@ -827,7 +794,6 @@ def _compute_x(
     competing_qty: int | None = 10,
     current_price: float = 300.00,
     rule=None,
-    cost_basis: float | None = None,
 ) -> PriceRecommendation:
     return compute_price(
         listing_scryfall_id="abc-123",
@@ -838,8 +804,6 @@ def _compute_x(
         listing_language="EN",
         listing_current_price_usd=current_price,
         catalog_variant=variant,
-        cost_basis_usd=cost_basis,
-        days_below_floor=0,
         config=DEFAULT_CONFIG,
         tcg_market_usd=tcg_market,
         tcg_low_usd=tcg_low,
@@ -931,15 +895,15 @@ def test_hold_strategy_still_clamped_by_bounds():
 
 def test_min_bound_overrides_market():
     v = _variant(low_price_usd=250.00)
-    rec = _compute_x(v, current_price=300.00, rule=_rule(min_price_usd=275.00), cost_basis=100.0)
+    rec = _compute_x(v, current_price=300.00, rule=_rule(min_price_usd=275.00))
     assert rec.reason == "rule_min"
     assert rec.new_price_usd == 275.00
 
 
-def test_max_bound_overrides_cost_floor():
-    v = _variant(low_price_usd=10.00)
-    rec = _compute_x(v, current_price=10.0, competing_qty=50, rule=_rule(max_price_usd=12.00), cost_basis=20.0)
-    assert rec.unclamped_price_usd == pytest.approx(22.00)  # cost floor
+def test_max_bound_overrides_market():
+    v = _variant(low_price_usd=20.00)
+    rec = _compute_x(v, current_price=10.0, competing_qty=50, rule=_rule(max_price_usd=12.00))
+    assert rec.unclamped_price_usd == pytest.approx(19.99)  # beat the ManaPool low
     assert rec.reason == "rule_max"
     assert rec.new_price_usd == 12.00
 

@@ -64,12 +64,6 @@ python -m manabot price-update --dry-run
 # Apply live price updates to your ManaPool inventory
 python -m manabot price-update
 
-# Show margin report — current prices vs cost basis
-python -m manabot margin-report
-
-# Import purchase cost data from a CSV file
-python -m manabot import-cost-basis --file purchases.csv
-
 # Start the daily price scheduler (blocks; runs at 2 AM Central by default)
 python -m manabot pricer-scheduler
 ```
@@ -223,8 +217,8 @@ Each listing is priced against ManaPool catalog data (sales history + live compe
 2. **Beat the low** — if competing listings exist, price 1¢ below the lowest (race-to-bottom guard: hold at trend if the low is >20% and ≥$0.10 below projection, and above the $0.15 floor)
 3. **TCGPlayer anchor** — when no ManaPool competing listings exist, use TCGPlayer market price directly (more transaction volume than sparse ManaPool data)
 4. **Finish pooling** — for cheap cards (<$2) with sparse data, foil and nonfoil sales are pooled together; same logic applied to TCGPlayer finish lookups
-5. **Cost floor** — never price below `cost_basis × (1 + min_margin_pct)` within `cost_floor_days` of purchase
-6. **Hard floor** — $0.15 minimum regardless of market
+5. **Hard floor** — $0.15 minimum regardless of market
+6. **Sell rules** — per-card strategy (`aggressive` / `balanced` / `hold`) and min/max overrides from `data/sell_rules.csv`
 
 ---
 
@@ -241,7 +235,5 @@ Each listing is priced against ManaPool catalog data (sales history + live compe
 | `PRICER_SCHEDULE_TIMEZONE` | `America/Chicago` | IANA timezone string for the scheduler |
 | `PRICER_RACE_TO_BOTTOM_THRESHOLD` | `0.20` | Hold at trend if low price is >20% below projection |
 | `PRICER_RACE_TO_BOTTOM_MIN_GAP_USD` | `0.10` | ...and at least this many dollars below it; never holds when low is at the $0.15 floor |
-| `PRICER_MIN_MARGIN_PCT` | `0.10` | Minimum margin above cost basis (10%) |
-| `PRICER_COST_FLOOR_DAYS` | `30` | Days to enforce cost floor after purchase |
 | `DB_PATH` | `data/manabot.db` | SQLite database path |
 | `REPORTS_DIR` | `data/reports` | Output directory for HTML/CSV reports |

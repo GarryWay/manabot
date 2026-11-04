@@ -180,7 +180,4 @@ source .venv/bin/activate && python -m manabot price-update
 
 # Preview prices without writing
 source .venv/bin/activate && python -m manabot price-update --dry-run
-
-# View margin report
-source .venv/bin/activate && python -m manabot margin-report
 ```

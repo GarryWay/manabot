@@ -96,3 +96,59 @@ def test_init_db_idempotent(tmp_path):
     c1.close()
     c2 = init_db(db_path)  # should not raise
     c2.close()
+
+
+def _sale(order_id: str = "ord-1", price: float = 5.32):
+    from manabot.models import CompletedSale
+    return CompletedSale(
+        order_id=order_id, scryfall_id=SCRYFALL_ID, card_name="Lightning Bolt", set_code="LEB",
+        condition=Condition.LP, finish=Finish.NONFOIL, quantity=1, sold_price_usd=price,
+        sold_at=datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc),
+    )
+
+
+def test_record_sales_skips_duplicates(conn):
+    from manabot.db import get_last_sales_sync, record_sales
+
+    assert record_sales(conn, [_sale()]) == 1
+    assert record_sales(conn, [_sale(), _sale("ord-2")]) == 1
+    assert conn.execute("SELECT COUNT(*) FROM sales_history").fetchone()[0] == 2
+    assert get_last_sales_sync(conn) == datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
+
+
+def test_init_db_drops_profit_tracking_from_old_schema(tmp_path):
+    """Databases created before 2026-11-04 had cost_basis, price_floor_tracking and
+    cost/margin columns on sales_history; init_db removes them and keeps the sales."""
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.executescript("""
+        CREATE TABLE cost_basis (id INTEGER PRIMARY KEY, scryfall_id TEXT, cost_usd REAL);
+        CREATE INDEX idx_cost_basis_scryfall ON cost_basis (scryfall_id);
+        CREATE TABLE price_floor_tracking (scryfall_id TEXT, condition TEXT, finish TEXT,
+            below_floor_since TEXT, PRIMARY KEY (scryfall_id, condition, finish));
+        CREATE TABLE sales_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT NOT NULL, scryfall_id TEXT NOT NULL,
+            card_name TEXT NOT NULL, set_code TEXT NOT NULL, condition TEXT NOT NULL,
+            finish TEXT NOT NULL DEFAULT 'nonfoil', quantity INTEGER NOT NULL,
+            sold_price_usd REAL NOT NULL, cost_usd REAL, margin_usd REAL, sold_at TEXT NOT NULL,
+            recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(order_id, scryfall_id, condition, finish));
+        INSERT INTO sales_history (order_id, scryfall_id, card_name, set_code, condition,
+            quantity, sold_price_usd, cost_usd, margin_usd, sold_at)
+            VALUES ('ord-1', 'sf', 'Bolt', 'LEB', 'LP', 1, 5.32, 1.0, 4.32, '2026-11-01');
+    """)
+    old.commit()
+    old.close()
+
+    conn = init_db(path)
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(sales_history)")}
+    sales = conn.execute("SELECT order_id, sold_price_usd FROM sales_history").fetchall()
+    conn.close()
+    init_db(path).close()  # second open is a no-op
+
+    assert "cost_basis" not in tables and "price_floor_tracking" not in tables
+    assert "cost_usd" not in cols and "margin_usd" not in cols
+    assert [tuple(r) for r in sales] == [("ord-1", 5.32)]

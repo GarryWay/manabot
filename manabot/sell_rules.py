@@ -8,7 +8,7 @@ optional price bounds:
   balanced   — the default pricer behaviour
   hold       — keep the current listing price; only min/max move it
 
-min_price_usd / max_price_usd clamp the final price (they override the cost floor).
+min_price_usd / max_price_usd clamp the final price (only the $0.15 hard floor beats them).
 When the strategy's own price falls well outside those bounds, the pricer flags the
 listing for manual review instead of silently pinning it (see pricer.bounds_report_rows).
 

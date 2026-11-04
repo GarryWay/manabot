@@ -35,8 +35,6 @@ class Config:
     arbitrage_liquidity_lookback_days: int = 60   # days to count sales for liquidity
     pricer_race_to_bottom_threshold: float = 0.20  # low_price < trend × (1 - this) = race to bottom
     pricer_race_to_bottom_min_gap_usd: float = 0.10  # ...and trend - low_price must be at least this
-    pricer_min_margin_pct: float = 0.10       # cost floor = cost_basis * (1 + this)
-    pricer_cost_floor_days: int = 30          # days below floor before cost floor is lifted
     pricer_schedule_hour: int = 2             # hour (local time) for daily price update job
     pricer_schedule_timezone: str = "America/Chicago"  # IANA timezone for the scheduler
     pricer_iqr_fence_factor: float = 1.5      # Tukey IQR fence multiplier for outlier removal
@@ -124,10 +122,6 @@ def load_config(config_path: Path | None = None) -> Config:
             base["pricer_race_to_bottom_threshold"] = float(pricer["race_to_bottom_threshold"])
         if "race_to_bottom_min_gap_usd" in pricer:
             base["pricer_race_to_bottom_min_gap_usd"] = float(pricer["race_to_bottom_min_gap_usd"])
-        if "min_margin_pct" in pricer:
-            base["pricer_min_margin_pct"] = float(pricer["min_margin_pct"])
-        if "cost_floor_days" in pricer:
-            base["pricer_cost_floor_days"] = int(pricer["cost_floor_days"])
         if "schedule_hour" in pricer:
             base["pricer_schedule_hour"] = int(pricer["schedule_hour"])
         if "schedule_timezone" in pricer:
@@ -192,10 +186,6 @@ def load_config(config_path: Path | None = None) -> Config:
         base["pricer_race_to_bottom_threshold"] = float(os.environ["PRICER_RACE_TO_BOTTOM_THRESHOLD"])
     if os.getenv("PRICER_RACE_TO_BOTTOM_MIN_GAP_USD"):
         base["pricer_race_to_bottom_min_gap_usd"] = float(os.environ["PRICER_RACE_TO_BOTTOM_MIN_GAP_USD"])
-    if os.getenv("PRICER_MIN_MARGIN_PCT"):
-        base["pricer_min_margin_pct"] = float(os.environ["PRICER_MIN_MARGIN_PCT"])
-    if os.getenv("PRICER_COST_FLOOR_DAYS"):
-        base["pricer_cost_floor_days"] = int(os.environ["PRICER_COST_FLOOR_DAYS"])
     if os.getenv("PRICER_SCHEDULE_TIMEZONE"):
         base["pricer_schedule_timezone"] = os.environ["PRICER_SCHEDULE_TIMEZONE"]
     if os.getenv("PRICER_CROSS_MARKET_MIN_USD"):
@@ -250,8 +240,6 @@ def load_config(config_path: Path | None = None) -> Config:
         arbitrage_liquidity_lookback_days=base.get("arbitrage_liquidity_lookback_days", 60),
         pricer_race_to_bottom_threshold=base.get("pricer_race_to_bottom_threshold", 0.20),
         pricer_race_to_bottom_min_gap_usd=base.get("pricer_race_to_bottom_min_gap_usd", 0.10),
-        pricer_min_margin_pct=base.get("pricer_min_margin_pct", 0.10),
-        pricer_cost_floor_days=base.get("pricer_cost_floor_days", 30),
         pricer_schedule_hour=base.get("pricer_schedule_hour", 2),
         pricer_schedule_timezone=base.get("pricer_schedule_timezone", "America/Chicago"),
         pricer_cross_market_min_usd=base.get("pricer_cross_market_min_usd", 20.0),
