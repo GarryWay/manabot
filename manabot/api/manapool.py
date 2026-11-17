@@ -598,7 +598,14 @@ class ManaPoolClient:
         quantity: int,
         language: str = "EN",
     ) -> None:
-        """POST /seller/inventory/scryfall_id/{scryfall_id} — create a new listing."""
+        """PUT /seller/inventory/scryfall_id/{scryfall_id} — create (upsert) a listing.
+
+        The endpoint only accepts GET, PUT, DELETE and HEAD (verified live 2026-11-17
+        via OPTIONS → ``Allow: GET, PUT, DELETE, HEAD``). This used to send POST,
+        which 405'd on every double-sided-token relist; PUT sets price/quantity for
+        the (scryfall_id, language, finish, condition) variant whether or not we
+        already list it.
+        """
         finish_id = _FINISH_TO_ID.get(finish, "NF")
         url = f"{self.BASE_URL}/seller/inventory/scryfall_id/{scryfall_id}"
         params = {
@@ -608,7 +615,7 @@ class ManaPoolClient:
         }
         payload = {"price_cents": round(price_usd * 100), "quantity": quantity}
         try:
-            resp = self._session.post(url, params=params, json=payload, timeout=30)
+            resp = self._session.put(url, params=params, json=payload, timeout=30)
             resp.raise_for_status()
         except requests.HTTPError as e:
             raise ManaPoolAPIError(

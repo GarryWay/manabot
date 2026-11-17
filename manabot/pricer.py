@@ -618,7 +618,7 @@ def apply_double_sided_upgrades(
                         face_name, group[0].listing.set_code,
                         deleted_qty, face_price, len(group),
                     )
-            except Exception:
+            except Exception as exc:
                 # delete_seller_listing() isn't a true delete — ManaPool has no DELETE
                 # endpoint, so it's a PUT that zeroes price/quantity. That means the
                 # "deleted" DFT listing(s) can be restored by the exact same PUT call,
@@ -627,8 +627,9 @@ def apply_double_sided_upgrades(
                 # here doesn't compound the loss.
                 log.error(
                     "Failed to create/update '%s' [%s] after deleting %d DFT listing(s) for "
-                    "'%s' — restoring the original listing(s) instead of losing the stock",
+                    "'%s' (%s) — restoring the original listing(s) instead of losing the stock",
                     face_name, group[0].listing.set_code, len(deleted), group[0].listing.card_name,
+                    exc,
                 )
                 for u in deleted:
                     try:

@@ -291,6 +291,22 @@ def test_get_seller_inventory_defaults_number_when_absent(client):
     assert listings[0].mtgjson_id == ""
 
 
+@resp_mock.activate
+def test_create_seller_listing_uses_put(client):
+    """Regression: the scryfall_id inventory endpoint allows GET/PUT/DELETE/HEAD only
+    (live OPTIONS, 2026-11-17); creating via POST 405'd on every DFT relist."""
+    from manabot.models import Condition, Finish
+    resp_mock.add(resp_mock.PUT, f"{BASE}/seller/inventory/scryfall_id/face-id", json={})
+    client.create_seller_listing(
+        scryfall_id="face-id", condition=Condition.NM, finish=Finish.FOIL,
+        price_usd=2.0, quantity=3, language="EN",
+    )
+    req = resp_mock.calls[0].request
+    assert req.method == "PUT"
+    assert "finish_id=FO" in req.url and "condition_id=NM" in req.url and "language_id=EN" in req.url
+    assert json.loads(req.body) == {"price_cents": 200, "quantity": 3}
+
+
 # Shapes from a live GET /seller/orders and /seller/orders/{id} (2026-11-04).
 _ORDER_SUMMARY = {"id": "ord-1", "created_at": "2026-02-10T21:29:01.331087+00:00",
                   "label": "195030-717878", "total_cents": 1292,
