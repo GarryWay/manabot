@@ -154,9 +154,9 @@ class SellerListing:
     """Our own inventory listing on ManaPool (seller side)."""
     inventory_id: str       # UUID from GET /seller/inventory
     product_id: str         # ManaPool product UUID — required for DFT updates
-    scryfall_id: str        # for a double-sided token, this is only the FRONT face's own
-                             # id — it carries no information about which specific back
-                             # face this listing is paired with (see `number` below)
+    scryfall_id: str        # "" for double-sided tokens (ManaPool returns null as of
+                             # 2026-11; earlier it was only the FRONT face's id, never
+                             # the pairing) — use `number` / `mtgjson_id` for those
     card_name: str
     set_code: str
     condition: Condition

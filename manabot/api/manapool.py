@@ -534,7 +534,10 @@ class ManaPoolClient:
         return SellerListing(
             inventory_id=item["id"],
             product_id=item["product"]["id"],
-            scryfall_id=single["scryfall_id"],
+            # Double-sided tokens come back with scryfall_id null (seen live 2026-11-17;
+            # identify them by mtgjson_id / product_id instead). Normalize to "" so the
+            # str-typed field never carries None into NOT NULL DB columns.
+            scryfall_id=single.get("scryfall_id") or "",
             card_name=single["name"],
             set_code=str(single.get("set", "")).upper(),
             condition=_CONDITION_MAP.get(condition_id, Condition.NM),

@@ -292,6 +292,30 @@ def test_get_seller_inventory_defaults_number_when_absent(client):
 
 
 @resp_mock.activate
+def test_get_seller_inventory_null_scryfall_id_becomes_empty(client):
+    """Regression: double-sided tokens come back with scryfall_id null; a None here
+    crashed the pricer on price_updates.scryfall_id NOT NULL (2026-11-17)."""
+    resp_mock.add(
+        resp_mock.GET, f"{BASE}/seller/inventory",
+        json={
+            "inventory": [{
+                "id": "inv-1",
+                "product": {"id": "prod-1", "single": {
+                    "scryfall_id": None, "mtgjson_id": "mj-3-11",
+                    "name": "Faerie Rogue // Thopter", "set": "tznc", "number": "3-11",
+                    "language_id": "EN", "condition_id": "NM", "finish_id": "NF",
+                }},
+                "price_cents": 15, "quantity": 1,
+            }],
+            "pagination": {"next_cursor": None},
+        },
+    )
+    listings = client.get_seller_inventory()
+    assert listings[0].scryfall_id == ""
+    assert listings[0].mtgjson_id == "mj-3-11"
+
+
+@resp_mock.activate
 def test_create_seller_listing_uses_put(client):
     """Regression: the scryfall_id inventory endpoint allows GET/PUT/DELETE/HEAD only
     (live OPTIONS, 2026-11-17); creating via POST 405'd on every DFT relist."""
